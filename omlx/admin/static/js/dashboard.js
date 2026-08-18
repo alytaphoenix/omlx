@@ -1907,13 +1907,26 @@
                         node.fabric_verified = false;
                     });
                 }
+                // Only invalidate a built plan when the node set actually
+                // changed. The 2s/10s cluster status poll calls this on every
+                // tick; invalidating unconditionally nulled clusterPlan and its
+                // signature, which dead-buttoned "Activate manual plan"
+                // (clusterActivationReady requires a non-null plan whose
+                // signature still matches) and erased error banners every poll.
+                // #2721 stopped the poll from POSTing /plan but left this
+                // client-side wipe in place.
+                const nodesChanged =
+                    JSON.stringify(nodes)
+                    !== JSON.stringify(this.clusterPlanNodes ?? []);
                 this.clusterPlanNodes = nodes;
                 this._clusterNodeKey = Math.max(
                     this._clusterNodeKey,
                     ...nodes.map(node => Number(node.key) || 0),
                 );
                 this.normalizeClusterTensorParallelSize();
-                this.invalidateClusterPlan();
+                if (nodesChanged) {
+                    this.invalidateClusterPlan();
+                }
             },
 
             // Turn every unambiguous fast-link discovery into the default
@@ -3334,8 +3347,16 @@
             normalizeClusterTensorParallelSize() {
                 const options = this.clusterTensorParallelOptions();
                 const current = Number(this.clusterPlanTensorParallelSize);
-                if (!options.includes(current)) {
-                    this.clusterPlanTensorParallelSize = 1;
+                // Guard against the status poll transiently reporting a single
+                // node (options === [1]): resetting to 1 there silently threw
+                // away a user's multi-way tensor choice every ~10s. Only correct
+                // a genuinely out-of-range value, and snap to the largest degree
+                // (tensor parallelism) rather than 1 (pipeline) — several
+                // architectures (VLMs) support tensor but not the MLX-LM pipeline
+                // forward path, so 1 would make the only valid plan fail.
+                if (options.length > 1 && !options.includes(current)) {
+                    this.clusterPlanTensorParallelSize =
+                        options[options.length - 1];
                     this.invalidateClusterPlan();
                 }
             },
