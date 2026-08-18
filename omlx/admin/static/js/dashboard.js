@@ -1766,6 +1766,16 @@
             },
 
             syncClusterNodesFromPeers() {
+                // Don't let a background status poll rebuild the node set (and
+                // reset selections / invalidate the plan) while an activation is
+                // in flight — startCluster() runs a multi-step autoconfigure →
+                // stage → activate sequence and a mid-flight resync can discard
+                // its own in-progress proposal.
+                if (this.clusterAutoconfigureLoading
+                    || this.clusterActivationLoading
+                    || this.clusterLinkSetupLoading) {
+                    return;
+                }
                 this.clusterModelInventory = null;
                 this.clusterCatalogue = null;
                 const gib = 1024 ** 3;
