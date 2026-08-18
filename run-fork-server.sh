@@ -10,7 +10,8 @@
 # is installed. Run the SAME script on both cluster nodes.
 
 set -e
-FORK="$HOME/repos/omlx"
+# The repo this script lives in — works from a normal checkout or a worktree.
+FORK="$(cd "$(dirname "$0")" && pwd)"
 APP="/Applications/oMLX.app/Contents/Resources"
 PYHOME="$APP/Python/cpython-3.11"
 SITE="$APP/Python/framework-mlx-base/lib/python3.11/site-packages"
