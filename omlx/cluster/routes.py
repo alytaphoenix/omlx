@@ -753,10 +753,16 @@ def _create_cluster_plan(request: ClusterPlanRequest):
         and model.source != "synthetic"
         and not model.supports_pipeline
     ):
-        raise PlanningError(
+        detail = (
             "pipeline parallelism is not possible for this model: the "
             "architecture does not implement the MLX-LM pipeline forward path"
         )
+        if model.supports_tensor_parallel:
+            detail += (
+                f". Choose {len(nodes)}-way tensor parallelism to run it "
+                f"across {len(nodes)} Macs."
+            )
+        raise PlanningError(detail)
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
         return plan_hybrid(

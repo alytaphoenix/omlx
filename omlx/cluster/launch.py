@@ -834,15 +834,17 @@ def discover_remote_python_executable(
         if candidate in seen:
             continue
         seen.add(candidate)
-        # The packaged macOS app exposes a launcher which assembles PYTHONPATH
-        # for its bundled interpreter.  Returning ``sys.executable`` from that
-        # launcher loses the environment and makes the very next probe fail.
-        # Preserve the launcher itself while still resolving ``~`` to an
-        # absolute path accepted by the launcher's path validation.
+        # The packaged macOS app and the worker shim are launchers which
+        # assemble PYTHONPATH for an underlying interpreter.  Returning
+        # ``sys.executable`` from a launcher loses that environment and makes
+        # the very next probe fail with ModuleNotFoundError.  Preserve every
+        # path-shaped candidate (absolute or ``~``) exactly as given; only a
+        # bare command name (``python3``) needs ``sys.executable`` to become an
+        # absolute path.
         script = (
             "import os,omlx; print(os.path.expanduser("
             f"{candidate!r}))"
-            if candidate.startswith("~")
+            if candidate.startswith(("~", "/"))
             else "import sys,omlx; print(sys.executable)"
         )
         command = (
@@ -1145,16 +1147,31 @@ def probe_remote_admission_ceiling(
     own instead.
     """
 
+    # Ask the peer's live server first: one HTTP round trip instead of a cold
+    # `import omlx` (which imports MLX and can blow the SSH timeout). Peers
+    # conventionally run the coordinator's port; 9000 is kept as a legacy
+    # candidate for mixed setups. Hardcoding 9000 alone left the fast path dead
+    # on every cluster serving on the (default) port 8000.
+    try:
+        from omlx.settings import get_settings
+
+        local_port = int(get_settings().server.port)
+    except Exception:
+        local_port = 8000
+    ports = tuple(dict.fromkeys((local_port, 9000)))
     script = (
         "import json,urllib.request\n"
         "ceiling=0\n"
-        "try:\n"
-        "    with urllib.request.urlopen("
-        "'http://127.0.0.1:9000/health',timeout=2) as response:\n"
-        "        health=json.load(response)\n"
-        "    ceiling=int(health.get('engine_pool',{}).get('final_ceiling',0))\n"
-        "except Exception:\n"
-        "    pass\n"
+        f"for port in {ports!r}:\n"
+        "    try:\n"
+        "        with urllib.request.urlopen("
+        "'http://127.0.0.1:%d/health'%port,timeout=2) as response:\n"
+        "            health=json.load(response)\n"
+        "        ceiling=int(health.get('engine_pool',{}).get('final_ceiling',0))\n"
+        "        if ceiling>0:\n"
+        "            break\n"
+        "    except Exception:\n"
+        "        pass\n"
         "if ceiling<=0:\n"
         "    from omlx.cluster.memory_guard import ceiling_breakdown\n"
         "    ceiling=int(ceiling_breakdown().get('hard_limit',0))\n"
