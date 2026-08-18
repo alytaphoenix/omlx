@@ -3277,7 +3277,7 @@
                     );
                 const fit = this.clusterCatalogueFit(model.model_path);
                 if (fit?.fits === true) {
-                    const tensorSize = Number(fit.tensor_parallel_size || 1);
+                    const tensorSize = this.clusterFitTensorParallelSize(fit);
                     if (this.clusterTensorParallelOptions().includes(tensorSize)) {
                         // The catalogue arrived at this topology using the
                         // same fit planner. Preview that proven topology rather
@@ -3354,6 +3354,21 @@
                 return nodes > 1 ? [1, nodes] : [1];
             },
 
+            // The catalogue fit is the FEWEST-node plan: a model that fits one
+            // Mac reports tensor_parallel_size=1 even when two Macs are wired.
+            // Adopting that 1 into a 2-node plan builder made every preview a
+            // pipeline plan, which 400s for architectures without the MLX-LM
+            // pipeline forward path. Translate the fit into the topology valid
+            // for the nodes actually configured.
+            clusterFitTensorParallelSize(fit) {
+                const nodes = Math.max(1, this.clusterPlanNodes.length);
+                const fitted = Number(fit?.tensor_parallel_size || 1);
+                if (Number(fit?.nodes_required || 1) >= nodes) return fitted;
+                if (fit?.supports_pipeline === false) return nodes;
+                // Pipeline is possible too: keep whatever is selected.
+                return Number(this.clusterPlanTensorParallelSize) || 1;
+            },
+
             normalizeClusterTensorParallelSize() {
                 const options = this.clusterTensorParallelOptions();
                 const current = Number(this.clusterPlanTensorParallelSize);
@@ -3365,6 +3380,23 @@
                 // architectures (VLMs) support tensor but not the MLX-LM pipeline
                 // forward path, so 1 would make the only valid plan fail.
                 if (options.length > 1 && !options.includes(current)) {
+                    this.clusterPlanTensorParallelSize =
+                        options[options.length - 1];
+                    this.invalidateClusterPlan();
+                }
+                // tp=1 on a multi-node cluster means pipeline. For a model whose
+                // architecture cannot pipeline the only valid multi-node plan is
+                // full tensor; leaving 1 here guarantees a 400 from /plan on
+                // every preview.
+                const fit = this.clusterCatalogueFit(
+                    this.clusterPlanModelPath.trim()
+                );
+                if (
+                    options.length > 1
+                    && Number(this.clusterPlanTensorParallelSize) === 1
+                    && fit?.fits === true
+                    && fit.supports_pipeline === false
+                ) {
                     this.clusterPlanTensorParallelSize =
                         options[options.length - 1];
                     this.invalidateClusterPlan();
@@ -4811,9 +4843,7 @@
                     const selected = this.clusterSelectedModel();
                     if (selected) {
                         const fit = this.clusterCatalogueFit(selected.model_path);
-                        const tensorSize = Number(
-                            fit?.tensor_parallel_size || 1
-                        );
+                        const tensorSize = this.clusterFitTensorParallelSize(fit);
                         if (
                             fit?.fits === true
                             && this.clusterTensorParallelOptions().includes(tensorSize)
@@ -5596,10 +5626,23 @@
                                 0,
                                 capacityGiB - Math.min(capacityGiB, manualAllowedGiB)
                             );
-                        changed = changed
-                            || node.capacity_gib !== capacityGiB
-                            || node.reserve_gib !== reserveGiB
-                            || node.automatic_reserve_gib !== automaticReserveGiB;
+                        // The admission ceiling is derived from live memory
+                        // pressure and wobbles by a few hundred MiB between
+                        // polls. Re-planning the whole catalogue for that wobble
+                        // emptied the model list and reset the topology controls
+                        // every ten seconds. Only a drift that could change a
+                        // plan invalidates anything.
+                        const drift = (a, b) =>
+                            Math.abs(Number(a || 0) - b) > 0.5;
+                        if (
+                            !drift(node.capacity_gib, capacityGiB)
+                            && !drift(node.reserve_gib, reserveGiB)
+                            && !drift(node.automatic_reserve_gib, automaticReserveGiB)
+                        ) {
+                            node.measured = measured.summary;
+                            return;
+                        }
+                        changed = true;
                         node.capacity_gib = capacityGiB;
                         node.reserve_gib = reserveGiB;
                         node.automatic_reserve_gib = automaticReserveGiB;
