@@ -35,7 +35,7 @@ from .liveness import read_marker, read_remote_marker
 from .models import CLUSTER_PROTOCOL_VERSION
 from .performance import performance_profiles_from_records
 from .ssh_policy import cluster_ssh_options
-from .staging import validate_staged_model
+from .staging import home_relative_model_path, validate_staged_model
 
 logger = logging.getLogger(__name__)
 
@@ -361,8 +361,11 @@ def build_mlx_launch_argv(
                 fallback=python_executable,
                 module="omlx.cluster.inference_worker",
             ),
+            # One shared argv launches every rank; send the ~-form so each rank
+            # resolves the model in its own home (worker expands it). A coord
+            # absolute path outside ~ is returned unchanged.
             "--model",
-            deployment.model,
+            home_relative_model_path(deployment.model),
             "--backend",
             deployment.backend,
             "--port",
@@ -1479,12 +1482,15 @@ def preflight_remote_hosts(
             )
             continue
         remote_python = host.python_executable or python_executable
+        # Send the ~-form: deployment.model is the coordinator's absolute path,
+        # which names nothing on a peer with a different macOS account. The
+        # preflight script expanduser()s it in the peer's own home.
         remote_command = shlex.join(
             [
                 remote_python,
                 "-c",
                 script,
-                deployment.model,
+                home_relative_model_path(deployment.model),
                 str(assignment.start_layer),
                 str(assignment.end_layer),
                 assignment.memory_guard_tier,
