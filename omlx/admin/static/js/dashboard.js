@@ -1178,6 +1178,9 @@
                     }
                     if (nodes.some(node => !previousIds.has(node.node_id))) {
                         this._clusterKnownNodesNeedsSync = true;
+                        // A newly joined node changes the topology, so its
+                        // budgets should be measured once on the next setup pass.
+                        this._clusterBudgetsMeasured = false;
                         this.saveClusterKnownNodes();
                     }
                     this.clusterJoinError = result.load_error || '';
@@ -2002,7 +2005,8 @@
                 // While the probe is backing off after failures, budgets would
                 // fail over the same SSH path, so they wait for the same hold.
                 if (this.clusterWorkerPeers().length
-                        && !this.clusterProbeBackoffActive()) {
+                        && !this.clusterProbeBackoffActive()
+                        && !this._clusterBudgetsMeasured) {
                     await this.measureClusterBudgets();
                 }
 
@@ -2305,6 +2309,10 @@
                     this.clusterFabricError = '';
                     this.clusterIpsOverridden = false;
                 }
+                // A different peer is a different machine: its budgets must be
+                // re-measured once (the recurring poll skips already-measured
+                // topologies to avoid jitter).
+                this._clusterBudgetsMeasured = false;
                 this.invalidateClusterPlan();
             },
 
@@ -5656,6 +5664,15 @@
                         this.clusterCatalogue = null;
                         this.invalidateClusterPlan();
                     }
+                    // Budgets are now known for this topology. The recurring
+                    // discovery poll must not re-measure them: the peer's live
+                    // admission ceiling wobbles by more than the drift guard on
+                    // a busy Mac, and re-measuring every 10 s emptied the model
+                    // list and reset the topology controls (visible jitter).
+                    // A peer or node change resets this flag (see
+                    // invalidateClusterPeer / the join-status merge); an
+                    // explicit peer selection re-measures directly.
+                    this._clusterBudgetsMeasured = true;
                 } catch (error) {
                     this.clusterBudgetsError = String(error);
                 } finally {
