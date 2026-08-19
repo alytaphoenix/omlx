@@ -761,7 +761,7 @@ def test_resolving_a_link_falls_back_to_a_verified_ethernet_path():
     assert link.peer.address == "192.168.4.22"
 
 
-def test_link_verification_checks_route_and_ping_from_both_macs():
+def test_link_verification_requires_bound_tcp_from_both_macs():
     link = shared_link_addresses(_laptop(), _studio())
     calls = []
 
@@ -770,18 +770,80 @@ def test_link_verification_checks_route_and_ping_from_both_macs():
         if command[0] == "/sbin/route":
             interface = "en4" if host == "127.0.0.1" else "en5"
             return subprocess.CompletedProcess(command, 0, f"interface: {interface}\n", "")
+        if command[0] == "python3":
+            return subprocess.CompletedProcess(command, 0, "", "")
         return subprocess.CompletedProcess(command, 0, "one packet received\n", "")
 
     verified, reason = verify_link_reachability(link, runner=runner)
 
     assert verified is True
     assert reason == link.reason
+    # TCP bound-connect is the success criterion; ping is never consulted.
     assert [command[0] for _, command in calls] == [
         "/sbin/route",
-        "/sbin/ping",
+        "python3",
         "/sbin/route",
-        "/sbin/ping",
+        "python3",
     ]
+    assert not any(command[0] == "/sbin/ping" for _, command in calls)
+
+
+def test_link_verification_flags_firewall_when_tcp_refused_but_ping_ok():
+    # Route + ICMP both fine, but the bound TCP connect is refused in one
+    # direction — the VPN/firewall-drops-inbound-TCP case. Must fail and name
+    # the blocking Mac + the likely cause.
+    link = shared_link_addresses(_laptop(), _studio())
+
+    def runner(host, command):
+        if command[0] == "/sbin/route":
+            interface = "en4" if host == "127.0.0.1" else "en5"
+            return subprocess.CompletedProcess(command, 0, f"interface: {interface}\n", "")
+        if command[0] == "python3":
+            # coordinator->peer connects; peer->coordinator is refused.
+            ok = host == "127.0.0.1"
+            return subprocess.CompletedProcess(command, 0 if ok else 1, "", "refused")
+        return subprocess.CompletedProcess(command, 0, "one packet received\n", "")
+
+    verified, reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is False
+    assert "cannot accept connections" in reason
+    assert "firewall or VPN" in reason
+
+
+def test_link_verification_reports_host_down_when_tcp_and_ping_fail():
+    link = shared_link_addresses(_laptop(), _studio())
+
+    def runner(host, command):
+        if command[0] == "/sbin/route":
+            interface = "en4" if host == "127.0.0.1" else "en5"
+            return subprocess.CompletedProcess(command, 0, f"interface: {interface}\n", "")
+        # Both TCP and ping fail in the second direction.
+        rc = 0 if host == "127.0.0.1" else 1
+        return subprocess.CompletedProcess(command, rc, "", "")
+
+    verified, reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is False
+    assert "no TCP, no ping" in reason
+
+
+def test_link_verification_accepts_bound_connect_without_route_command():
+    # Linux (or any host lacking macOS `route -n get`, returncode != 0): the
+    # bound TCP connect alone proves the path; existing behavior preserved.
+    link = shared_link_addresses(_laptop(), _studio())
+
+    def runner(_host, command):
+        if command[0] == "/sbin/route":
+            return subprocess.CompletedProcess(command, 1, "", "not supported")
+        if command[0] == "python3":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    verified, reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is True
+    assert reason == link.reason
 
 
 def test_link_verification_rejects_a_route_on_the_wrong_interface():

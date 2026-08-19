@@ -1643,18 +1643,38 @@ def _route_interface(output: str) -> str:
     return ""
 
 
+# A TCP connect *bound to the fabric source IP*. Proves the route AND that the
+# peer's SSH service answers over that exact path — the check that separates
+# "cable works" from "a VPN/firewall on that Mac swallows inbound TCP". ICMP and
+# route lookups can both pass while TCP is dropped (the incident's exact shape:
+# LAN ping/SSH fine, peer->coordinator on the fabric refused).
+_BOUND_CONNECT_SCRIPT = (
+    "import socket,sys\n"
+    "s=socket.create_connection((sys.argv[2],22),timeout=3,"
+    "source_address=(sys.argv[1],0))\n"
+    "s.close()"
+)
+
+
 def verify_link_reachability(
     link: SharedLink,
     *,
     runner: LinkCommandRunner | None = None,
 ) -> tuple[bool, str]:
-    """Prove both endpoints route and answer over the selected interfaces.
+    """Prove both endpoints route and answer TCP over the selected interfaces.
 
     Sharing a subnet is only a candidate. Macs can retain stale addresses on
     old Thunderbolt interfaces, and two unreachable interfaces can therefore
-    look like a perfect point-to-point link. The route must name the selected
-    interface in both directions and one bounded ICMP probe must succeed from
-    each endpoint before the address enters a hostfile.
+    look like a perfect point-to-point link. In each direction the route must
+    name the selected interface *and* a TCP connection bound to the fabric
+    source IP must succeed. TCP is the success criterion, not ping: a VPN or
+    firewall (org policy "all interfaces") can pass ICMP and route lookups while
+    refusing inbound TCP, which is exactly how the fabric silently failed.
+
+    Ping is kept only as a post-failure diagnostic, to tell "firewall drops TCP"
+    (route + ping fine, TCP refused) from "host down" (nothing answers). Worst
+    case on a fully dead link is ~3 bounded commands x 2 directions; acceptable
+    for an explicit, user-initiated check.
     """
 
     source, peer = link.source, link.peer
@@ -1664,25 +1684,12 @@ def verify_link_reachability(
     directions = ((source, peer), (peer, source))
     for local, remote in directions:
         route = run(local.host, ("/sbin/route", "-n", "get", remote.address))
-        selected = _route_interface(route.stdout) if route.returncode == 0 else ""
-        if selected != local.interface:
-            # Linux does not implement macOS's ``route -n get`` form. Binding
-            # a TCP connection to the candidate source address proves both the
-            # route and that the peer's SSH service answers on that exact path,
-            # without needing a platform-specific interface command.
-            script = (
-                "import socket,sys\n"
-                "s=socket.create_connection((sys.argv[2],22),timeout=3,"
-                "source_address=(sys.argv[1],0))\n"
-                "s.close()"
-            )
-            if route.returncode != 0:
-                bound = run(
-                    local.host,
-                    ("python3", "-c", script, local.address, remote.address),
-                )
-                if bound.returncode == 0:
-                    continue
+        route_available = route.returncode == 0
+        selected = _route_interface(route.stdout) if route_available else ""
+        # macOS names the egress interface; a mismatch means no route over our
+        # fabric interface. Linux lacks this ``route -n get`` form (returncode
+        # != 0) — there the bound connect below is the sole proof.
+        if route_available and selected != local.interface:
             detail = (
                 f"route uses {selected}"
                 if selected
@@ -1692,13 +1699,26 @@ def verify_link_reachability(
                 f"{local.host} cannot use {local.interface} to reach "
                 f"{remote.address}: {detail}."
             )
+        bound = run(
+            local.host,
+            ("python3", "-c", _BOUND_CONNECT_SCRIPT, local.address, remote.address),
+        )
+        if bound.returncode == 0:
+            continue
+        # TCP failed. Ping is only a diagnostic to name the likely cause.
         ping = run(
             local.host,
             ("/sbin/ping", "-n", "-c", "1", "-W", "1000", remote.address),
         )
-        if ping.returncode != 0:
+        if ping.returncode == 0:
             return False, (
-                f"{local.host} routes {remote.address} over {local.interface}, "
-                "but the peer did not answer on that address."
+                f"{remote.host} cannot accept connections on the Thunderbolt "
+                "link (a firewall or VPN on that Mac applies to all "
+                f"interfaces): {local.host} reached {remote.address} by ping "
+                "but the bound TCP connection was refused."
             )
+        return False, (
+            f"{local.host} routes {remote.address} over {local.interface}, "
+            f"but {remote.host} did not answer on that address (no TCP, no ping)."
+        )
     return True, link.reason
