@@ -235,6 +235,33 @@ def test_collect_status_advertises_ssh_user(monkeypatch):
     assert status.to_dict()["node"]["ssh_user"] == "aphoenix"
 
 
+def test_collect_status_advertises_the_admin_port(monkeypatch):
+    """C5: the coordinator aims its fast ceiling probe at this port."""
+
+    class _Settings:
+        class server:
+            port = 8123
+
+    monkeypatch.setattr("omlx.settings.get_settings", lambda: _Settings)
+    status = probe.collect_cluster_status()
+    assert status.admin_port == 8123
+    assert status.to_dict()["node"]["admin_port"] == 8123
+
+
+def test_collect_status_admin_port_is_zero_when_settings_are_unavailable(
+    monkeypatch,
+):
+    """A worker-only install has no server settings; 0 keeps legacy guesses."""
+
+    def _unavailable():
+        raise RuntimeError("settings are not configured")
+
+    monkeypatch.setattr("omlx.settings.get_settings", _unavailable)
+    status = probe.collect_cluster_status()
+    assert status.admin_port == 0
+    assert status.to_dict()["node"]["admin_port"] == 0
+
+
 def test_mlx_version_uses_core_module_version(monkeypatch):
     monkeypatch.setattr(probe.hardware, "HAS_MLX", True)
     monkeypatch.setattr(

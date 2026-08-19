@@ -1124,13 +1124,31 @@ def probe_remote_system_host(
     }
 
 
+@dataclass(frozen=True)
+class AdmissionCeilingProbe:
+    """One remote ceiling reading, with an honest account of how it was read.
+
+    ``ceiling_bytes`` is the same number the probe has always returned. The
+    confession fields exist because the fast /health path used to fail
+    silently: ``fast_probe_ok`` is False when the peer's admin API did not
+    answer and the slower in-process computation produced the ceiling, and
+    ``fast_probe_error`` carries the last error the fast path saw so the
+    caller can record it (design rule: fallbacks confess).
+    """
+
+    ceiling_bytes: int
+    fast_probe_ok: bool = True
+    fast_probe_error: str = ""
+
+
 def probe_remote_admission_ceiling(
     ssh_target: str,
     *,
     python_executable: str | None = None,
+    admin_port: int = 0,
     timeout: float = 8.0,
     runner: SSHRunner = subprocess.run,
-) -> int:
+) -> AdmissionCeilingProbe:
     """Read only the peer's live memory ceiling, without a hardware rescan.
 
     The full capability probe invokes ``system_profiler`` and transport tools;
@@ -1145,23 +1163,38 @@ def probe_remote_admission_ceiling(
     page oscillated between ready and Needs Attention (#2680).  With no known
     interpreter, or when the known one has stopped working, discover the peer's
     own instead.
+
+    ``admin_port`` is the port the peer itself advertised in its
+    ``ClusterStatus`` (C5). When known, the fast /health path targets exactly
+    that port — no guessing, and a miss is a real "the advertised port is
+    dead" signal the caller should confess. 0 (an older peer, or a status
+    that has not been read yet) preserves the legacy behavior: try the
+    coordinator's own configured port, then 9000.
     """
 
     # Ask the peer's live server first: one HTTP round trip instead of a cold
-    # `import omlx` (which imports MLX and can blow the SSH timeout). Peers
-    # conventionally run the coordinator's port; 9000 is kept as a legacy
-    # candidate for mixed setups. Hardcoding 9000 alone left the fast path dead
-    # on every cluster serving on the (default) port 8000.
-    try:
-        from omlx.settings import get_settings
+    # `import omlx` (which imports MLX and can blow the SSH timeout). With no
+    # advertised port, peers conventionally run the coordinator's port; 9000
+    # is kept as a legacy candidate for mixed setups. Hardcoding 9000 alone
+    # left the fast path dead on every cluster serving on the (default) port
+    # 8000.
+    if admin_port > 0:
+        ports: tuple[int, ...] = (int(admin_port),)
+    else:
+        try:
+            from omlx.settings import get_settings
 
-        local_port = int(get_settings().server.port)
-    except Exception:
-        local_port = 8000
-    ports = tuple(dict.fromkeys((local_port, 9000)))
+            local_port = int(get_settings().server.port)
+        except Exception:
+            local_port = 8000
+        ports = tuple(dict.fromkeys((local_port, 9000)))
+    # The script's JSON keeps `admission_ceiling_bytes` top-level so an older
+    # coordinator parsing this reply still finds the number; the fast-probe
+    # confession fields ride alongside it.
     script = (
         "import json,urllib.request\n"
         "ceiling=0\n"
+        "fast_error=''\n"
         f"for port in {ports!r}:\n"
         "    try:\n"
         "        with urllib.request.urlopen("
@@ -1170,12 +1203,15 @@ def probe_remote_admission_ceiling(
         "        ceiling=int(health.get('engine_pool',{}).get('final_ceiling',0))\n"
         "        if ceiling>0:\n"
         "            break\n"
-        "    except Exception:\n"
-        "        pass\n"
+        "        fast_error='port %d answered without a ceiling'%port\n"
+        "    except Exception as exc:\n"
+        "        fast_error='port %d: %s'%(port,exc)\n"
+        "fast_ok=ceiling>0\n"
         "if ceiling<=0:\n"
         "    from omlx.cluster.memory_guard import ceiling_breakdown\n"
         "    ceiling=int(ceiling_breakdown().get('hard_limit',0))\n"
-        "print(json.dumps({'admission_ceiling_bytes':ceiling}))"
+        "print(json.dumps({'admission_ceiling_bytes':ceiling,"
+        "'fast_probe_ok':fast_ok,'fast_probe_error':fast_error}))"
     )
 
     def _read(executable: str) -> subprocess.CompletedProcess[str]:
@@ -1246,7 +1282,13 @@ def probe_remote_admission_ceiling(
         raise DistributedLaunchError(
             f"{ssh_target} did not report an oMLX memory ceiling"
         )
-    return ceiling
+    return AdmissionCeilingProbe(
+        ceiling_bytes=ceiling,
+        # Missing fields default to a clean fast path: the script is ours,
+        # so absence means an unexpected reply shape, not a probed failure.
+        fast_probe_ok=bool(payload.get("fast_probe_ok", True)),
+        fast_probe_error=str(payload.get("fast_probe_error") or ""),
+    )
 
 
 # Runs on the peer under its own interpreter, like the probes above. It never

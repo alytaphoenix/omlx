@@ -560,3 +560,138 @@ def test_no_service_mapping_falls_back_to_ifconfig_and_says_so(
         assert store.current().addressing == "ifconfig"
     finally:
         _reset_store()
+
+
+# --- C5: detect_drift — live addressing versus the recorded intent ----------
+
+
+def _intent(addressing: str = "networksetup") -> fabric_intent_module.FabricIntent:
+    return fabric_intent_module.FabricIntent(
+        subnet="172.16.99.0/24",
+        hosts=HOSTS,
+        chosen_by="auto",
+        reason="collision_free_default",
+        recorded_at=1_700_000_000.0,
+        addressing=addressing,
+    )
+
+
+def _live(*pairs: tuple[str, str]) -> tuple[HostInterfaces, ...]:
+    from omlx.cluster.transport import InterfaceAddress
+
+    return (
+        HostInterfaces(
+            host="studio.local",
+            addresses=tuple(
+                InterfaceAddress(interface=iface, address=addr, prefix_length=24)
+                for iface, addr in pairs
+            ),
+            rdma_interfaces=frozenset({"en1"}),
+            thunderbolt_interfaces=frozenset({"en1"}),
+        ),
+    )
+
+
+def test_detect_drift_is_silent_while_live_matches_intent():
+    finding = fabric_intent_module.detect_drift(
+        _intent(), _live(("en1", "172.16.99.2"))
+    )
+    assert finding is None
+
+
+def test_detect_drift_ignores_non_fabric_interfaces_when_matching():
+    # A Wi-Fi address inside the subnet must not satisfy the fabric intent.
+    finding = fabric_intent_module.detect_drift(
+        _intent(), _live(("en0", "172.16.99.2"))
+    )
+    assert finding is not None
+    assert finding.kind == "address_lost"
+
+
+def test_detect_drift_reports_a_lost_address_after_reboot():
+    finding = fabric_intent_module.detect_drift(_intent("ifconfig"), _live())
+    assert finding is not None
+    assert finding.kind == "address_lost"
+    assert finding.live == ""
+    assert finding.expected == "172.16.99.0/24"
+    # An ifconfig-recorded link may not be silently re-addressed: the WARN
+    # invites a consented Doctor re-address instead.
+    assert finding.auto_restore is False
+    assert "ifconfig" in finding.incident
+    assert "Fabric Doctor" in finding.incident
+
+
+def test_detect_drift_lost_networksetup_address_is_auto_restorable():
+    finding = fabric_intent_module.detect_drift(_intent("networksetup"), _live())
+    assert finding is not None
+    assert finding.kind == "address_lost"
+    # The service configuration persists; re-asserting it needs no new
+    # consent, so the caller restores silently — no incident copy.
+    assert finding.auto_restore is True
+    assert finding.incident == ""
+
+
+def test_detect_drift_reports_a_changed_address():
+    finding = fabric_intent_module.detect_drift(
+        _intent("ifconfig"), _live(("en1", "169.254.7.7"))
+    )
+    assert finding is not None
+    assert finding.kind == "address_changed"
+    assert finding.live == "en1 169.254.7.7"
+    assert finding.expected == "172.16.99.0/24"
+    assert finding.auto_restore is False
+    assert "Fabric Doctor" in finding.incident
+
+
+def test_detect_drift_reports_a_new_collision_with_the_design_copy():
+    vpn_range = ipaddress.ip_network("172.16.0.0/12")
+
+    finding = fabric_intent_module.detect_drift(
+        _intent("networksetup"),
+        _live(("en1", "172.16.99.2")),
+        collides=lambda candidate: candidate.overlaps(vpn_range),
+    )
+
+    assert finding is not None
+    assert finding.kind == "intent_collides"
+    assert finding.expected == "172.16.99.0/24"
+    assert "en1 172.16.99.2" in finding.live
+    # A collided intent must never be silently re-applied, even for a
+    # networksetup-recorded link.
+    assert finding.auto_restore is False
+    assert finding.incident == (
+        "The link's saved addresses now collide with a new VPN range — "
+        "Fabric Doctor needs to pick new ones."
+    )
+
+
+def test_detect_drift_collision_outranks_a_lost_address():
+    finding = fabric_intent_module.detect_drift(
+        _intent("networksetup"),
+        _live(),
+        collides=lambda candidate: True,
+    )
+    assert finding is not None
+    assert finding.kind == "intent_collides"
+    assert finding.auto_restore is False
+
+
+def test_detect_drift_healthy_link_does_not_collide_with_itself():
+    """The caller excludes the intent's own subnet, configure_link-style."""
+
+    intent_net = ipaddress.ip_network("172.16.99.0/24")
+    # hostile_networks always contains the link's own interface subnet; the
+    # routes caller filters it before building the collision check.
+    hostile = (intent_net, ipaddress.ip_network("192.168.1.0/24"))
+    collision_set = tuple(
+        net for net in hostile if not net.subnet_of(intent_net)
+    )
+
+    finding = fabric_intent_module.detect_drift(
+        _intent(),
+        _live(("en1", "172.16.99.2")),
+        collides=lambda candidate: any(
+            candidate.overlaps(net) for net in collision_set
+        ),
+    )
+    assert finding is None
