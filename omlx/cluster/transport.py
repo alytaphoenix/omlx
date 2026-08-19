@@ -184,6 +184,15 @@ def _extract_tb_link_speed(ssh_hostname: str) -> int | None:
 
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _FAST_KINDS = {"thunderbolt", "rdma"}
+# ``ibv_devinfo`` answers in well under a second on a healthy device; the only
+# time it blocks is when the RDMA device is bound to a wedged Thunderbolt link
+# (a downed cable/controller). A 30s cap turned that into a 30s hang per device
+# on exactly the failure the caller most needs to report quickly. 15s keeps the
+# SSH connect allowance (10s, this file's convention) intact and adds only a
+# few seconds of slack for a command that normally returns near-instantly —
+# still half the worst case, and the caller gets a fast, actionable failure
+# instead of a long silent hang.
+_RDMA_PROBE_TIMEOUT = 15
 
 
 def _rdma_devices(ssh_hostname: str) -> list[str]:
@@ -635,8 +644,18 @@ def _rdma_port_state(ssh_hostname: str, device: str) -> str | None:
         ]
     try:
         result = subprocess.run(
-            command, capture_output=True, text=True, check=False, timeout=30
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_RDMA_PROBE_TIMEOUT,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"RDMA port probe for {ssh_hostname} did not respond within "
+            f"{_RDMA_PROBE_TIMEOUT}s — the Thunderbolt link is most likely "
+            "down (reseat the cable or wake both Macs and try again)."
+        ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(
             f"RDMA port probe failed for {ssh_hostname}: {exc}"
