@@ -2374,15 +2374,26 @@ async def health(response: Response):
     if _server_state.engine_pool is not None:
         enforcer = _server_state.process_memory_enforcer
         ceiling = 0
+        ceiling_components = None
         if enforcer is not None:
             try:
-                ceiling = enforcer.get_final_ceiling()
+                # One computation serves both numbers: get_final_ceiling() is
+                # get_ceiling_breakdown()["hard_limit"], so reading the
+                # breakdown costs nothing extra per poll. The components let a
+                # cluster coordinator's fast ceiling probe show the arithmetic
+                # behind the ceiling (B5) without a cold `import omlx` on the
+                # peer; an older server simply omits the key and the
+                # coordinator renders the ceiling alone.
+                ceiling_components = dict(enforcer.get_ceiling_breakdown())
+                ceiling = int(ceiling_components.get("hard_limit", 0))
             except Exception as exc:  # noqa: BLE001
+                ceiling_components = None
                 logger.warning("Health memory ceiling unavailable: %s", exc)
         pool_status = {
             "model_count": _server_state.engine_pool.model_count,
             "loaded_count": _server_state.engine_pool.loaded_model_count,
             "final_ceiling": ceiling,
+            "ceiling_breakdown": ceiling_components,
             "current_model_memory": _server_state.engine_pool.current_model_memory,
         }
 
