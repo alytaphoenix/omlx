@@ -19,16 +19,17 @@ logits remain on GPU.
 - The dual path is intended for M3 Ultra, where the two dies expose physical
   ANE instances 1 and 2.
 - The oMLX native custom kernels must be built (`OMLX_WITH_CUSTOM_KERNEL=1`).
-- Dense Qwen3.5/3.6/3.8 affine q4 gate/up linears with group size 64 or 128.
+- Dense Qwen3.5/3.6/3.8 affine q4, q6, or q8 gate/up linears with group size
+  64 or 128.
   The down projection may use compatible affine q2/q4/q5/q6/q8 weights and
   remains on the GPU.
-- Optional GDN acceleration accepts affine q4/q5 projections with group size
-  64 or 128. Mixed q4/q5 layouts are supported when the ANE prefix covers the
-  full z projection, leaving a homogeneous qkv suffix on the GPU.
+- Optional GDN acceleration accepts affine q4/q5/q6/q8 projections with group
+  size 64 or 128. Mixed q4/q5/q6/q8 layouts are supported when the ANE prefix
+  covers the full z projection, leaving a homogeneous qkv suffix on the GPU.
 - An MLP prefill call whose flattened token count exactly matches the fixed
   configured sequence length. Decode, target verification, short chunks, and
   unsupported layers automatically use the existing path.
-- Fixed-shape ANE programs and their combined q4 suffixes are prepared eagerly
+- Fixed-shape ANE programs and their combined affine suffixes are prepared eagerly
   on the MLX executor while the model starts. For the 64-layer 27B target this
   adds a substantial startup phase, but the first matching prompt no longer
   pays the compilation cost. Programs are cached for the model's lifetime.
@@ -47,6 +48,13 @@ metallib is missing at runtime, the suffix quietly falls back to the
 classic Metal kernels, and `OMLX_QWEN35_QMM_NAX=0` forces that fallback.
 `OMLX_QWEN35_ANE_PREFILL=0` keeps the whole feature off everywhere
 regardless of the per-model setting.
+
+The ANE GDN dispatch runs through the mlx-lm prefill linear patch, so
+`OMLX_QWEN35_Q4_LM_LINEAR=0` disables ANE GDN acceleration as well as the
+standalone GPU qmm routing. GDN b/a suffix projections follow the same q8
+token threshold as that patch: below `OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS`
+(default 16384, which covers every fixed ANE shape) q8 b/a use stock MLX,
+where the native q8 tile is not profitable.
 
 ## Per-model settings
 
