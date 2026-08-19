@@ -4552,6 +4552,35 @@ async def create_completion(
         raise
 
 
+def _request_has_image_content(messages) -> bool:
+    """True if any message carries an image content part.
+
+    OpenAI content parts arrive as dicts (``{"type": "image_url", ...}``); be
+    tolerant of object-shaped parts too. Text-only requests have string content
+    and return False.
+    """
+
+    for message in messages:
+        content = getattr(message, "content", None)
+        if content is None and isinstance(message, dict):
+            content = message.get("content")
+        if not isinstance(content, (list, tuple)):
+            continue
+        for part in content:
+            ptype = (
+                part.get("type")
+                if isinstance(part, dict)
+                else getattr(part, "type", None)
+            )
+            if (
+                ptype in {"image_url", "image", "input_image"}
+                or (isinstance(part, dict) and "image_url" in part)
+                or getattr(part, "image_url", None) is not None
+            ):
+                return True
+    return False
+
+
 def _merge_chat_template_kwargs(
     request: ChatCompletionRequest, ms
 ) -> tuple[dict, int | None]:
@@ -4800,6 +4829,23 @@ async def create_chat_completion(
             settings_guided_grammar = _settings_guided_grammar(ms)
         merged_ct_kwargs, thinking_budget = _merge_chat_template_kwargs(request, ms)
 
+        # A VLM served text-only across the cluster dropped its vision tower.
+        # Reject image content with a clear error instead of silently stripping
+        # it (extract_text_content below would otherwise discard the images).
+        deployment = getattr(engine, "deployment", None)
+        if (
+            deployment is not None
+            and getattr(deployment, "text_only", False)
+            and _request_has_image_content(request.messages)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This model is deployed text-only across the cluster "
+                    "(vision disabled); image content is not supported. "
+                    "Serve it on a single node to use vision."
+                ),
+            )
         chat_messages = _extract_chat_messages(
             request, engine, resolved_model, max_tool_result_tokens
         )
