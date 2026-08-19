@@ -230,6 +230,9 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
+        # Test-only reset hook for the in-memory start-job store singleton
+        # (B2); production code never needs to reset it mid-process.
+        ("start_job.py", "reset_start_job_store"),
     }
 
     sources = {

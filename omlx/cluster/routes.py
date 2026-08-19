@@ -53,7 +53,7 @@ from .discovery import (
 from .doctor import run_fabric_doctor
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
 from .guidance import explain, explain_code
-from .incidents import Severity, get_cluster_incidents
+from .incidents import Incident, Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
@@ -106,6 +106,11 @@ from .staging import (
     remote_model_staging_inventory,
     stage_files_from_source,
     stage_manifest,
+)
+from .start_job import (
+    StartJobConflictError,
+    get_start_job_store,
+    run_start_job,
 )
 from .strategy_benchmarks import get_strategy_benchmark_store
 from .supervisor import run_worker_smoke
@@ -348,22 +353,23 @@ def _record_cluster_incident(
     source: str = "coordinator",
     job_id: str | None = None,
     deployment_id: str | None = None,
-) -> None:
+) -> Incident | None:
     """Best-effort incident funnel for the routes layer.
 
     Failure paths call this immediately before re-raising, so nothing here may
     mask the original error: an unconfigured store (worker-only installs,
     bare test apps) or a failed save is swallowed. The message is redacted at
-    record time so the stored copy is already safe to serve.
+    record time so the stored copy is already safe to serve. Returns the
+    recorded incident (the B2 job runner links it to the job) or ``None``.
     """
 
     try:
         store = get_cluster_incidents()
     except RuntimeError:
-        return
+        return None
     redacted = str(_redact_diagnostic(str(message)))
     try:
-        store.record(
+        return store.record(
             severity,
             source,
             state_code,
@@ -373,7 +379,7 @@ def _record_cluster_incident(
             deployment_id=deployment_id,
         )
     except Exception:  # noqa: BLE001 - logging must never outrank the failure
-        return
+        return None
 
 
 # A full-tunnel VPN is a standing condition, not an event: one INFO incident
@@ -1246,6 +1252,16 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     preflight and staging checks report ready.
     """
 
+    return await _autoconfigure(request)
+
+
+async def _autoconfigure(request: ClusterAutoconfigureRequest) -> dict[str, Any]:
+    """One autoconfigure pass — the endpoint body, unchanged (B2 refactor).
+
+    Kept as a plain callable so the start-job runner can run the same ladder
+    the ``/autoconfigure`` endpoint serves, byte-identically.
+    """
+
     _validate_cluster_hosts(request.hosts)
 
     plan_request = ClusterPlanRequest(
@@ -1992,6 +2008,253 @@ async def cluster_stage_status(job_id: str):
     if snapshot is None:
         raise HTTPException(status_code=404, detail="staging job not found")
     return snapshot
+
+
+# --- B2: Start Cluster as a persisted server-owned job -----------------------
+#
+# The guard below is shared between the legacy sync activation endpoint and
+# the async job path. It is a threading.Lock around a counter, never held
+# across an await: both paths run on the same event loop, so holding a lock
+# for the duration of an activation would deadlock the server.
+_ACTIVATION_GUARD_LOCK = threading.Lock()
+_SYNC_ACTIVATIONS_IN_FLIGHT = 0
+
+# Strong references to running job tasks: a bare create_task result may be
+# garbage-collected mid-flight.
+_START_JOB_TASKS: dict[str, asyncio.Task] = {}
+
+
+def _claim_sync_activation() -> None:
+    """Admit one legacy ``POST /deployments`` call, or refuse with a 409."""
+
+    global _SYNC_ACTIVATIONS_IN_FLIGHT
+    with _ACTIVATION_GUARD_LOCK:
+        active = get_start_job_store().active_job()
+        if active is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"A Start Cluster job ({active['job_id']}) is already "
+                    "running; wait for it to finish or watch "
+                    f"/admin/api/cluster/start-jobs/{active['job_id']}."
+                ),
+            )
+        _SYNC_ACTIVATIONS_IN_FLIGHT += 1
+
+
+def _release_sync_activation() -> None:
+    global _SYNC_ACTIVATIONS_IN_FLIGHT
+    with _ACTIVATION_GUARD_LOCK:
+        _SYNC_ACTIVATIONS_IN_FLIGHT = max(0, _SYNC_ACTIVATIONS_IN_FLIGHT - 1)
+
+
+def _start_job_incident(
+    severity: Severity,
+    state_code: str,
+    message: str,
+    *,
+    job_id: str,
+    deployment_id: str | None = None,
+) -> str | None:
+    """The job runner's incident funnel; returns the incident id or None."""
+
+    incident = _record_cluster_incident(
+        severity,
+        state_code,
+        message,
+        job_id=job_id,
+        deployment_id=deployment_id,
+    )
+    return incident.id if incident is not None else None
+
+
+def _describe_start_job_error(exc: BaseException) -> str:
+    """The user-facing sentence for a failed phase, HTTP detail included."""
+
+    if isinstance(exc, HTTPException):
+        return str(exc.detail)
+    return str(exc) or exc.__class__.__name__
+
+
+async def _configure_start_link(hosts: list[str]) -> None:
+    """The link phase of the ladder, exactly as the dashboard ran it.
+
+    ``GET /link-status`` then, when setup is available, ``configure_link``
+    per physical pair — the same pair selection ``prepareClusterLink()``
+    used: detected Thunderbolt/RDMA pairs, or the only pair there is.
+    """
+
+    if len(hosts) < 2:
+        return
+    status = await asyncio.to_thread(assess_link, hosts)
+    if not status.setup_available:
+        return
+    pairs: list[tuple[str, str]] = []
+    if len(hosts) == 2:
+        pairs.append((hosts[0], hosts[1]))
+    else:
+        try:
+            matrix = await asyncio.to_thread(detect_cluster_transports, hosts)
+            seen: set[tuple[str, ...]] = set()
+            for transport in matrix.transports:
+                if transport.kind not in {"thunderbolt", "rdma"}:
+                    continue
+                endpoints = (transport.source_node_id, transport.peer_node_id)
+                if any(endpoint not in hosts for endpoint in endpoints):
+                    continue
+                key = tuple(sorted(endpoints))
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append(endpoints)
+        except (OSError, RuntimeError):
+            pairs = []
+        if not pairs:
+            raise RuntimeError(
+                "oMLX could not identify the physical links between these Macs."
+            )
+    for pair in pairs:
+        await asyncio.to_thread(configure_link, list(pair))
+
+
+async def _start_job_staging(proposal: dict[str, Any]) -> str:
+    """Spawn the existing staging job for the proposal; return its job id."""
+
+    activation = ClusterDeploymentRequest.model_validate(proposal["activation"])
+    snapshot = await cluster_stage(ClusterStageRequest(activation=activation))
+    return str(snapshot["job_id"])
+
+
+async def _wait_for_staging_job(staging_job_id: str) -> dict[str, Any]:
+    """Poll the staging job registry until the copy finishes either way."""
+
+    while True:
+        snapshot = _staging_job_snapshot(staging_job_id)
+        if snapshot is None:
+            raise RuntimeError(
+                "the staging job disappeared before it finished"
+            )
+        if snapshot.get("status") in {"completed", "failed"}:
+            return snapshot
+        await asyncio.sleep(1.0)
+
+
+async def _run_cluster_start_job(
+    job_id: str, request: ClusterAutoconfigureRequest
+) -> None:
+    """Wire the routes-layer phase callables into the start-job runner.
+
+    Every phase resolves its target through this module's globals at call
+    time, so tests can monkeypatch ``_autoconfigure`` / ``_run_staging_job``
+    / ``_activate`` and drive the same orchestration the server runs.
+    """
+
+    hosts = [host.ssh for host in request.hosts]
+    await run_start_job(
+        get_start_job_store(),
+        job_id,
+        link_setup=lambda: _configure_start_link(hosts),
+        autoconfigure=lambda: _autoconfigure(request),
+        start_staging=lambda proposal: _start_job_staging(proposal),
+        wait_staging=lambda staging_job_id: _wait_for_staging_job(
+            staging_job_id
+        ),
+        activate=lambda activation: _activate(
+            ClusterDeploymentRequest.model_validate(activation)
+        ),
+        record_incident=_start_job_incident,
+        describe_error=_describe_start_job_error,
+    )
+
+
+def _schedule_start_job(
+    job_id: str, request: ClusterAutoconfigureRequest
+) -> None:
+    """Run the job on the server's event loop — never a thread.
+
+    The activation phase is async and touches the engine pool, so the job
+    must live where the pool lives.
+    """
+
+    task = asyncio.get_running_loop().create_task(
+        _run_cluster_start_job(job_id, request),
+        name=f"omlx-cluster-start-{job_id[:8]}",
+    )
+    _START_JOB_TASKS[job_id] = task
+    task.add_done_callback(
+        lambda _task, job_id=job_id: _START_JOB_TASKS.pop(job_id, None)
+    )
+
+
+@router.post("/start-jobs", status_code=202)
+async def cluster_start_job_create(request: ClusterAutoconfigureRequest):
+    """Create one server-owned Start Cluster job and return its record.
+
+    The body is exactly the autoconfigure request the one-click button has
+    always posted; the server now owns the whole ladder, so a browser reload
+    re-attaches to this record instead of finding a dead button.
+    """
+
+    _validate_cluster_hosts(request.hosts)
+    model_path = (request.model_path or "").strip()
+    if not model_path:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose a downloaded model before starting the cluster.",
+        )
+    store = get_start_job_store()
+    with _ACTIVATION_GUARD_LOCK:
+        if _SYNC_ACTIVATIONS_IN_FLIGHT:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A manual activation is already in flight; wait for it "
+                    "to finish before starting a cluster job."
+                ),
+            )
+        try:
+            job, superseded_ids = store.create(
+                model_path=model_path,
+                hosts=[host.ssh for host in request.hosts],
+            )
+        except StartJobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    for old_job_id in superseded_ids:
+        # "#4 replaces #3": the earlier attempt's incidents stay in the feed,
+        # flagged rather than deleted, and the new attempt says so.
+        incident = _record_cluster_incident(
+            Severity.INFO,
+            "start_job_superseded",
+            f"Start Cluster attempt #{job['attempt']} replaces the failed "
+            f"attempt {old_job_id}.",
+            job_id=job["job_id"],
+        )
+        if incident is not None:
+            try:
+                get_cluster_incidents().supersede(old_job_id, incident.id)
+            except Exception:  # noqa: BLE001 - history flagging is best-effort
+                pass
+    _schedule_start_job(job["job_id"], request)
+    return job
+
+
+@router.get("/start-jobs")
+async def cluster_start_jobs():
+    """Recent start jobs, newest first — the reload re-attach point."""
+
+    return {"jobs": get_start_job_store().list()}
+
+
+@router.get("/start-jobs/{job_id}")
+async def cluster_start_job_status(job_id: str):
+    """One start-job record; the dashboard button renders exactly this."""
+
+    if not re.fullmatch(r"[0-9a-f]{24}", job_id):
+        raise HTTPException(status_code=404, detail="start job not found")
+    job = get_start_job_store().get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="start job not found")
+    return job
 
 
 class ClusterDoctorRequest(BaseModel):
@@ -3633,6 +3896,22 @@ async def _evict_competing_local_models(
 @router.post("/deployments")
 async def activate_cluster_deployment(request: ClusterDeploymentRequest):
     """Recompute, preflight, eagerly load, and prove one distributed model."""
+
+    # B2 mutual exclusion: the legacy sync path and a server-owned start job
+    # must never race each other into the engine pool.
+    _claim_sync_activation()
+    try:
+        return await _activate(request)
+    finally:
+        _release_sync_activation()
+
+
+async def _activate(request: ClusterDeploymentRequest) -> dict[str, Any]:
+    """The activation body, unchanged (B2 refactor).
+
+    Kept as a plain callable so the start-job runner activates through
+    exactly the code path ``POST /deployments`` serves.
+    """
 
     plan_changes: dict[str, Any] = {
         "changed": False,
