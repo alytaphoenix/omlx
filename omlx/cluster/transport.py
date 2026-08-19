@@ -939,7 +939,26 @@ def configure_link(hosts: list[str] | tuple[str, ...]) -> LinkStatus:
     if existing:
         network = ipaddress.ip_network(f"{existing}/24", strict=False)
     else:
-        network = choose_fabric_subnet(_occupied_networks(hosts))
+        # Local import: vpn.py imports this module for its probing plumbing.
+        # Its reads only enrich this selection — every route a utun claims is
+        # hostile, and a range a VPN provably excludes ranks first. The bound
+        # connect in assess_link below stays the authority on the result.
+        from .vpn import detect_vpn, hostile_networks
+
+        probed: dict[str, HostInterfaces] = {}
+        for host in hosts:
+            with suppress(RuntimeError, OSError, subprocess.SubprocessError):
+                probed[host] = probe_host_interfaces(host)
+        preferred = tuple(
+            excluded
+            for host in hosts
+            for excluded in detect_vpn(
+                host, interfaces=probed.get(host)
+            ).exclusion_networks
+        )
+        network = choose_fabric_subnet(
+            hostile_networks(hosts, interfaces=probed), preferred=preferred
+        )
     for rank, host in enumerate(hosts):
         if current_ips[host]:
             continue
@@ -1176,6 +1195,7 @@ def choose_fabric_subnet(
     occupied: Iterable[ipaddress.IPv4Network],
     *,
     candidates: Sequence[ipaddress.IPv4Network] = _FABRIC_SUBNET_CANDIDATES,
+    preferred: Sequence[ipaddress.IPv4Network] = (),
 ) -> ipaddress.IPv4Network:
     """Pick a point-to-point fabric /24 that collides with nothing in use.
 
@@ -1185,10 +1205,27 @@ def choose_fabric_subnet(
     ranges first so the fabric survives a full-tunnel VPN; the empirical
     reachability check after addressing (``assess_link``) remains the authority
     on whether the chosen link actually carries traffic.
+
+    ``preferred`` are ranges a detected VPN provably excludes from its tunnel
+    (``vpn.VPNProfile.exclusions``): candidates contained in one rank before
+    the rest of the static order — the incident's 172.16.99.x trick,
+    systematized. A wrong exclusion read cannot poison the choice, because a
+    preferred candidate still has to pass the same collision check, and an
+    empty ``preferred`` leaves today's order untouched.
     """
 
     occupied = tuple(occupied)
-    for candidate in candidates:
+    ordered = tuple(candidates)
+    if preferred:
+        preferred = tuple(preferred)
+
+        def excluded(candidate: ipaddress.IPv4Network) -> bool:
+            return any(candidate.subnet_of(net) for net in preferred)
+
+        ordered = tuple(
+            candidate for candidate in ordered if excluded(candidate)
+        ) + tuple(candidate for candidate in ordered if not excluded(candidate))
+    for candidate in ordered:
         if not any(candidate.overlaps(net) for net in occupied):
             return candidate
     raise LinkSetupError(
