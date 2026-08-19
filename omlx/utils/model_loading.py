@@ -22,6 +22,19 @@ _RUNTIME_TEXT_PREFIX = "language_model.model."
 
 _MATERIALIZE_EVAL_CHUNK = 8
 
+# Parameter families that a VLM checkpoint served text-only never loads: the
+# vision tower, and multi-token-prediction draft heads. mlx-lm's ``sanitize``
+# drops both when loading text-only, so the distributed planner must not count
+# them toward the resident text-model size. Their names also collide with the
+# decoder-layer index pattern (``vision_tower.blocks.N``,
+# ``language_model.mtp.layers.0``), which otherwise mis-sizes pipeline stages.
+_VLM_VISION_PREFIXES = (
+    "vision_tower.",
+    "visual.",
+    "model.visual.",
+    "model.vision_tower.",
+)
+
 _MLX_LM_LOAD_CONFIG_PATCHED = False
 
 _REMOTE_CODE_METADATA_PATTERNS = [
