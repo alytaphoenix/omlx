@@ -157,6 +157,12 @@ class ClusterStatus:
     # OpenSSH resolves against the *caller's* account (or the caller's ssh_config
     # ``User``) — the wrong user on a cluster whose Macs have different accounts.
     ssh_user: str = ""
+    # The port this node's own admin API answers on. Advertised so a
+    # coordinator's fast memory-ceiling probe can target the peer's real
+    # server instead of guessing conventional ports (C5). 0 means the port
+    # is unknown (worker-only installs, older peers) and the coordinator
+    # must fall back to its legacy guesses.
+    admin_port: int = 0
 
     @property
     def thunderbolt_peer_connected(self) -> bool:
@@ -173,6 +179,7 @@ class ClusterStatus:
             "node": {
                 "hostname": self.hostname,
                 "ssh_user": self.ssh_user,
+                "admin_port": self.admin_port,
                 "platform": self.platform,
                 "chip_name": self.chip_name,
                 "physical_memory_bytes": self.physical_memory_bytes,

@@ -626,10 +626,25 @@ def collect_cluster_status(
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
 
+    try:
+        # Advertise the port this node's own admin API answers on, so a
+        # coordinator's fast ceiling probe targets the real server instead
+        # of guessing conventional ports (C5).
+        from omlx.settings import get_settings
+
+        admin_port = int(get_settings().server.port)
+    except Exception:
+        # Settings are genuinely absent on a worker-only install; 0 tells the
+        # coordinator to keep its legacy port fallback rather than fail.
+        admin_port = 0
+    if admin_port <= 0:
+        admin_port = 0
+
     return ClusterStatus(
         collected_at=timestamp.isoformat(),
         hostname=socket.gethostname(),
         ssh_user=local_login_name(),
+        admin_port=admin_port,
         platform=platform.platform(),
         chip_name=chip_name,
         physical_memory_bytes=physical_memory_bytes,
