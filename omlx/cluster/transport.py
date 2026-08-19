@@ -424,7 +424,12 @@ _RDMA_STATES = (
 
 @dataclass(frozen=True)
 class LinkStatus:
-    """What the fabric can actually do right now, and how to fix it."""
+    """What the fabric can actually do right now, and how to fix it.
+
+    ``ladder`` is the ``TransportState`` rung this evidence supports (a plain
+    string to keep this module import-light); ``reason``/``remedy`` are the
+    copy the CLI and GUI render verbatim beside it.
+    """
 
     state: str
     title: str
@@ -435,6 +440,9 @@ class LinkStatus:
     commands: tuple[str, ...] = ()
     doc_url: str = ""
     setup_available: bool = False
+    ladder: str = ""
+    reason: str = ""
+    remedy: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -447,6 +455,9 @@ class LinkStatus:
             "commands": list(self.commands),
             "doc_url": self.doc_url,
             "setup_available": self.setup_available,
+            "ladder": self.ladder,
+            "reason": self.reason,
+            "remedy": self.remedy,
         }
 
 
@@ -487,6 +498,15 @@ def classify_link(
             backend="ring",
             ready=True,
             link_label=label or "Ethernet / Wi-Fi",
+            ladder="enabled_no_peer",
+            reason=(
+                "No Thunderbolt link was found between these Macs, so the "
+                "fast fabric does not exist yet."
+            ),
+            remedy=(
+                "Connect a Thunderbolt 5 cable between the Macs, then detect "
+                "the link again."
+            ),
         )
 
     hosts = list(rdma_devices)
@@ -512,6 +532,16 @@ def classify_link(
                 "rdma_ctl enable",
             ),
             doc_url="https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt",
+            ladder="disabled",
+            reason=(
+                f"RDMA is switched off in the operating system on "
+                f"{', '.join(without_devices)}."
+            ),
+            remedy=(
+                "On each listed Mac: enter macOS Recovery, run `rdma_ctl "
+                "enable` in Utilities → Terminal, restart, then detect the "
+                "link again."
+            ),
         )
 
     inactive = [h for h in hosts if not active_ports.get(h)]
@@ -529,6 +559,15 @@ def classify_link(
             backend="jaccl-ring",
             ready=False,
             link_label=label,
+            ladder="peer_linked_config_pending",
+            reason=(
+                f"RDMA is enabled but no Thunderbolt port reports an active "
+                f"RDMA link on {', '.join(inactive)}."
+            ),
+            remedy=(
+                "Reseat the cable, wake both Macs, and detect the link again "
+                "— RDMA needs Thunderbolt 5 on both ends."
+            ),
         )
 
     unrouted = [h for h in hosts if not port_ips.get(h)]
@@ -547,6 +586,15 @@ def classify_link(
             link_label=label,
             doc_url="https://github.com/ml-explore/mlx/discussions/3481",
             setup_available=True,
+            ladder="peer_linked_config_pending",
+            reason=(
+                "The active Thunderbolt ports have no IP address, so the RDMA "
+                "queue pairs cannot be established."
+            ),
+            remedy=(
+                "Press Start Cluster — oMLX will configure and verify the "
+                "link after administrator approval."
+            ),
         )
 
     return LinkStatus(
@@ -560,6 +608,17 @@ def classify_link(
         backend="jaccl",
         ready=True,
         link_label=label,
+        # Per-host evidence proves addressing and routing, not two-ended
+        # reachability — that rung belongs to assess_link's bound connect.
+        ladder="routed",
+        reason=(
+            "Every Mac has an active, routable RDMA port; reachability "
+            "between them has not been proven yet."
+        ),
+        remedy=(
+            "Press Start — activation verifies the link before launching — "
+            "or run Fabric Doctor to prove it now."
+        ),
     )
 
 
@@ -893,6 +952,9 @@ def assess_link(
             detail="Add a peer Mac to check the link between them.",
             backend="ring",
             ready=False,
+            ladder="unavailable",
+            reason="No peer Macs are configured, so there is no link to assess.",
+            remedy="Add a peer Mac to check the link between them.",
         )
 
     try:
@@ -915,6 +977,9 @@ def assess_link(
             ),
             backend="ring",
             ready=False,
+            ladder="unavailable",
+            reason="The peer's RDMA state could not be read over SSH.",
+            remedy="Fix the SSH connection and detect the link again.",
         )
     thunderbolt = any(
         getattr(t, "kind", "") in _FAST_KINDS for t in transports
@@ -967,6 +1032,17 @@ def assess_link(
                 backend="jaccl",
                 ready=True,
                 link_label=label or "Thunderbolt RDMA",
+                # The bound connect proved both ends, which is what earns the
+                # REACHABLE rung; bandwidth verification comes later.
+                ladder="reachable",
+                reason=(
+                    "Both Macs answered on their fabric addresses in both "
+                    "directions."
+                ),
+                remedy=(
+                    "Nothing to fix — press Start; the fabric bandwidth check "
+                    "runs during activation."
+                ),
             )
         if status.state == "rdma_ready" and shared is not None and shared.ok:
             return LinkStatus(
@@ -980,6 +1056,15 @@ def assess_link(
                 backend="ring",
                 ready=True,
                 link_label="Ethernet / Wi-Fi",
+                ladder="routed",
+                reason=(
+                    "The Thunderbolt RDMA addresses did not form the usable "
+                    "route; a TCP route was verified instead."
+                ),
+                remedy=(
+                    "Run Fabric Doctor to re-address the Thunderbolt link if "
+                    "you want the RDMA path; the TCP ring works meanwhile."
+                ),
             )
         if status.state == "rdma_ready" and (shared is None or not shared.ok):
             reason = (
@@ -998,6 +1083,17 @@ def assess_link(
                 backend="ring",
                 ready=False,
                 link_label=status.link_label or "Thunderbolt",
+                # Addressed and routed per-host, but the bound connect failed:
+                # the ladder honestly stops below REACHABLE.
+                ladder="routed",
+                reason=(
+                    "The Thunderbolt addresses are configured but did not "
+                    "answer a bound connect between the Macs."
+                ),
+                remedy=(
+                    "Run Fabric Doctor to check the static addresses and "
+                    "routes on both Macs."
+                ),
             )
         if status.ready and (shared is None or not shared.ok):
             reason = (
@@ -1016,6 +1112,12 @@ def assess_link(
                 backend="ring",
                 ready=False,
                 link_label=status.link_label,
+                ladder="unavailable",
+                reason="No route between the Macs could be verified.",
+                remedy=(
+                    "Run Fabric Doctor, or check the network addresses and "
+                    "routes on both Macs."
+                ),
             )
     return status
 

@@ -17,7 +17,12 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Guidance:
-    """A readable failure with steps that resolve it."""
+    """A readable failure with steps that resolve it.
+
+    ``code`` is the stable machine key: readiness-ladder states and structured
+    diagnostics look guidance up by code (``explain_code``) so message-regex
+    and state-code paths converge on the same copy objects.
+    """
 
     title: str
     explanation: str
@@ -25,6 +30,7 @@ class Guidance:
     doc_anchor: str | None = None
     command: str | None = None
     keygen_command: str | None = None
+    code: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -34,6 +40,7 @@ class Guidance:
             "doc_anchor": self.doc_anchor,
             "command": self.command,
             "keygen_command": self.keygen_command,
+            "code": self.code,
         }
 
 
@@ -75,6 +82,7 @@ def _first_seen_host_guidance(message: str) -> Guidance | None:
         "pairing",
         f"ssh-copy-id -i ~/.ssh/omlx_cluster.pub {target}",
         "ssh-keygen -t ed25519 -f ~/.ssh/omlx_cluster -N '' -C omlx-cluster",
+        code="host_key_unknown",
     )
 
 
@@ -101,6 +109,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "runtime, memory, and links automatically.",
             ),
             "worker-runtime",
+            code="worker_runtime_unverified",
         ),
     ),
     (
@@ -116,6 +125,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "runtime, memory, and links automatically.",
             ),
             "worker-runtime",
+            code="worker_runtime_missing",
         ),
     ),
     (
@@ -135,6 +145,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Re-run Set up cluster afterwards to confirm.",
             ),
             "worker-runtime",
+            code="python_version_mismatch",
         ),
     ),
     (
@@ -154,6 +165,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "its source copy is incomplete.",
             ),
             "models",
+            code="model_stage_incomplete",
         ),
     ),
     (
@@ -174,6 +186,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "split, and retry so automatic placement owns the full plan.",
             ),
             "plan-approval",
+            code="plan_changed",
         ),
     ),
     (
@@ -194,6 +207,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "stale entry with ssh-keygen -R, then retry pairing.",
             ),
             "pairing",
+            code="host_identity_changed",
         ),
     ),
     (
@@ -207,6 +221,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Retry pairing after both Macs are updated to a current macOS release.",
             ),
             "pairing",
+            code="no_matching_host_key",
         ),
     ),
     (
@@ -219,6 +234,27 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Check that the SSH username in the peer address is correct.",
             ),
             "pairing",
+            code="login_rejected",
+        ),
+    ),
+    (
+        # Before the generic connection rules: a message naming a 169.254
+        # address is the stale self-assigned link, not a network outage. The
+        # code is also the readiness ladder's stale-address key, so the
+        # regex and structured lookups land on the same copy (#B3).
+        re.compile(r"self-assigned|\b169\.254\.\d{1,3}\.\d{1,3}\b", re.I),
+        Guidance(
+            "The Thunderbolt link has a stale self-assigned address",
+            "A 169.254 address means macOS never finished configuring the "
+            "link — it looks addressed, but the peers agree on the subnet and "
+            "on nothing else, so nothing can connect across it.",
+            (
+                "Run Fabric Doctor → Re-address link to give both ends a "
+                "routable address.",
+                "If it repeats after a reboot, reseat the cable and detect "
+                "the link again before starting the cluster.",
+            ),
+            code="stale_link_address",
         ),
     ),
     (
@@ -231,6 +267,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "If you typed it, try the .local name or the Thunderbolt IP.",
                 "Confirm both Macs are on the same network or cable.",
             ),
+            code="address_unresolved",
         ),
     ),
     (
@@ -243,6 +280,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "If you are using Thunderbolt, reseat the cable and re-run Detect link.",
                 "Confirm Remote Login is enabled in System Settings → General → Sharing.",
             ),
+            code="peer_unreachable",
         ),
     ),
     (
@@ -254,6 +292,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Check the peer is not asleep or under heavy load.",
                 "Retry — a first connection over a new link is often slower.",
             ),
+            code="peer_timeout",
         ),
     ),
     (
@@ -269,6 +308,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "family model.",
             ),
             "tensor-parallel",
+            code="no_tensor_parallel_support",
         ),
     ),
     (
@@ -282,6 +322,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Allow more memory on the Mac that is short, if it has headroom.",
                 "Choose a smaller model or add another Mac.",
             ),
+            code="no_workable_split",
         ),
     ),
     (
@@ -295,6 +336,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "degrees that divide evenly.",
             ),
             "tensor-parallel",
+            code="heads_not_divisible",
         ),
     ),
     (
@@ -304,6 +346,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
             "The cluster is arranged as pipeline stages of equal tensor-parallel "
             "groups, so the node count must be a multiple of the split.",
             ("Use automatic setup, or pick a split that divides your node count.",),
+            code="world_size_not_divisible",
         ),
     ),
     (
@@ -321,6 +364,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Update both Macs to the same oMLX release.",
                 "Re-run Set up cluster afterwards to confirm.",
             ),
+            code="version_mismatch",
         ),
     ),
     (
@@ -334,6 +378,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Make sure the paths match exactly on both.",
             ),
             "models",
+            code="model_missing_on_peer",
         ),
     ),
     (
@@ -342,6 +387,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
             "Clustering isn't set up on this Mac yet",
             "The cluster registry has not been initialised for this install.",
             ("Restart oMLX. If it persists, check the server logs for start-up errors.",),
+            code="registry_not_configured",
         ),
     ),
     (
@@ -353,6 +399,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Confirm /usr/bin/ssh-keygen exists.",
                 "If you manage your own keys, pair using an existing key instead.",
             ),
+            code="ssh_keygen_failed",
         ),
     ),
 )
@@ -364,7 +411,16 @@ _FALLBACK = Guidance(
         "Retry — transient link and SSH failures are common on a first connection.",
         "If it repeats, run Detect link to check the connection between the Macs.",
     ),
+    code="unknown_failure",
 )
+
+
+# Structured lookup by code. The first-seen-host guidance is deliberately
+# absent: its command embeds the peer target, so it only exists per-message.
+_BY_CODE: dict[str, Guidance] = {
+    guidance.code: guidance for _pattern, guidance in _RULES if guidance.code
+}
+_BY_CODE[_FALLBACK.code or "unknown_failure"] = _FALLBACK
 
 
 def explain(message: str | None) -> Guidance:
@@ -383,3 +439,17 @@ def explain(message: str | None) -> Guidance:
         if pattern.search(message):
             return guidance
     return _FALLBACK
+
+
+def explain_code(code: str | None, message: str | None = None) -> Guidance:
+    """Guidance by machine code, falling back through the message-regex path.
+
+    Same contract as ``explain``: never raises and never returns None, so an
+    unknown or absent code degrades to the message lookup rather than a hole.
+    """
+
+    if code:
+        guidance = _BY_CODE.get(code)
+        if guidance is not None:
+            return guidance
+    return explain(message)

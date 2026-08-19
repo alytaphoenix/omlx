@@ -817,3 +817,156 @@ def test_the_detected_link_speed_is_carried_into_the_explanation():
     assert link.link_speed_gbps == 120
     assert "120 Gb/s" in link.reason
     assert link.to_dict()["source"]["address"] == "10.0.1.1"
+
+
+# ---------------------------------------------------------------------------
+# Readiness ladder (B3): every branch names its rung and carries copy.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_ladder"),
+    [
+        ({}, "routed"),
+        ({"thunderbolt": False}, "enabled_no_peer"),
+        ({"rdma_devices": {h: [] for h in HOSTS}}, "disabled"),
+        ({"active_ports": {h: None for h in HOSTS}}, "peer_linked_config_pending"),
+        ({"port_ips": {h: None for h in HOSTS}}, "peer_linked_config_pending"),
+    ],
+)
+def test_classify_branches_carry_the_expected_ladder(overrides, expected_ladder):
+    status = _classify(**overrides)
+    assert status.ladder == expected_ladder
+    assert status.reason.strip(), f"{status.state} shipped without a reason"
+    assert status.remedy.strip(), f"{status.state} shipped without a remedy"
+    payload = status.to_dict()
+    assert payload["ladder"] == expected_ladder
+    assert payload["reason"] and payload["remedy"]
+
+
+def test_classify_rdma_ready_does_not_claim_reachable():
+    """Per-host evidence proves routing, never two-ended reachability."""
+
+    assert _classify().ladder == "routed"
+
+
+def test_no_peers_ladder_is_the_floor():
+    status = assess_link([])
+    assert status.ladder == "unavailable"
+    assert status.reason and status.remedy
+
+
+def test_failed_peer_probe_ladder_is_the_floor(monkeypatch):
+    def rejected(_host):
+        raise RuntimeError("SSH permission denied")
+
+    monkeypatch.setattr("omlx.cluster.transport._rdma_devices", rejected)
+
+    status = assess_link(HOSTS)
+
+    assert status.ladder == "unavailable"
+    assert "SSH" in status.remedy
+
+
+def _rdma_pair(monkeypatch):
+    monkeypatch.setattr(
+        "omlx.cluster.transport._rdma_devices",
+        lambda host: ["rdma_en6"] if host == HOSTS[0] else ["rdma_en5"],
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._active_rdma_port",
+        lambda host: "en6" if host == HOSTS[0] else "en5",
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._interface_ip",
+        lambda host, _interface: "10.0.1.1" if host == HOSTS[0] else "10.0.1.2",
+    )
+
+
+def test_verified_rdma_link_earns_the_reachable_rung(monkeypatch):
+    _rdma_pair(monkeypatch)
+    interfaces = {
+        HOSTS[0]: _host(
+            HOSTS[0], [("en6", "10.0.1.1", 30)], rdma=("en6",), thunderbolt=("en6",)
+        ),
+        HOSTS[1]: _host(
+            HOSTS[1], [("en5", "10.0.1.2", 30)], rdma=("en5",), thunderbolt=("en5",)
+        ),
+    }
+
+    status = assess_link(
+        HOSTS,
+        probe=interfaces.__getitem__,
+        verify=lambda _link: (True, "both ends answered"),
+    )
+
+    assert status.state == "rdma_ready"
+    assert status.ladder == "reachable"
+    assert status.reason and status.remedy
+
+
+def test_unreachable_addresses_stop_the_ladder_at_routed(monkeypatch):
+    """The unreachable branch names the Doctor as the way forward."""
+
+    _rdma_pair(monkeypatch)
+    interfaces = {
+        HOSTS[0]: _host(HOSTS[0], [("en6", "10.0.1.1", 30)], rdma=("en6",)),
+        HOSTS[1]: _host(HOSTS[1], [("en5", "10.0.1.2", 30)], rdma=("en5",)),
+    }
+
+    status = assess_link(
+        HOSTS,
+        probe=interfaces.__getitem__,
+        verify=lambda _link: (False, "the peer did not answer"),
+    )
+
+    assert status.state == "thunderbolt"
+    assert status.ladder == "routed"
+    assert "Fabric Doctor" in status.remedy
+
+
+def test_verified_tcp_fallback_reports_routed_with_doctor_remedy(monkeypatch):
+    _rdma_pair(monkeypatch)
+    interfaces = {
+        HOSTS[0]: _host(
+            HOSTS[0],
+            [("en6", "10.0.1.1", 30), ("en0", "192.168.4.21", 24)],
+            rdma=("en6",),
+        ),
+        HOSTS[1]: _host(
+            HOSTS[1],
+            [("en5", "10.0.1.2", 30), ("en0", "192.168.4.22", 24)],
+            rdma=("en5",),
+        ),
+    }
+
+    status = assess_link(
+        HOSTS,
+        probe=interfaces.__getitem__,
+        verify=lambda link: (link.kind == "ethernet", "RDMA did not answer"),
+    )
+
+    assert status.state == "ethernet"
+    assert status.ladder == "routed"
+    assert "Fabric Doctor" in status.remedy
+
+
+def test_unverified_network_route_ladder_is_the_floor(monkeypatch):
+    monkeypatch.setattr("omlx.cluster.transport._rdma_devices", lambda _host: [])
+    monkeypatch.setattr(
+        "omlx.cluster.transport._active_rdma_port", lambda _host: None
+    )
+    interfaces = {
+        HOSTS[0]: _host(HOSTS[0], [("en0", "192.168.4.21", 24)]),
+        HOSTS[1]: _host(HOSTS[1], [("en0", "192.168.4.22", 24)]),
+    }
+
+    status = assess_link(
+        HOSTS,
+        probe=interfaces.__getitem__,
+        verify=lambda _link: (False, "the peer did not answer"),
+    )
+
+    assert status.state == "unknown"
+    assert status.ladder == "unavailable"
+    assert status.reason and status.remedy
