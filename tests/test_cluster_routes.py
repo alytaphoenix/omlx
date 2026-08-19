@@ -123,7 +123,7 @@ class _ReadyClusterPool:
         self.entry = SimpleNamespace(engine=None)
         self.reloads = 0
 
-    def resolve_cluster_model_id(self, model_path):
+    def resolve_cluster_model_id(self, model_path, *, text_only=False):
         assert model_path == self.model_path
         if self.remote_only and not self.cluster_registered:
             from omlx.exceptions import ModelNotFoundError
@@ -131,7 +131,7 @@ class _ReadyClusterPool:
             raise ModelNotFoundError(model_path, [])
         return self.model_id
 
-    def register_cluster_model(self, model_path, *, estimated_size):
+    def register_cluster_model(self, model_path, *, estimated_size, text_only=False):
         assert model_path == self.model_path
         assert estimated_size > 0
         self.cluster_registered = True
