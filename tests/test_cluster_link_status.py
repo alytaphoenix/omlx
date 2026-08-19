@@ -306,10 +306,13 @@ def test_gui_setup_addresses_only_the_missing_endpoint(monkeypatch):
         "omlx.cluster.transport._interface_ip",
         lambda host, interface: None if host == "127.0.0.1" else "10.0.1.2",
     )
+    _stub_fresh_subnet_selection(monkeypatch)
     configured = []
     monkeypatch.setattr(
         "omlx.cluster.transport._authorized_ifconfig",
-        lambda host, interface, address: configured.append((host, interface, address)),
+        lambda host, interface, address, **_kw: configured.append(
+            (host, interface, address)
+        ),
     )
 
     status = configure_link(HOSTS)
@@ -373,7 +376,9 @@ def test_gui_setup_uses_native_authorization_on_both_macs(monkeypatch):
     configured = []
     monkeypatch.setattr(
         "omlx.cluster.transport._authorized_ifconfig",
-        lambda host, interface, address: configured.append((host, interface, address)),
+        lambda host, interface, address, **_kw: configured.append(
+            (host, interface, address)
+        ),
     )
 
     configure_link(HOSTS)
@@ -418,7 +423,7 @@ def test_gui_setup_can_configure_a_worker_to_worker_pair(monkeypatch):
     configured = []
     monkeypatch.setattr(
         "omlx.cluster.transport._authorized_ifconfig",
-        lambda host, interface, address: configured.append((host, address)),
+        lambda host, interface, address, **_kw: configured.append((host, address)),
     )
 
     assert configure_link(hosts).ready is True
