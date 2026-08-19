@@ -514,20 +514,29 @@ def stage_manifest(
             remote_dir,
             python_executable=source_python_executable,
         )
+    # A peer with a different macOS account has a different $HOME, so the
+    # coordinator-absolute path names nothing there. The worker now receives the
+    # ~-form and resolves it per-node (see home_relative_model_path / launch),
+    # so readiness must probe each peer in its OWN home too — otherwise an
+    # already-present model reads as entirely missing and a full re-copy is
+    # (needlessly, and here fatally) proposed.
+    portable = home_relative_model_path(str(model_path))
     present_by_node = {}
     for assignment in assignments:
         ssh_target = hosts_by_node.get(assignment.node_id)
         if not ssh_target:
             continue
-        present_by_node[assignment.node_id] = (
-            {
+        if is_local_host(ssh_target):
+            present_by_node[assignment.node_id] = {
                 path.name: path.stat().st_size
                 for path in Path(remote_dir).iterdir()
                 if path.is_file()
             }
-            if is_local_host(ssh_target)
-            else remote_file_sizes(ssh_target, remote_dir)
-        )
+        else:
+            peer_dir = remote_model_dir(ssh_target, portable)
+            present_by_node[assignment.node_id] = remote_file_sizes(
+                ssh_target, peer_dir
+            )
 
     plans = (
         plan_cluster_staging(
