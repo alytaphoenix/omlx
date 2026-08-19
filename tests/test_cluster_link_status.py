@@ -16,6 +16,8 @@ from omlx.cluster.transport import (
     InterfaceAddress,
     LinkStatus,
     TransportInfo,
+    _RDMA_PROBE_TIMEOUT,
+    _rdma_port_state,
     assess_link,
     classify_link,
     configure_link,
@@ -826,6 +828,31 @@ def test_link_verification_reports_host_down_when_tcp_and_ping_fail():
 
     assert verified is False
     assert "no TCP, no ping" in reason
+
+
+def test_rdma_port_state_reads_active_port(monkeypatch):
+    def fake_run(command, **kwargs):
+        assert kwargs.get("timeout") == _RDMA_PROBE_TIMEOUT
+        return subprocess.CompletedProcess(
+            command, 0, "\tstate:\t\tPORT_ACTIVE (4)\n", ""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert _rdma_port_state("127.0.0.1", "rdma_en3") == "PORT_ACTIVE"
+
+
+def test_rdma_port_state_fails_fast_on_a_wedged_link(monkeypatch):
+    # A downed Thunderbolt controller makes ibv_devinfo hang indefinitely
+    # querying kernel/driver state; the probe must bound that wait tightly
+    # (previously 30s per device) and say the link is the likely cause.
+    def fake_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="did not respond within"):
+        _rdma_port_state("M-FJX1D769D0.local", "rdma_en2")
 
 
 def test_link_verification_accepts_bound_connect_without_route_command():
