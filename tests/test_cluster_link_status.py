@@ -30,6 +30,7 @@ from omlx.cluster.transport import (
     shared_link_addresses,
     verify_link_reachability,
 )
+from omlx.cluster.vpn import VPNProfile
 
 HOSTS = ("127.0.0.1", "Studio.local")
 
@@ -317,6 +318,29 @@ def test_gui_setup_addresses_only_the_missing_endpoint(monkeypatch):
     assert configured == [("127.0.0.1", "en6", "10.0.1.1")]
 
 
+def _stub_fresh_subnet_selection(monkeypatch):
+    """Pin configure_link's tier-3 selection so tests are hermetic.
+
+    With no address on either endpoint, configure_link reads live interfaces,
+    routes and VPN posture to pick a collision-free /24. On a developer Mac
+    those reads see the real machine, so the stubs stand in for two clean
+    hosts: nothing occupied, no VPN, and the selection lands on the first
+    static candidate, 172.16.99.0/24.
+    """
+
+    monkeypatch.setattr(
+        "omlx.cluster.transport.probe_host_interfaces",
+        lambda host: HostInterfaces(host=host),
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.vpn.detect_vpn",
+        lambda host, **_kwargs: VPNProfile(),
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.vpn.hostile_networks", lambda hosts, **_kwargs: ()
+    )
+
+
 def test_gui_setup_uses_native_authorization_on_both_macs(monkeypatch):
     states = iter(
         [
@@ -345,6 +369,7 @@ def test_gui_setup_uses_native_authorization_on_both_macs(monkeypatch):
     monkeypatch.setattr(
         "omlx.cluster.transport._interface_ip", lambda host, interface: None
     )
+    _stub_fresh_subnet_selection(monkeypatch)
     configured = []
     monkeypatch.setattr(
         "omlx.cluster.transport._authorized_ifconfig",
@@ -354,8 +379,8 @@ def test_gui_setup_uses_native_authorization_on_both_macs(monkeypatch):
     configure_link(HOSTS)
 
     assert configured == [
-        ("127.0.0.1", "en6", "10.0.1.1"),
-        ("Studio.local", "en5", "10.0.1.2"),
+        ("127.0.0.1", "en6", "172.16.99.1"),
+        ("Studio.local", "en5", "172.16.99.2"),
     ]
 
 
@@ -389,6 +414,7 @@ def test_gui_setup_can_configure_a_worker_to_worker_pair(monkeypatch):
         "omlx.cluster.transport._interface_ip",
         lambda host, interface: None,
     )
+    _stub_fresh_subnet_selection(monkeypatch)
     configured = []
     monkeypatch.setattr(
         "omlx.cluster.transport._authorized_ifconfig",
@@ -397,8 +423,8 @@ def test_gui_setup_can_configure_a_worker_to_worker_pair(monkeypatch):
 
     assert configure_link(hosts).ready is True
     assert configured == [
-        ("mini.local", "10.0.1.1"),
-        ("studio.local", "10.0.1.2"),
+        ("mini.local", "172.16.99.1"),
+        ("studio.local", "172.16.99.2"),
     ]
 
 

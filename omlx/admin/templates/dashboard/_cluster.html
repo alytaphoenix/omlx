@@ -130,6 +130,16 @@
             </ul>
         </details>
 
+        <!-- C4: VPN pre-warning, shown before any fabric setup. A heuristic
+             read of the peer's configuration — it never gates Start; the
+             bound-connect probes remain the authority on the link. -->
+        <template x-for="warning in clusterVpnWarnings()" :key="'vpn-' + warning.host">
+            <div class="mb-6 flex items-start gap-2.5 rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+                <i data-lucide="shield-alert" class="w-4 h-4 mt-0.5 flex-shrink-0"></i>
+                <span class="break-words" x-text="warning.message"></span>
+            </div>
+        </template>
+
         <!-- Where you are in setting up a cluster. Four states, in order. -->
         <div x-show="clusterStatus && clusterShowSetupDetails" x-cloak class="mb-6">
             <ol class="grid grid-cols-2 lg:grid-cols-4 gap-3">
