@@ -50,6 +50,7 @@ from .discovery import (
     record_peer_transports,
     verify_pairing_token,
 )
+from .doctor import run_fabric_doctor
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
 from .guidance import explain, explain_code
 from .incidents import Severity, get_cluster_incidents
@@ -1845,6 +1846,142 @@ async def cluster_stage_status(job_id: str):
     return snapshot
 
 
+class ClusterDoctorRequest(BaseModel):
+    """The two link endpoints one Fabric Doctor run inspects."""
+
+    hosts: list[str] = Field(min_length=2, max_length=2)
+
+
+# The Doctor's own tiny job dict, mirroring the staging-job pattern above.
+# Deliberately minimal and generic — job_id/phase/findings/verdict — so a
+# later generalized job store (B2) can absorb it without an API change.
+_DOCTOR_JOBS: dict[str, dict[str, Any]] = {}
+_DOCTOR_JOBS_LOCK = threading.Lock()
+_MAX_DOCTOR_JOBS = 16
+
+
+def _doctor_job_snapshot(job_id: str) -> dict[str, Any] | None:
+    with _DOCTOR_JOBS_LOCK:
+        job = _DOCTOR_JOBS.get(job_id)
+        if job is None:
+            return None
+        return json.loads(json.dumps(job))
+
+
+def _record_doctor_job(job: dict[str, Any]) -> None:
+    with _DOCTOR_JOBS_LOCK:
+        if len(_DOCTOR_JOBS) >= _MAX_DOCTOR_JOBS:
+            finished = [
+                key
+                for key, value in _DOCTOR_JOBS.items()
+                if value.get("phase") in {"completed", "failed"}
+            ]
+            if finished:
+                _DOCTOR_JOBS.pop(finished[0], None)
+        _DOCTOR_JOBS[job["job_id"]] = job
+
+
+def _update_doctor_job(job_id: str, update: Any) -> None:
+    with _DOCTOR_JOBS_LOCK:
+        job = _DOCTOR_JOBS[job_id]
+        update(job)
+        job["updated_at"] = time.time()
+
+
+def _run_doctor_job(job_id: str, hosts: tuple[str, ...]) -> None:
+    """Run the ladder checks and land the report in the incident feed.
+
+    The Doctor takes tens of seconds (SSH probes plus a bounded collective
+    handshake), so it runs off-thread behind a job id. Every completed run
+    records exactly one incident whose severity follows the verdict, and the
+    report stays queryable through the job dict and ``/diagnostics``.
+    """
+
+    _update_doctor_job(job_id, lambda job: job.update(phase="running"))
+    try:
+        report = run_fabric_doctor(hosts)
+    except Exception as exc:  # noqa: BLE001 - the job must always conclude
+        message = f"Fabric Doctor run failed: {type(exc).__name__}: {exc}"
+
+        def fail(job: dict[str, Any]) -> None:
+            job.update(phase="failed", error=str(_redact_diagnostic(message)))
+
+        _update_doctor_job(job_id, fail)
+        _record_cluster_incident(
+            Severity.ERROR, "fabric_doctor_failed", message, job_id=job_id
+        )
+        return
+
+    findings = [finding.to_dict() for finding in report.findings]
+
+    def complete(job: dict[str, Any]) -> None:
+        job.update(
+            phase="completed",
+            findings=findings,
+            verdict=report.verdict,
+        )
+
+    _update_doctor_job(job_id, complete)
+    states = {finding.state for finding in report.findings}
+    severity = (
+        Severity.ERROR
+        if "fail" in states
+        else Severity.WARN
+        if "skipped" in states
+        else Severity.INFO
+    )
+    _record_cluster_incident(
+        severity, "fabric_doctor", report.verdict, job_id=job_id
+    )
+
+
+@router.post("/doctor", status_code=202)
+async def cluster_doctor_start(request: ClusterDoctorRequest):
+    """Start one Fabric Doctor run against a pair of link endpoints."""
+
+    hosts = tuple(host.strip() for host in request.hosts)
+    for host in hosts:
+        if _local_ssh_target(host):
+            continue
+        try:
+            validate_ssh_target(host)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job_id = secrets.token_hex(12)
+    _record_doctor_job(
+        {
+            "job_id": job_id,
+            "phase": "queued",
+            "hosts": list(hosts),
+            "findings": [],
+            "verdict": "",
+            "error": "",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+    )
+    thread = threading.Thread(
+        target=_run_doctor_job,
+        args=(job_id, hosts),
+        name=f"omlx-fabric-doctor-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id}
+
+
+@router.get("/doctor/{job_id}")
+async def cluster_doctor_status(job_id: str):
+    """Phase, findings, and verdict for one Fabric Doctor run."""
+
+    if not re.fullmatch(r"[0-9a-f]{24}", job_id):
+        raise HTTPException(status_code=404, detail="doctor job not found")
+    snapshot = _doctor_job_snapshot(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="doctor job not found")
+    return snapshot
+
+
 @router.get("/status")
 async def cluster_status(route_to: str | None = None):
     """Return this node's read-only distributed capability snapshot."""
@@ -1950,6 +2087,10 @@ async def cluster_diagnostics():
         staging_jobs = json.loads(
             json.dumps(list(_STAGING_JOBS.values())[-_MAX_STAGING_JOBS:])
         )
+    with _DOCTOR_JOBS_LOCK:
+        doctor_reports = json.loads(
+            json.dumps(list(_DOCTOR_JOBS.values())[-_MAX_DOCTOR_JOBS:])
+        )
     incidents: list[dict[str, Any]] = []
     try:
         incidents = [
@@ -1966,6 +2107,7 @@ async def cluster_diagnostics():
         "registry": registry_payload,
         "peer_health": peer_health,
         "staging_jobs": staging_jobs,
+        "fabric_doctor": doctor_reports,
         "incidents": incidents,
         "errors": errors,
     }

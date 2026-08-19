@@ -349,6 +349,10 @@
             clusterIncidents: [],
             _clusterIncidentSeq: 0,
             _clusterIncidentsById: null,
+            // Fabric Doctor (C3): one run at a time; the report renders as
+            // minimal check · state · evidence · fix rows until B4's panel.
+            clusterDoctor: null,
+            clusterDoctorRunning: false,
             clusterStagingResult: null,
             clusterStagingLoading: false,
             clusterGuidance: null,
@@ -1552,6 +1556,65 @@
 
             clusterActiveIncidents() {
                 return (this.clusterIncidents || []).filter((incident) => !incident.dismissed_at);
+            },
+
+            // C3: run the Fabric Doctor as a server job and poll it to a
+            // verdict. The link is this Mac plus the first worker peer — the
+            // Doctor checks exactly one link at a time.
+            async runFabricDoctor() {
+                if (this.clusterDoctorRunning) return;
+                const peers = this.clusterWorkerPeers()
+                    .map(peer => String(peer?.ssh || '').trim())
+                    .filter(Boolean);
+                if (!peers.length) {
+                    this.clusterDoctor = {
+                        phase: 'failed',
+                        findings: [],
+                        verdict: '',
+                        error: 'Add a peer Mac first — the Doctor checks the link between two Macs.',
+                    };
+                    return;
+                }
+                this.clusterDoctorRunning = true;
+                this.clusterDoctor = { phase: 'queued', findings: [], verdict: '', error: '' };
+                try {
+                    const response = await fetch('/admin/api/cluster/doctor', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ hosts: ['127.0.0.1', peers[0]] }),
+                    });
+                    if (response.status === 401) { window.location.href = '/admin'; return; }
+                    if (!response.ok) {
+                        const detail = await response.json().catch(() => ({}));
+                        throw new Error(detail?.detail || `Doctor start failed (${response.status})`);
+                    }
+                    const { job_id: jobId } = await response.json();
+                    for (let attempt = 0; attempt < 120; attempt += 1) {
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        const poll = await fetch(
+                            `/admin/api/cluster/doctor/${encodeURIComponent(jobId)}`
+                        );
+                        if (poll.status === 401) { window.location.href = '/admin'; return; }
+                        if (!poll.ok) continue;
+                        const job = await poll.json();
+                        this.clusterDoctor = job;
+                        if (job.phase === 'completed' || job.phase === 'failed') return;
+                    }
+                    this.clusterDoctor = {
+                        ...(this.clusterDoctor || {}),
+                        phase: 'failed',
+                        error: 'The Doctor run did not finish; check the incident feed.',
+                    };
+                } catch (error) {
+                    this.clusterDoctor = {
+                        phase: 'failed',
+                        findings: [],
+                        verdict: '',
+                        error: error?.message || 'Doctor run failed',
+                    };
+                } finally {
+                    this.clusterDoctorRunning = false;
+                }
             },
 
             clusterIncidentAge(ts) {
