@@ -654,3 +654,73 @@ Each PR is independently shippable and behind no flag: every item degrades addit
 | C4 | **S–M** | parsers + selection plumbing |
 
 **Recommended first two weeks:** PR-1 (**C1**) → PR-2 (**B3**) → PR-3 (**B1**), while PR #2819 review/merge and the C2 `networksetup` spike run in parallel. That closes the ladder-honesty and silent-failure classes (failures #5, #8, and half of #4/#6) before any UI composition work, and everything after stacks on merged foundations.
+
+---
+
+# D — Model-sharding fixes (distinct workstream from B/C diagnostics)
+
+These items make specific model *architectures* actually run under distributed inference. They are independent of the B/C fabric-doctor work and can ship on their own PR (target: the existing #2819 clustering-reliability PR). Root-cause analysis verified live on mlx 0.31.2/0.31.3; see `docs/vlm-distributed-design.md` for the VLM half.
+
+## D1 — Nemotron-H TP=2 quantized-MoE sharding fix
+
+**Problem.** `nemotron_h` (hybrid Mamba2/attention + MoE, 4-bit oQ4, group_size 64) crashes mid-shard at TP=2: `Array split does not result in sub arrays with equal size: 2 splits along axis -1 for shape (128,2688,29)`. The MoE experts' down-projection (`switch_mlp.fc2`) is row-parallel over the 1856-wide intermediate = `1856/64 = 29` quant groups; **29 is prime**, so no 2ⁿ TP degree splits it evenly. The planner is blind to the quant-group constraint and offers TP=2 anyway. A latent sibling bug slices quantized Mamba `in_proj.weight` without its `scales`/`biases`.
+
+### Files & symbols
+- `omlx/cluster/tensor_strategies.py` — `_shard_nemotron_h` (~400): Mamba branch (471) and MoE branch (507-521); `_wrap_sharded_moe` (237) needs **no** change (its `all_sum` is shape-agnostic).
+- `omlx/cluster/planner.py` — `_tensor_parallel_divisors` (611), nemotron_h branch (625).
+- Config: per-tensor quantization overrides live in `config.json["quantization"]` (some layers 8-bit gs=64).
+
+### Checklist
+- [ ] **D1a (mandatory latent-bug fix):** in the Mamba branch, after `mixer.in_proj.weight = ...[indices]` (line 471), apply the **same `indices`** to `mixer.in_proj.scales` and `mixer.in_proj.biases`, guarded by `hasattr(mixer.in_proj, "scales")`. Row-slicing is group-safe (groups run along the input axis). Without this, layer-0 Mamba shards into a silently-broken state (10304 scale rows vs 5152 weight rows).
+- [ ] **D1b (the fix that makes it run):** replace the two `shard_inplace` calls on `switch_mlp.fc1`/`fc2` (508-509) with **uneven group-aligned manual slicing**. Compute per-rank group ranges over the N scale-groups (`base = groups // size`; first `groups % size` ranks get one extra → rank0=[0,15), rank1=[15,29) at TP=2). `fc1` (column-parallel, ReLU² non-gated so output = 1856, one group axis): slice **axis 1** of weight/scales/biases at `[glo*gs : ghi*gs]`. `fc2` (row-parallel): slice `weight` **axis -1** packed cols `[glo*(gs/8) : ghi*(gs/8)]` (4-bit → 8 values/uint32), `scales`/`biases` axis -1 at `[glo:ghi]`. Wrap slices in `mx.contiguous`. Verified numerically exact vs unsharded (1.5e-5 on signal magnitude 80). Keep `shared_experts` on `shard_inplace` (down_proj input 3712 → 58 groups, even).
+- [ ] **D1c (planner honesty, ship regardless):** extend `_tensor_parallel_divisors` (or add a companion viability check) so quantized **row-split** tensors (o_proj, mamba out_proj, fc2, shared down_proj) contribute `input_dim / group_size` using the quant dict **including per-tensor overrides**. Require divisibility where `shard_inplace`/`shard_linear` still runs; require only `group_count >= size` for the custom-sliced fc1/fc2. (kv_heads=2 already caps this model at TP=2, so the guard only needs TP=2 honesty here.)
+
+### Tests
+- [ ] `tests/test_cluster_tensor_strategies.py`: per-rank group-range math (15/14 split) + fc2 packed-column arithmetic; assert reassembled scales cover [0,29) with no overlap.
+- [ ] `tests/test_cluster_planner.py`: a synthetic nemotron_h-like quant config with an odd row-split group count is **not** rejected outright (custom path allows `>=size`), and a genuinely un-splittable `shard_inplace` dim **is** flagged.
+
+### D1e/D1f — runtime forward-path fixes (found while verifying on hardware)
+The sharding fixes above got the model to *load*; two more bugs blocked the first
+inference. Both are in `omlx/cluster/pipeline_compat.py` (`_install_nemotron_h_pipeline`),
+whose `pipeline_call` becomes `NemotronHModel.__call__` even for pure TP:
+- [x] **D1e:** `pipeline_call` rejected the `n_confirmed` kwarg that the base MTP
+  patch threads through every model `__call__` (`TypeError: … unexpected keyword
+  argument 'n_confirmed'`). Accept `n_confirmed: int = 0, **_unused` and ignore it
+  (MTP is inactive on the distributed path). Mirrors the mlx-vlm runtimes' `pop`.
+- [x] **D1f:** `pipeline_call` read `pipeline_rank`/`pipeline_size`/`fa_idx`/`ssm_idx`,
+  which only `pipeline()` sets — never called on the pure-TP path (`AttributeError:
+  'NemotronHModel' object has no attribute 'pipeline_rank'`). Default to a single
+  stage (`rank 0`, `size 1`, so send/recv/all_gather no-op) and recompute the
+  first attention/SSM cache indices locally when `pipeline()` did not run.
+
+### Verify (real hardware) — ✅ DONE 2026-08-19
+- [x] Both fork servers pick up changes via the worker shim (workers re-import per launch); files synced to the peer worktree `/Users/aphoenix/repos/omlx-fork-test`.
+- [x] Activation driver → `deployments: 200`; deployment `…-1899cb75cc02` live, jaccl, rank0=mini / rank1=peer.
+- [x] `/v1/chat/completions` generated coherent tokens across both Macs (TP=2 `all_sum` succeeded → both ranks live).
+
+### Fallbacks (do NOT implement unless D1b blocks)
+- Requant fc2/down_proj family only to gs=32 into a **new** dir (58 groups → even). ~19GB re-stage; requant error bounded by original (not nil).
+- Expert-parallel (shard the 128-expert axis): correct collectively but `gather_qmm` still computes all experts → no compute win without token compaction. Legitimate upstream project; defer.
+
+## D2 — Qwen3.5/3.6 text-only distributed (VLM checkpoints)
+
+**Problem.** `Qwen3.6-35B-A3B` / `Qwen3.8-27B` are VLM checkpoints (`*ForConditionalGeneration`, `vision_config` present). Activation is rejected with HTTP 400 ("…is a vlm model. Distributed cluster inference currently supports text LLM models only.") at `engine_pool.py:668-674`. But the pinned mlx-lm already loads these **text-only** (`qwen3_5*.Model.sanitize` drops `vision_tower.*`/`visual.*`; `qwen3_5.Model.shard()` passes oMLX's `native_shard_is_layer_local` proof). Only the gate + accounting block a working text-only cluster.
+
+### Files & symbols
+- `omlx/engine_pool.py` — the gate: `resolve_cluster_model_id` (668-674), `register_cluster_model` (706-711), `_distributed_deployment_for_entry` (186) / dispatch (2137-2141).
+- `omlx/cluster/inference_worker.py` — `_validate_loaded_stage` (540-575) hard-codes `model.model`; qwen3_5 family Model wraps `language_model` → **latent crash on pure-TP text Qwen too**. Mirror the `_common_layer_owner` fallback (`tensor_strategies.py:96-119`).
+- `omlx/cluster/planner.py` — `_LAYER_PATTERNS` (29) wrongly merges `vision_tower.blocks.*` (0.83 GiB) and `language_model.mtp.layers.0` (0.47 GiB) into decoder layers → over-counts layer sizes for VLM checkpoints.
+
+### Checklist (tier a — text-only, oMLX-only, no upstream change)
+- [ ] Behind an explicit **"deploy text-only"** flag (never silent vision-drop — see issues #1261/#1426): allow VLM checkpoints past the three `engine_pool` gates when the flag is set and a capability probe (`_supports_tensor_parallel`/`_supports_pipeline`) confirms shardability.
+- [ ] Text-only layout filtering in the planner: exclude `vision_tower.*` and `*.mtp.*` from `_LAYER_PATTERNS` accounting; admission uses `text_only_size`.
+- [ ] Fix `_validate_loaded_stage` to resolve the layer owner via the `language_model`/`model` fallback chain (also fixes pure-TP text Qwen3.5/3.6 today).
+- [ ] Reject image requests at inference time with a clear error when a deployment was activated text-only.
+- [ ] 2-rank TP smoke test for a qwen3_5 text-only shard.
+
+### Tests
+- [ ] `_validate_loaded_stage` accepts a `language_model`-wrapped model tree.
+- [ ] planner text-only accounting excludes vision/mtp params (assert measured layer-0 ≈ 456 MiB, not 960 MiB on the 35B).
+- [ ] gate allows VLM checkpoint only with the text-only flag + capability pass.
+
+### Deferred (tier b — full VLM, vision on rank 0): L–XL, needs an image path in mlx-lm's server and TP-broadcast of visual embeddings (Qwen3.6 deepstack). Out of scope for this PR.
