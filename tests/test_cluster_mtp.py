@@ -93,10 +93,12 @@ def test_pipeline_parallel_error_explains_the_stack_boundary():
         "specprefill_enabled",
         "vlm_mtp_enabled",
         "turboquant_kv_enabled",
-        "thinking_budget_enabled",
+        # thinking_budget_enabled is deliberately absent: #2731 (already on
+        # main) removed it from the incompatible list, since thinking-budget
+        # behavior was aligned across engines and no longer needs gating.
     ],
 )
-def test_the_other_five_settings_stay_rejected_even_for_pure_tp(name):
+def test_the_other_four_settings_stay_rejected_even_for_pure_tp(name):
     engine = DistributedBatchedEngine(
         _deployment(tensor_parallel_size=2),
         model_settings=SimpleNamespace(**{name: True}),
