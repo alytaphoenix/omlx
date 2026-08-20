@@ -166,6 +166,9 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
     dflash_verify_mode: str | None = None
+    # DFlash 2 (independent engine — see omlx/engine/dflash2.py)
+    dflash2_enabled: bool | None = None
+    dflash2_draft_model: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
@@ -539,6 +542,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_draft_window_size",
         "dflash_draft_sink_size",
         "dflash_verify_mode",
+        "dflash2_draft_model",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
     )
@@ -558,6 +562,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["dflash_in_memory_cache_max_bytes"] = 8 * 1024 * 1024 * 1024
     settings["dflash_ssd_cache"] = False
     settings["dflash_ssd_cache_max_bytes"] = 20 * 1024 * 1024 * 1024
+    settings["dflash2_enabled"] = False
     settings["mtp_enabled"] = False
     settings["vlm_mtp_enabled"] = False
 
@@ -645,6 +650,8 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_draft_window_size = None
     settings.dflash_draft_sink_size = None
     settings.dflash_verify_mode = None
+    settings.dflash2_enabled = False
+    settings.dflash2_draft_model = None
     settings.mtp_enabled = False
     settings.vlm_mtp_enabled = False
     settings.vlm_mtp_draft_model = None
@@ -1938,6 +1945,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         for ref in (
             _ms.specprefill_draft_model,
             _ms.dflash_draft_model,
+            _ms.dflash2_draft_model,
             _ms.vlm_mtp_draft_model,
         ):
             if ref:
@@ -2543,6 +2551,37 @@ async def update_model_settings(
             value if value in ("dflash", "adaptive", "ddtree", "off") else None
         )
 
+    # DFlash 2 (independent engine — see omlx/engine/dflash2.py). Does not
+    # use dflash-mlx, so none of the dflash_* runtime knobs above apply.
+    if "dflash2_enabled" in sent:
+        new_dflash2_enabled = (
+            False if is_diffusion_model else bool(request.dflash2_enabled)
+        )
+        if new_dflash2_enabled:
+            # Mutex enforced again at ModelSettings.__post_init__ for
+            # last-mile safety, but surface a clearer error here.
+            for other_field, other_label in (
+                ("dflash_enabled", "DFlash"),
+                ("mtp_enabled", "MTP"),
+                ("vlm_mtp_enabled", "VLM MTP"),
+            ):
+                other_after = (
+                    bool(getattr(request, other_field))
+                    if other_field in sent
+                    else getattr(current_settings, other_field)
+                )
+                if other_after:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"dflash2_enabled and {other_label} cannot both be "
+                            "enabled; choose one speculative-decoding path."
+                        ),
+                    )
+        current_settings.dflash2_enabled = new_dflash2_enabled
+    if "dflash2_draft_model" in sent:
+        current_settings.dflash2_draft_model = request.dflash2_draft_model or None
+
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
         new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
@@ -2611,6 +2650,16 @@ async def update_model_settings(
                     status_code=400,
                     detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
                 )
+            dflash2_after = (
+                bool(request.dflash2_enabled)
+                if "dflash2_enabled" in sent
+                else current_settings.dflash2_enabled
+            )
+            if dflash2_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="MTP and DFlash 2 cannot both be enabled; choose one speculative-decoding path.",
+                )
         current_settings.mtp_enabled = new_mtp_enabled
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
@@ -2635,6 +2684,7 @@ async def update_model_settings(
             # last-mile safety, but surface a clearer error here.
             for other_field, other_label in (
                 ("dflash_enabled", "DFlash"),
+                ("dflash2_enabled", "DFlash 2"),
                 ("specprefill_enabled", "SpecPrefill"),
                 ("mtp_enabled", "MTP"),
                 ("turboquant_kv_enabled", "TurboQuant KV"),
@@ -2777,6 +2827,8 @@ async def update_model_settings(
         or "dflash_in_memory_cache_max_bytes" in sent
         or "dflash_ssd_cache" in sent
         or "dflash_ssd_cache_max_bytes" in sent
+        or "dflash2_enabled" in sent
+        or "dflash2_draft_model" in sent
         # trust_remote_code is plumbed at model load time; toggling it on
         # an already-loaded engine has no effect until reload.
         or "trust_remote_code" in sent

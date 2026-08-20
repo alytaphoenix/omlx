@@ -1189,9 +1189,16 @@ class ProcessMemoryEnforcer:
                     # coordinator scheduler for this enforcer to update.
                     continue
                 if (
-                    type(engine).__name__ == "DFlashEngine"
+                    type(engine).__name__ in ("DFlashEngine", "DFlash2Engine")
                     and getattr(engine, "_fallback_engine", None) is None
                 ):
+                    # DFlash's primary speculative path (and DFlash2, which
+                    # has no fallback engine at all -- getattr always finds
+                    # None) resolves via _prefill_guard in _resolve_scheduler
+                    # above, not a scheduler. Landing here means guard
+                    # construction failed at load time (already logged as a
+                    # warning in start()); this is a known degraded state,
+                    # not a wrapper-chain break, so don't also warn here.
                     continue
                 if getattr(engine, "is_diffusion_model", False):
                     continue

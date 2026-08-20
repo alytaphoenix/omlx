@@ -1129,6 +1129,7 @@ class TestFilterUploadedSettings:
             out = _filter_uploaded_settings(settings)
         assert out == {
             "dflash_enabled": False,
+            "dflash2_enabled": False,
             "specprefill_enabled": False,
             "turboquant_kv_enabled": True,
             "mtp_enabled": True,

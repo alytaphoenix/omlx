@@ -18,6 +18,7 @@ from .batched import BatchedEngine
 from .embedding import EmbeddingEngine
 
 from .dflash import DFlashEngine
+from .dflash2 import DFlash2Engine
 from .reranker import RerankerEngine
 from .stt import STTEngine
 from .sts import STSEngine
@@ -30,6 +31,7 @@ __all__ = [
     "GenerationOutput",
     "BatchedEngine",
     "DFlashEngine",
+    "DFlash2Engine",
     "VLMBatchedEngine",
     "EmbeddingEngine",
     "RerankerEngine",

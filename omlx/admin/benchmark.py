@@ -222,6 +222,7 @@ class _FeatureFlagSpec:
 # upload key follows the user-facing name rather than the settings field.
 _FEATURE_FLAG_SPECS = (
     _FeatureFlagSpec("dflash_enabled", "dflash", "dflash", "DFlash"),
+    _FeatureFlagSpec("dflash2_enabled", "dflash2", "dflash2", "DFlash2"),
     _FeatureFlagSpec(
         "specprefill_enabled", "specprefill", "specprefill", "SpecPrefill"
     ),
@@ -347,6 +348,8 @@ _UPLOADED_SETTING_FIELDS = (
     "dflash_draft_window_size",
     "dflash_draft_sink_size",
     "dflash_verify_mode",
+    "dflash2_enabled",
+    "dflash2_draft_model",
     "mtp_enabled",
     "mtp_num_draft_tokens",
     "vlm_mtp_enabled",
@@ -366,6 +369,7 @@ _PATH_VALUED_SETTING_FIELDS = frozenset(
     {
         "specprefill_draft_model",
         "dflash_draft_model",
+        "dflash2_draft_model",
         "vlm_mtp_draft_model",
     }
 )
