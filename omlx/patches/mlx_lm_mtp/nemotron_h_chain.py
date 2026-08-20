@@ -54,20 +54,19 @@ def apply() -> bool:
         logger.debug("nemotron_h base MTP patch missing; chain patch skipped")
         return False
 
-    # Self-healing, not skippable: nemotron_h_model._patch_model()
-    # unconditionally reassigns Model.mtp_forward on every one of its own
-    # calls (no _is_ours guard there, unlike its __init__/__call__
-    # patches), so a second maybe_apply_pre_load_patches() pass in the same
-    # process silently clobbers this patch's wider mtp_forward back to the
-    # base's narrow one. An earlier top-level "already initialized, skip
-    # everything" guard here (meant only to silence repeat logging) broke
-    # that recovery and shipped a Nemotron model with a mtp_forward that
-    # rejects return_hidden/logits_keep the first time this ran twice.
-    # Every sub-patch below already re-checks and re-applies itself
-    # (mirrors qwen35_model.apply()'s documented self-healing, #1388), so
-    # keep calling all six unconditionally; only the noisy INFO log is
-    # gated, on a marker nothing else touches.
-    already_logged = getattr(nh.Model, "_omlx_nh_chain_logged", False)
+    # Every sub-patch below guards itself per surface, so re-running them is
+    # a cheap no-op when nothing changed. Do NOT early-return on the class
+    # flag alone: a single flag cannot know that some surface was reinstalled
+    # underneath us (a module reload, a monkeypatched teardown, the base
+    # patch re-applying), and skipping the sub-patches then leaves that
+    # surface permanently unwrapped. Run them and let the per-surface
+    # markers decide; only the log is gated, which is what the planner's
+    # every-10s autoconfigure tick actually needed quieted.
+    already_applied = (
+        getattr(nh.Model, "_omlx_nh_chain_init", False)
+        and _is_ours(nh.Model, "mtp_forward")
+        and _is_ours(nh.NemotronHMamba2Mixer, "__call__")
+    )
 
     _patch_mixer(nh)
     _patch_ssm_sequential()
@@ -75,13 +74,11 @@ def apply() -> bool:
     _patch_mtp_forward(nh)
     _patch_partial_rollback(nh)
     _patch_init_markers(nh)
-    if already_logged:
-        return True
-    nh.Model._omlx_nh_chain_logged = True
-    logger.info(
-        "nemotron_h MTP chain patch applied "
-        "(depth-k drafting, sequential fused verify, replay-free rollback)"
-    )
+    if not already_applied:
+        logger.info(
+            "nemotron_h MTP chain patch applied "
+            "(depth-k drafting, sequential fused verify, replay-free rollback)"
+        )
     return True
 
 
