@@ -255,6 +255,19 @@ class ClusterDeployment:
     # opt-in; an un-flagged VLM deployment stays refused (silent vision drop
     # is treated as a bug, #1261/#1426).
     text_only: bool = False
+    # Native MTP (mlx_lm_mtp patch), pure-tensor-parallel only — see
+    # DistributedBatchedEngine._validate_model_settings. Threaded onto every
+    # rank's launch argv (build_mlx_launch_argv) so
+    # inference_worker.run_worker can pass a synthesized settings object into
+    # maybe_apply_pre_load_patches before provider.load_default(). Mirrors
+    # how trust_remote_code is injected late via dataclasses.replace() at
+    # engine_pool.py, since ClusterDeployment plans are built before the
+    # per-request model_settings is known.
+    mtp_enabled: bool = False
+    # None defers to maybe_apply_pre_load_patches' per-model-type default
+    # (omlx/utils/model_loading.py); set clamps to the same [1, 8] range as
+    # set_mtp_depth.
+    mtp_num_draft_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if _NODE_ID.fullmatch(self.deployment_id) is None:
@@ -278,6 +291,21 @@ class ClusterDeployment:
             raise ValueError(
                 "host count must be divisible by tensor_parallel_size"
             )
+        if self.mtp_enabled and self.tensor_parallel_size != len(self.hosts):
+            # Defense in depth: DistributedBatchedEngine._validate_model_settings
+            # is the primary gate (it runs before any rank is launched), but a
+            # ClusterDeployment can be constructed directly, so the pure-TP
+            # requirement (no pipeline stages) is enforced here too.
+            raise ValueError(
+                "mtp_enabled requires a pure tensor-parallel deployment "
+                "(tensor_parallel_size == host count); pipeline-parallel "
+                "deployments are not supported"
+            )
+        if self.mtp_num_draft_tokens is not None and (
+            isinstance(self.mtp_num_draft_tokens, bool)
+            or not isinstance(self.mtp_num_draft_tokens, int)
+        ):
+            raise ValueError("mtp_num_draft_tokens must be an integer or None")
         if (
             not isinstance(self.target_context_tokens, int)
             or isinstance(self.target_context_tokens, bool)
@@ -381,6 +409,8 @@ class ClusterDeployment:
             "tensor_parallel_size": self.tensor_parallel_size,
             "target_context_tokens": self.target_context_tokens,
             "text_only": self.text_only,
+            "mtp_enabled": self.mtp_enabled,
+            "mtp_num_draft_tokens": self.mtp_num_draft_tokens,
         }
 
     @classmethod
@@ -423,6 +453,12 @@ class ClusterDeployment:
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
             target_context_tokens=int(payload.get("target_context_tokens", 8192)),
             text_only=bool(payload.get("text_only", False)),
+            mtp_enabled=bool(payload.get("mtp_enabled", False)),
+            mtp_num_draft_tokens=(
+                int(payload["mtp_num_draft_tokens"])
+                if payload.get("mtp_num_draft_tokens") is not None
+                else None
+            ),
         )
 
     def encode_worker_plan(self) -> str:
