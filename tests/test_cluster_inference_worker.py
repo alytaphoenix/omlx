@@ -103,8 +103,9 @@ def test_eager_load_graph_is_visible_to_mlx_lm_generation_thread():
 
     import mlx.core as mx
 
-    previous = mx.default_stream(mx.default_device())
-    stream = _cross_thread_generation_stream(mx)
+    previous_gpu = mx.default_stream(mx.default_device())
+    previous_cpu = mx.default_stream(mx.cpu)
+    streams = _cross_thread_generation_stream(mx)
     lazy_value = mx.arange(4) + 1
     observed: list[list[int]] = []
 
@@ -118,16 +119,64 @@ def test_eager_load_graph_is_visible_to_mlx_lm_generation_thread():
         with _bind_generation_thread_stream(
             FakeResponseGenerator,
             mx,
-            stream,
+            streams,
         ):
             worker = threading.Thread(target=FakeResponseGenerator()._generate)
             worker.start()
             worker.join()
     finally:
-        mx.set_default_stream(previous)
+        mx.set_default_stream(previous_gpu)
+        mx.set_default_stream(previous_cpu)
 
     assert observed == [[1, 2, 3, 4]]
     assert FakeResponseGenerator._generate is original
+
+
+def test_generation_thread_has_a_registered_cpu_stream():
+    """Regression for ``no Stream(cpu, N) in current thread`` under native MTP.
+
+    Native MTP's distributed depth/park coordination (batch_generator.py's
+    ``_sync_distributed_mtp_cycle``) and tensor-parallel collectives inside a
+    forward pass need a CPU default stream on the generation thread, not just
+    a GPU one. Plain single-node decode never exercised that path, so the
+    original ``_cross_thread_generation_stream`` (GPU-only) worked until MTP
+    was enabled on a pure tensor-parallel cluster deployment. This asserts
+    both devices resolve to the *same* stream objects created up front,
+    observed from the generation thread, the way
+    ``test_eager_load_graph_is_visible_to_mlx_lm_generation_thread`` already
+    does for the GPU stream alone.
+    """
+
+    import mlx.core as mx
+
+    previous_gpu = mx.default_stream(mx.default_device())
+    previous_cpu = mx.default_stream(mx.cpu)
+    gpu_stream, cpu_stream = _cross_thread_generation_stream(mx)
+    observed: dict[str, Any] = {}
+
+    class FakeResponseGenerator:
+        def _generate(self):
+            observed["gpu"] = mx.default_stream(mx.default_device())
+            observed["cpu"] = mx.default_stream(mx.cpu)
+            # The actual failure mode: any op requiring the CPU stream must
+            # not raise "no Stream(cpu, N) in current thread" on this thread.
+            mx.eval(mx.add(mx.array(1), mx.array(1), stream=mx.cpu))
+
+    try:
+        with _bind_generation_thread_stream(
+            FakeResponseGenerator,
+            mx,
+            (gpu_stream, cpu_stream),
+        ):
+            worker = threading.Thread(target=FakeResponseGenerator()._generate)
+            worker.start()
+            worker.join()
+    finally:
+        mx.set_default_stream(previous_gpu)
+        mx.set_default_stream(previous_cpu)
+
+    assert observed["gpu"] == gpu_stream
+    assert observed["cpu"] == cpu_stream
 
 
 def _assignment() -> PipelineAssignment:

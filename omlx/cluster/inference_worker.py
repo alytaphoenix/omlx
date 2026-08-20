@@ -49,35 +49,49 @@ def _emit_event(payload: dict[str, Any]) -> None:
     )
 
 
-def _cross_thread_generation_stream(mx: Any) -> Any:
-    """Create the one MLX stream used by both rank loading and generation.
+def _cross_thread_generation_stream(mx: Any) -> tuple[Any, Any]:
+    """Create the MLX streams used by both rank loading and generation.
 
     ``mlx_lm.server.ResponseGenerator`` performs generation on a background
     thread. A regular MLX stream exists only on the thread that created it, so
     eagerly loading and validating a distributed model on the rank's main
     thread leaves lazy graph nodes referring to a stream that the generation
     thread cannot see. MLX 0.32's thread-unsafe stream is deliberately the
-    cross-thread variant; the worker serializes model work on this one stream.
+    cross-thread variant; the worker serializes model work on these streams.
+
+    Two streams, not one: plain single-node decode never touches the CPU
+    device from the generation thread, so a GPU-only thread-unsafe stream was
+    enough until native MTP's distributed depth/park coordination
+    (``_sync_distributed_mtp_cycle``) and the collectives inside a
+    tensor-parallel forward pass started requiring one too. Without a CPU
+    default stream registered on the generation thread, the first such op
+    fails with "There is no Stream(cpu, N) in current thread." — the same
+    class of bug ``test_eager_load_graph_is_visible_to_mlx_lm_generation_thread``
+    already regression-tests for the GPU stream.
     """
 
-    stream = mx.new_thread_unsafe_stream(mx.default_device())
-    mx.set_default_stream(stream)
-    return stream
+    gpu_stream = mx.new_thread_unsafe_stream(mx.default_device())
+    mx.set_default_stream(gpu_stream)
+    cpu_stream = mx.new_thread_unsafe_stream(mx.cpu)
+    mx.set_default_stream(cpu_stream)
+    return gpu_stream, cpu_stream
 
 
 @contextmanager
 def _bind_generation_thread_stream(
     response_generator_type: Any,
     mx: Any,
-    stream: Any,
+    streams: tuple[Any, Any],
 ):
-    """Install the rank's cross-thread stream before MLX-LM starts decoding."""
+    """Install the rank's cross-thread streams before MLX-LM starts decoding."""
 
+    gpu_stream, cpu_stream = streams
     original_generate = response_generator_type._generate
 
     @wraps(original_generate)
     def generate_on_rank_stream(instance: Any) -> Any:
-        mx.set_default_stream(stream)
+        mx.set_default_stream(gpu_stream)
+        mx.set_default_stream(cpu_stream)
         return original_generate(instance)
 
     response_generator_type._generate = generate_on_rank_stream
