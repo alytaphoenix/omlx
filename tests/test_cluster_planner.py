@@ -618,3 +618,172 @@ def test_nemotron_h_divisors_omit_quant_groups_when_unquantized():
     divisors = _tensor_parallel_divisors(config)
     assert 58 not in divisors
     assert set(divisors) == {32, 2, 64, 8}
+
+
+# --- Hybrid-attention KV accounting -----------------------------------------
+#
+# Many current models mix constant-state layers (Gated DeltaNet, Mamba) with
+# real growing-KV layers, per config.json's `layer_types`. Charging every
+# layer the uniform per-token rate overestimates KV reservation by the ratio
+# of constant-state to growing layers -- confirmed at 48:16 (a ~4x
+# overestimate) on Qwen3.8-27B's real config.json, which nests layer_types
+# under text_config like every other decoder field an mlx-vlm checkpoint
+# reads from there.
+
+
+def test_hybrid_layer_types_zero_the_constant_state_layers():
+    from omlx.cluster.planner import _kv_bytes_per_token_by_layer
+
+    config = {
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "layer_types": [
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+    }
+    uniform = 4 * 256 * 2 * 2
+    assert _kv_bytes_per_token_by_layer(config, 4) == (uniform, 0, 0, uniform)
+
+
+def test_hybrid_layer_types_nested_under_text_config():
+    """Qwen3.8-27B's real config.json shape: an mlx-vlm wrapper nests
+    layer_types (and every other decoder field) under text_config, not at
+    the top level. Without walking into text_config the classifier would
+    silently fall back to uniform and this fix would no-op on the exact
+    model it was written to fix.
+    """
+
+    from omlx.cluster.planner import _kv_bytes_per_token_by_layer
+
+    config = {
+        "model_type": "qwen3_5_vl",
+        "text_config": {
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "layer_types": ["linear_attention", "full_attention"] * 2
+            + ["linear_attention"],
+        },
+    }
+    uniform = 4 * 256 * 2 * 2
+    assert _kv_bytes_per_token_by_layer(config, 5) == (0, uniform, 0, uniform, 0)
+
+
+def test_layer_types_length_mismatch_falls_back_to_uniform():
+    """A layer_types list that does not line up with layer_count cannot be
+    trusted index-for-index against layer_weight_bytes, so this must not
+    guess an alignment -- it falls back to the same uniform tuple a config
+    with no layer_types at all would produce.
+    """
+
+    from omlx.cluster.planner import _kv_bytes_per_token_by_layer
+
+    config = {
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "layer_types": ["full_attention", "linear_attention"],  # length 2
+    }
+    uniform = 4 * 256 * 2 * 2
+    assert _kv_bytes_per_token_by_layer(config, 4) == (uniform,) * 4
+
+
+def test_no_layer_types_field_matches_todays_behavior_exactly():
+    """The regression guard: every pure-transformer model without
+    layer_types must see the identical uniform tuple this planner produced
+    before hybrid-attention accounting existed.
+    """
+
+    from omlx.cluster.planner import (
+        _kv_bytes_per_token_by_layer,
+        _kv_bytes_per_token_per_layer,
+    )
+
+    config = {"num_attention_heads": 40, "num_key_value_heads": 8, "head_dim": 128}
+    uniform = _kv_bytes_per_token_per_layer(config)
+    assert _kv_bytes_per_token_by_layer(config, 6) == (uniform,) * 6
+
+
+def test_sliding_attention_falls_through_to_full_attention():
+    """Out of scope for this pass (see the plan): conservative, not zeroed."""
+
+    from omlx.cluster.planner import _kv_bytes_per_token_by_layer
+
+    config = {
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "layer_types": ["sliding_attention", "full_attention", "linear_attention"],
+    }
+    uniform = 4 * 256 * 2 * 2
+    assert _kv_bytes_per_token_by_layer(config, 3) == (uniform, uniform, 0)
+
+
+def test_kv_bytes_for_stage_sums_only_the_sliced_layers():
+    from omlx.cluster.planner import ModelLayout, _kv_bytes_for_stage
+
+    model = ModelLayout(
+        source="test",
+        fixed_weight_bytes=0,
+        layer_weight_bytes=(1,) * 4,
+        kv_bytes_per_token_by_layer=(4096, 0, 0, 4096),
+    )
+    # A stage holding only the two constant-state (zero) layers reserves
+    # nothing, even though the model as a whole has real growing KV.
+    assert _kv_bytes_for_stage(model, slice(1, 3), context_tokens=8192) == 0
+    # A stage holding a real growing layer reserves proportionally.
+    assert (
+        _kv_bytes_for_stage(model, slice(0, 1), context_tokens=8192)
+        == 4096 * 8192
+    )
+
+
+def test_model_layout_rejects_a_kv_tuple_of_the_wrong_length():
+    from omlx.cluster.planner import ModelLayout
+
+    with pytest.raises(ValueError, match="one entry per layer"):
+        ModelLayout(
+            source="test",
+            fixed_weight_bytes=0,
+            layer_weight_bytes=(1,) * 4,
+            kv_bytes_per_token_by_layer=(4096, 4096),
+        )
+
+
+def test_kv_bytes_per_token_by_layer_survives_the_wire():
+    """Peers exchange layouts as JSON; per-layer zeros must not be lost."""
+
+    from omlx.cluster.planner import ModelLayout
+
+    model = ModelLayout(
+        source="test",
+        fixed_weight_bytes=0,
+        layer_weight_bytes=(1,) * 4,
+        kv_bytes_per_token_by_layer=(4096, 0, 0, 4096),
+    )
+    restored = ModelLayout.from_dict(model.to_dict())
+    assert restored.kv_bytes_per_token_by_layer == (4096, 0, 0, 4096)
+
+
+def test_qwen3_8_27b_shaped_config_produces_the_confirmed_48_16_split():
+    """Pinning the real ratio this fix was written against: 48 linear, 16 full."""
+
+    from omlx.cluster.planner import _kv_bytes_per_token_by_layer
+
+    layer_types = ["linear_attention"] * 48 + ["full_attention"] * 16
+    config = {
+        "model_type": "qwen3_5_vl",
+        "text_config": {
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "layer_types": layer_types,
+        },
+    }
+    tup = _kv_bytes_per_token_by_layer(config, 64)
+    assert sum(1 for v in tup if v) == 16
+    assert sum(1 for v in tup if not v) == 48
