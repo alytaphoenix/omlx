@@ -92,6 +92,7 @@ from .planner import (
     remote_model_layout,
     synthetic_model_layout,
 )
+from .preconditions import ROW_IDS, readiness_rows
 from .probe import _system_memory_bytes, collect_cluster_status
 from .registry import get_cluster_registry
 from .runtime import read_runtime_markers
@@ -1817,6 +1818,260 @@ async def _autoconfigure(request: ClusterAutoconfigureRequest) -> dict[str, Any]
             "approved_placement": plan_payload["placement_signature"],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# B4: GET /readiness — the "why can't I start?" precondition rows.
+#
+# Responses are cached 10 s server-side so B2's job poll and the dashboard's
+# discovery tick never stampede SSH with the same five probes (house style:
+# _PEER_ADMIN_PORTS above). The cache key is the exact evidence question —
+# (hosts, model) — and served entries carry their age so the client can
+# stale-gray anything older than 30 s (design A.6's live-data rule).
+_READINESS_TTL_S = 10.0
+_READINESS_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_READINESS_CACHE_LOCK = threading.Lock()
+
+
+def _readiness_clock() -> float:
+    """Monotonic seconds. A seam so cache-TTL tests can advance time."""
+
+    return time.monotonic()
+
+
+async def _readiness_peers(hosts: list[str]) -> list[dict[str, Any]]:
+    """SSH reachability per host, probed in parallel with bounded timeouts.
+
+    ``probe_remote_host`` already carries its own SSH timeout; a host that
+    cannot be probed becomes evidence, never an exception.
+    """
+
+    async def _one(host: str) -> dict[str, Any]:
+        if _local_ssh_target(host):
+            return {"host": host, "reachable": True, "detail": "this Mac"}
+        try:
+            status = await asyncio.to_thread(probe_remote_host, host)
+            _note_peer_admin_port(status)
+            return {"host": host, "reachable": True, "detail": ""}
+        except (DistributedLaunchError, OSError, ValueError) as exc:
+            return {"host": host, "reachable": False, "detail": str(exc)}
+
+    return list(await asyncio.gather(*(_one(host) for host in hosts)))
+
+
+async def _readiness_fabric(
+    hosts: list[str],
+) -> tuple[bool | None, Any, str]:
+    """(fabric_ok, shared-link evidence, human detail) for the fabric row.
+
+    Reuses ``_resolve_fabric`` — the exact reading ``_autoconfigure`` gates
+    Start on — rather than a second probe path that could disagree with it.
+    """
+
+    try:
+        fabric = await asyncio.to_thread(_resolve_fabric, hosts)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return False, None, str(exc)
+    link = fabric.get("link") or {}
+    shared = SimpleNamespace(
+        ok=bool(link.get("ok")), kind=str(link.get("kind") or "")
+    )
+    if fabric.get("ok"):
+        endpoints = " ⇄ ".join(
+            (entry.get("ips") or [""])[0] or str(entry.get("host") or "")
+            for entry in fabric.get("hosts") or ()
+        )
+        label = str(link.get("kind") or fabric.get("backend") or "link")
+        return True, shared, f"reachable · {endpoints} · {label}"
+    blocker = str(
+        fabric.get("blocker")
+        or link.get("reason")
+        or "the cluster route did not verify"
+    )
+    return False, shared, blocker
+
+
+async def _cluster_readiness_report(
+    hosts: list[str], model_path: str
+) -> dict[str, Any]:
+    """Assemble B4's evidence and compose the five rows.
+
+    Shared verbatim by ``GET /readiness`` and ``omlx cluster status
+    --explain`` (design B.6: the CLI and the GUI can never tell different
+    stories). Every sub-step is one `_autoconfigure` already runs —
+    ``probe_remote_host``, ``_resolve_fabric``, the model layout, the
+    B5 budget probe, ``stage_manifest`` — never a re-implementation.
+    """
+
+    peers = await _readiness_peers(hosts)
+    remote_peers = [
+        peer for peer in peers if not _local_ssh_target(peer["host"])
+    ]
+
+    fabric_required = len(hosts) > 1
+    fabric_ok: bool | None = None
+    shared_link: Any = None
+    fabric_detail = ""
+    if fabric_required:
+        fabric_ok, shared_link, fabric_detail = await _readiness_fabric(hosts)
+
+    model_error = ""
+    layout = None
+    required_bytes = 0
+    strategies: dict[str, Any] | None = None
+    if model_path:
+        try:
+            layout = await asyncio.to_thread(
+                inspect_safetensors_layout, model_path
+            )
+            required_bytes = int(layout.total_weight_bytes)
+            strategies = _strategies_payload(layout, len(hosts))
+        except (OSError, RuntimeError, ValueError) as exc:
+            model_error = str(exc)
+
+    budgets: list[dict[str, Any]] = []
+    budget_errors: list[str] = []
+
+    async def _budget(host: str) -> dict[str, Any] | None:
+        try:
+            return await _node_budget_evidence(host, host)
+        except (DistributedLaunchError, OSError, ValueError) as exc:
+            budget_errors.append(f"{host}: {exc}")
+            return None
+
+    for result in await asyncio.gather(*(_budget(host) for host in hosts)):
+        if result is not None:
+            budgets.append(result)
+
+    plan_error = ""
+    staging: dict[str, Any] | None = None
+    if (
+        layout is not None
+        and not model_error
+        and len(budgets) == len(hosts)
+    ):
+        node_budgets = [
+            NodeBudget(
+                node_id=str(budget["node_id"]),
+                capacity_bytes=int(budget["capacity_bytes"]),
+                reserve_bytes=int(budget["reserve_bytes"]),
+                role=str(budget.get("role") or ""),
+                rank=rank,
+            )
+            for rank, budget in enumerate(budgets)
+        ]
+        try:
+            if (
+                len(hosts) > 1
+                and not layout.supports_pipeline
+                and layout.supports_tensor_parallel
+            ):
+                plan = plan_hybrid(
+                    layout, node_budgets, tensor_parallel_size=len(hosts)
+                )
+            else:
+                plan = plan_unequal_pipeline(layout, node_budgets)
+            staging = await asyncio.to_thread(
+                stage_manifest,
+                model_path,
+                plan.assignments,
+                {host: host for host in hosts},
+                source_host="127.0.0.1",
+            )
+        except PlanningError as exc:
+            plan_error = str(exc)
+        except (
+            ValueError,
+            RuntimeError,
+            OSError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            staging = {"error": str(exc), "ready": False}
+    elif budget_errors and required_bytes > 0 and not model_error:
+        plan_error = "not every Mac reported a usable budget: " + "; ".join(
+            budget_errors
+        )
+
+    report = readiness_rows(
+        peers=remote_peers,
+        fabric_required=fabric_required,
+        shared_link=shared_link,
+        fabric_ok=fabric_ok,
+        fabric_detail=fabric_detail,
+        staging=staging,
+        budgets=budgets,
+        required_bytes=required_bytes,
+        plan_error=plan_error,
+        strategies=strategies,
+        model_error=model_error,
+        ages={row_id: 0.0 for row_id in ROW_IDS},
+    )
+    payload = report.to_dict()
+    payload["hosts"] = list(hosts)
+    payload["model"] = model_path
+    # Surface 1 of design B.4: the per-node status strip, state named in
+    # text (never color-only).
+    payload["nodes"] = [
+        {
+            "host": peer["host"],
+            "state": "reachable" if peer["reachable"] else "unreachable",
+            "detail": peer["detail"],
+        }
+        for peer in peers
+    ]
+    payload["age_s"] = 0.0
+    return _redact_diagnostic(payload)
+
+
+def _readiness_with_age(
+    payload: dict[str, Any], elapsed: float
+) -> dict[str, Any]:
+    """A served copy whose evidence ages include time spent in the cache."""
+
+    aged = json.loads(json.dumps(payload))
+    aged["age_s"] = round(elapsed, 1)
+    for row in aged.get("rows") or []:
+        row["evidence_age_s"] = round(
+            float(row.get("evidence_age_s") or 0.0) + elapsed, 1
+        )
+    return aged
+
+
+@router.get("/readiness")
+async def cluster_readiness(
+    hosts: str = Query(...), model: str = Query(default="")
+):
+    """Why Start is or is not green: one row per precondition (B4).
+
+    ``ready`` is the conjunction from design B.2: ``all(ssh_ok, fabric >=
+    reachable, model_staged, budget_fits_live, strategy_compatible)``.
+    """
+
+    host_list = [host.strip() for host in hosts.split(",") if host.strip()]
+    if not host_list:
+        raise HTTPException(status_code=400, detail="hosts is required")
+    try:
+        host_list = [
+            host if _local_ssh_target(host) else validate_ssh_target(host)
+            for host in host_list
+        ]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    key = (",".join(host_list), model.strip())
+    now = _readiness_clock()
+    with _READINESS_CACHE_LOCK:
+        cached = _READINESS_CACHE.get(key)
+    if cached is not None and now - cached[0] < _READINESS_TTL_S:
+        return _readiness_with_age(cached[1], now - cached[0])
+    payload = await _cluster_readiness_report(host_list, model.strip())
+    with _READINESS_CACHE_LOCK:
+        stale_before = _readiness_clock() - _READINESS_TTL_S
+        for cache_key in [
+            k for k, (ts, _) in _READINESS_CACHE.items() if ts < stale_before
+        ]:
+            _READINESS_CACHE.pop(cache_key, None)
+        _READINESS_CACHE[key] = (_readiness_clock(), payload)
+    return _readiness_with_age(payload, 0.0)
 
 
 class ClusterGuidanceRequest(BaseModel):
@@ -3594,6 +3849,86 @@ async def cluster_node_roles() -> dict[str, Any]:
     }
 
 
+async def _node_budget_evidence(
+    node_id: str,
+    ssh: str,
+    *,
+    role: str = "headless",
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    """One node's measured budget plus B5's arithmetic breakdown.
+
+    The single sub-step behind ``/node-budgets`` and B4's ``/readiness``
+    budget row, extracted so the readiness panel reuses the exact probe the
+    role editor renders rather than a drifted copy.
+    """
+
+    from .node_role import suggest_budget
+
+    capacity_bytes = 0
+    capacity_source: str | None = None
+    ceiling_components: dict[str, int] | None = None
+    physical_bytes = 0
+    if not _local_ssh_target(ssh):
+        admin_port = _advertised_admin_port(ssh)
+        physical_bytes = _peer_physical_bytes(ssh)
+        probe = await asyncio.to_thread(
+            probe_remote_admission_ceiling,
+            ssh,
+            # No fallback to sys.executable: inside the packaged app that
+            # is a bundled interpreter which exists on the peer but cannot
+            # import oMLX, so every poll 503'd (#2680). Unknown means the
+            # probe discovers the peer's own interpreter.
+            python_executable=python_executable,
+            admin_port=admin_port,
+        )
+        capacity_bytes = probe.ceiling_bytes
+        capacity_source = "admission_ceiling"
+        ceiling_components = probe.breakdown
+        if not probe.fast_probe_ok and admin_port > 0:
+            # The peer's own advertised port did not answer: the ceiling
+            # above came from the slower in-process computation. Confess
+            # once per dead port, not once per dashboard poll.
+            key = (_peer_key(ssh), admin_port)
+            with _PEER_ADMIN_PORTS_LOCK:
+                seen = key in _CEILING_FALLBACK_SEEN
+                _CEILING_FALLBACK_SEEN.add(key)
+            if not seen:
+                _record_cluster_incident(
+                    Severity.WARN,
+                    "ceiling_fast_probe_fallback",
+                    f"fast ceiling probe unreachable on port {admin_port}; "
+                    "using slower local computation"
+                    + (
+                        f" ({probe.fast_probe_error})"
+                        if probe.fast_probe_error
+                        else ""
+                    ),
+                )
+    else:
+        ceiling_components = await asyncio.to_thread(
+            _local_ceiling_components
+        )
+        physical_bytes = _system_memory_bytes()
+    budget = await asyncio.to_thread(
+        suggest_budget,
+        role=role,
+        ssh_target=ssh,
+        capacity_bytes=capacity_bytes,
+        capacity_source=capacity_source,
+    )
+    return {
+        "node_id": node_id,
+        "ssh": ssh,
+        **budget.to_dict(),
+        "breakdown": _budget_breakdown(
+            physical_bytes=physical_bytes,
+            components=ceiling_components,
+            budget=budget,
+        ),
+    }
+
+
 @router.post("/node-budgets")
 async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, Any]:
     """What each Mac should contribute, measured on the machine itself.
@@ -3603,8 +3938,6 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
     memory pressure can lower that further. A plan built on the larger number
     is refused by the memory guard at load.
     """
-
-    from .node_role import suggest_budget
 
     try:
         hosts = [
@@ -3617,68 +3950,12 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def _for(host: Any) -> dict[str, Any]:
-        capacity_bytes = 0
-        capacity_source: str | None = None
-        ceiling_components: dict[str, int] | None = None
-        physical_bytes = 0
-        if not _local_ssh_target(host.ssh):
-            admin_port = _advertised_admin_port(host.ssh)
-            physical_bytes = _peer_physical_bytes(host.ssh)
-            probe = await asyncio.to_thread(
-                probe_remote_admission_ceiling,
-                host.ssh,
-                # No fallback to sys.executable: inside the packaged app that
-                # is a bundled interpreter which exists on the peer but cannot
-                # import oMLX, so every poll 503'd (#2680). Unknown means the
-                # probe discovers the peer's own interpreter.
-                python_executable=host.python_executable,
-                admin_port=admin_port,
-            )
-            capacity_bytes = probe.ceiling_bytes
-            capacity_source = "admission_ceiling"
-            ceiling_components = probe.breakdown
-            if not probe.fast_probe_ok and admin_port > 0:
-                # The peer's own advertised port did not answer: the ceiling
-                # above came from the slower in-process computation. Confess
-                # once per dead port, not once per dashboard poll.
-                key = (_peer_key(host.ssh), admin_port)
-                with _PEER_ADMIN_PORTS_LOCK:
-                    seen = key in _CEILING_FALLBACK_SEEN
-                    _CEILING_FALLBACK_SEEN.add(key)
-                if not seen:
-                    _record_cluster_incident(
-                        Severity.WARN,
-                        "ceiling_fast_probe_fallback",
-                        f"fast ceiling probe unreachable on port {admin_port}; "
-                        "using slower local computation"
-                        + (
-                            f" ({probe.fast_probe_error})"
-                            if probe.fast_probe_error
-                            else ""
-                        ),
-                    )
-        else:
-            ceiling_components = await asyncio.to_thread(
-                _local_ceiling_components
-            )
-            physical_bytes = _system_memory_bytes()
-        budget = await asyncio.to_thread(
-            suggest_budget,
+        return await _node_budget_evidence(
+            host.node_id,
+            host.ssh,
             role=request.roles.get(host.node_id, "headless"),
-            ssh_target=host.ssh,
-            capacity_bytes=capacity_bytes,
-            capacity_source=capacity_source,
+            python_executable=host.python_executable,
         )
-        return {
-            "node_id": host.node_id,
-            "ssh": host.ssh,
-            **budget.to_dict(),
-            "breakdown": _budget_breakdown(
-                physical_bytes=physical_bytes,
-                components=ceiling_components,
-                budget=budget,
-            ),
-        }
 
     try:
         nodes = list(await asyncio.gather(*(_for(host) for host in hosts)))

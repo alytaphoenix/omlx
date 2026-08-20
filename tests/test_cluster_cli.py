@@ -236,3 +236,23 @@ def test_cluster_doctor_requires_a_host():
     with contextlib.redirect_stderr(err):
         assert cli.cluster_command(args) == 2
     assert "--host" in err.getvalue()
+
+
+def test_cluster_status_explain_prints_the_precondition_rows():
+    """B4: `--explain` renders the same five rows the dashboard panel shows.
+
+    A bare local run (no workers, no model): nothing is broken, but Start
+    cannot proceed without a model, so the exit code says "not ready".
+    """
+
+    result = subprocess.run(
+        [sys.executable, "-m", "omlx.cli", "cluster", "status", "--explain"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 1, result.stderr
+    for row_id in ("ssh", "fabric", "staging", "budget", "strategy"):
+        assert row_id in result.stdout
+    assert "ready: no" in result.stdout
+    assert "PASS" in result.stdout

@@ -1965,6 +1965,7 @@ Object.assign(component, {
   loadClusterIncidents: async () => calls.push('incidents'),
   discoverClusterPeers: async () => calls.push('discover'),
   loadClusterJoinStatus: async () => calls.push('join'),
+  loadClusterReadiness: async () => calls.push('readiness'),
 });
 (async () => {
   await component.initializeClusterSetup();
@@ -1978,7 +1979,11 @@ Object.assign(component, {
     )
 
     assert result == {
-        "calls": ["preview", "runtime", "incidents", "discover", "join"]
+        "calls": [
+            # B4: the readiness rows ride the same gated discovery tick —
+            # SSH-backed evidence must never join the 2 s runtime poll.
+            "preview", "runtime", "incidents", "discover", "join", "readiness",
+        ]
     }
 
 

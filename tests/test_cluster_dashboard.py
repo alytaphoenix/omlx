@@ -488,3 +488,39 @@ def test_every_dashboard_locale_names_cluster_tab():
         locale = json.loads(locale_path.read_text())
         missing = {key for key in required if not locale.get(key)}
         assert not missing, f"{locale_path.name}: missing {sorted(missing)}"
+
+
+def test_cluster_dashboard_renders_the_precondition_panel():
+    """B4: the disabled-button dead zone is replaced by evidence rows."""
+
+    rendered = admin_routes.templates.get_template("dashboard.html").render()
+    cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+
+    # The panel markup exists and only shows when the cluster is not ready.
+    assert "data-cluster-preconditions" in rendered
+    assert 'x-show="clusterReadiness && !clusterReadiness.ready"' in cluster
+    # Surface 1: the per-node status strip names states in text (never
+    # color-only), and carries B1's incident badge.
+    assert "data-cluster-status-strip" in rendered
+    assert 'x-text="node.state"' in cluster
+    assert "clusterActiveIncidents().length" in cluster
+    # Each row: state word, evidence, age, and a fix affordance that
+    # dispatches to already-existing actions.
+    assert 'x-text="row.state"' in cluster
+    assert 'x-text="row.evidence"' in cluster
+    assert "clusterReadinessRowStale(row)" in cluster
+    assert "applyClusterReadinessFix(row)" in cluster
+    # The prose blocker stays for one release; the panel is additive.
+    assert cluster.count('x-text="clusterAutoconfigureError"') >= 1
+
+    # The rows poll on the 10 s discovery tick, never the 2 s runtime tick:
+    # loadClusterReadiness is called only inside the gated discovery block.
+    assert "loadClusterReadiness()" in javascript
+    refresh = javascript.index("async refreshClusterExperience()")
+    gate = javascript.index("_clusterDiscoveryRefreshCounter < 5", refresh)
+    call = javascript.index("this.loadClusterReadiness()", refresh)
+    assert gate < call
+    # Fixes reuse existing machinery, not new endpoints.
+    assert "runFabricDoctor()" in javascript
+    assert "/admin/api/cluster/peer-probe" in javascript
