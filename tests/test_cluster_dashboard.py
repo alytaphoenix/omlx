@@ -78,7 +78,9 @@ def test_cluster_dashboard_uses_authenticated_cluster_apis():
     assert "async startCluster()" in javascript
     assert "async activateClusterProposal(activation)" in javascript
     assert "async loadClusterStatus()" in javascript
-    assert "async downloadClusterDiagnostics()" in javascript
+    # B6 widened the signature: no argument saves the full bundle, an
+    # incident id saves that incident's evidence slice.
+    assert "async downloadClusterDiagnostics(incidentId = null)" in javascript
     assert "async activateClusterDeployment()" in javascript
     assert "clusterRuntimeAssignments(job)" in javascript
     assert "formatClusterRate(rate)" in javascript
@@ -524,3 +526,47 @@ def test_cluster_dashboard_renders_the_precondition_panel():
     # Fixes reuse existing machinery, not new endpoints.
     assert "runFabricDoctor()" in javascript
     assert "/admin/api/cluster/peer-probe" in javascript
+
+
+def test_cluster_dashboard_demands_reload_when_the_bundle_is_stale():
+    """B6: a stale cached dashboard names itself, and the bar cannot close."""
+
+    rendered = admin_routes.templates.get_template("dashboard.html").render()
+    cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+
+    # The page carries the version it was built with, injected server-side
+    # from the same content hash that stamps every cluster API response.
+    assert "window.OMLX_ASSET_VERSION" in rendered
+    assert f'window.OMLX_ASSET_VERSION = "{admin_routes.asset_version()}"' in rendered
+    # The bundle URL busts on the same hash, so the demanded reload
+    # actually fetches the new JavaScript instead of the cached copy.
+    assert f"js/dashboard.js?v={admin_routes.asset_version()}" in rendered
+
+    # The reload bar exists, binds the flag, and is non-dismissable by
+    # design (B.3): its only affordance is the reload itself.
+    assert "data-asset-stale-bar" in cluster
+    assert 'x-show="assetStale"' in cluster
+    assert "Dashboard updated — reload" in cluster
+    bar = cluster.split("data-asset-stale-bar", 1)[1].split("</div>", 1)[0]
+    assert "window.location.reload()" in bar
+    assert "Dismiss" not in bar
+    assert "dismiss" not in bar
+
+    # One wrapper covers every cluster call site: the global fetch is
+    # intercepted for /admin/api/cluster/ paths only, and the flag it sets
+    # is never cleared anywhere in the bundle.
+    assert "X-Omlx-Asset-Version" in javascript
+    assert "url.startsWith('/admin/api/cluster/')" in javascript
+    assert "omlx-asset-stale" in javascript
+    assert "window.OMLX_ASSET_STALE = true" in javascript
+    assert "this.assetStale = true" in javascript
+    # Nothing anywhere sets the flag back down once raised.
+    assert "assetStale = false" not in javascript.replace(
+        "assetStale: false", ""
+    )
+
+    # Every incident feed row offers the B6 evidence slice.
+    assert "data-incident-details" in cluster
+    assert "downloadClusterDiagnostics(incident.id)" in cluster
+    assert "/admin/api/cluster/diagnostics?incident=" in javascript

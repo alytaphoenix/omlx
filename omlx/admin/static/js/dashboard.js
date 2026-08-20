@@ -1,3 +1,34 @@
+    // B6 asset-version handshake: every /admin/api/cluster/* response carries
+    // the X-Omlx-Asset-Version header for the dashboard.js the server ships
+    // right now. This page was built with window.OMLX_ASSET_VERSION (injected
+    // by dashboard.html). A mismatch means the browser cached a stale bundle
+    // across an app update (failure #8's cached-JS ghost) — flag it once,
+    // permanently, and let the reload bar in _cluster.html demand a reload.
+    // Wrapping the global fetch for cluster paths only means every current
+    // and future cluster call site participates without being touched.
+    (() => {
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = async function (input, init) {
+            const response = await nativeFetch(input, init);
+            try {
+                const url = typeof input === 'string'
+                    ? input
+                    : String((input && input.url) || '');
+                if (url.startsWith('/admin/api/cluster/')) {
+                    const served = response.headers.get('X-Omlx-Asset-Version');
+                    const built = window.OMLX_ASSET_VERSION;
+                    if (served && built && served !== built) {
+                        window.OMLX_ASSET_STALE = true;
+                        window.dispatchEvent(new CustomEvent('omlx-asset-stale'));
+                    }
+                }
+            } catch (_) {
+                // Version bookkeeping must never break the API call itself.
+            }
+            return response;
+        };
+    })();
+
     // OCR model types that require temperature=0.0 (deterministic output)
     const OCR_CONFIG_MODEL_TYPES = new Set([
         'deepseekocr', 'deepseekocr_2', 'dots_ocr', 'glm_ocr',
@@ -347,6 +378,10 @@
             clusterPlanTensorParallelSize: 1,
             clusterPeerHealth: null,
             clusterPeerHealthLoading: false,
+            // B6: set once by the asset-version fetch wrapper, never cleared
+            // — the bar it drives is non-dismissable by design (B.3); the
+            // only way out is the reload it asks for.
+            assetStale: false,
             // Server-owned incident feed. Polls merge by id and never delete:
             // the only paths that change a row are new server records (via the
             // since cursor) and an explicit dismissal round-trip.
@@ -820,6 +855,14 @@
             accCopied: false,
 
             async init() {
+                // B6: surface a stale cached bundle the fetch wrapper flags.
+                // The window-level flag covers a mismatch detected before
+                // this component initialized.
+                this.assetStale = Boolean(window.OMLX_ASSET_STALE);
+                window.addEventListener('omlx-asset-stale', () => {
+                    this.assetStale = true;
+                });
+
                 // Apply theme
                 this.applyTheme();
                 this.applyTabStateFromUrl();
@@ -1367,11 +1410,18 @@
                 }
             },
 
-            async downloadClusterDiagnostics() {
+            // Without an argument: the full support bundle. With an incident
+            // id (each feed row's [Details], B6): the server-correlated
+            // evidence slice for that one incident — its job record, the
+            // readiness snapshot, and the ±30 s log window.
+            async downloadClusterDiagnostics(incidentId = null) {
                 if (this.clusterDiagnosticsLoading) return;
                 this.clusterDiagnosticsLoading = true;
                 try {
-                    const response = await fetch('/admin/api/cluster/diagnostics');
+                    const endpoint = incidentId
+                        ? `/admin/api/cluster/diagnostics?incident=${encodeURIComponent(incidentId)}`
+                        : '/admin/api/cluster/diagnostics';
+                    const response = await fetch(endpoint);
                     if (response.status === 401) {
                         window.location.href = '/admin';
                         return;
@@ -1391,7 +1441,9 @@
                     const stamp = new Date().toISOString().replaceAll(':', '-');
                     const url = URL.createObjectURL(blob);
                     link.href = url;
-                    link.download = `omlx-cluster-diagnostics-${stamp}.json`;
+                    link.download = incidentId
+                        ? `omlx-incident-${incidentId}-${stamp}.json`
+                        : `omlx-cluster-diagnostics-${stamp}.json`;
                     document.body.appendChild(link);
                     link.click();
                     link.remove();

@@ -51,8 +51,13 @@ def _js_called_paths() -> set[str]:
         path = match.group("path").split("?")[0]
         # Any interpolated segment stands for a path parameter.
         path = re.sub(r"\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}", "{parameter}", path)
-        path = path.rstrip("/") if path not in ("", "/") else path
-        called.add(_PREFIX + path)
+        if path in ("", "/"):
+            # A bare prefix is a prefix test, not an endpoint call — the B6
+            # asset-version wrapper matches every cluster response with
+            # url.startsWith('/admin/api/cluster/'). Real calls always name
+            # a path segment after the prefix.
+            continue
+        called.add(_PREFIX + path.rstrip("/"))
     return called
 
 

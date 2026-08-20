@@ -9,6 +9,7 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -17,6 +18,7 @@ import re
 import shutil
 import signal
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import asdict, is_dataclass
@@ -1100,16 +1102,79 @@ templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 static_dir = Path(__file__).parent / "static"
 
 
+# B6 asset-version handshake: the version stamp for dashboard.js is a content
+# hash, deliberately NOT the mtime `_static_version` uses for other assets.
+# The packaged app is staged with ditto/rsync -a (apps/omlx-mac/Scripts/
+# build.sh), which copies *source* mtimes: two different builds can carry
+# identical mtimes (fresh clones, normalized archives) or identical bytes can
+# carry fresh mtimes. Hashing the bytes is provably right either way, and the
+# 60 s cache keeps the file read off the per-request path.
+_ASSET_VERSION_ASSET = "js/dashboard.js"
+_ASSET_VERSION_TTL_S = 60.0
+_asset_version_lock = threading.Lock()
+_asset_version_cache: dict[str, tuple[float, str]] = {}
+
+
+def asset_version() -> str:
+    """Content-hash version of the currently shipped ``dashboard.js``.
+
+    Stamped as ``X-Omlx-Asset-Version`` on every cluster API response and
+    injected into the dashboard page as ``window.OMLX_ASSET_VERSION``; a
+    mismatch means the browser cached a stale bundle across an app update
+    (failure #8's cached-JS ghost). Returns ``""`` when the asset is missing,
+    in which case callers skip the handshake entirely.
+    """
+
+    now = time.monotonic()
+    with _asset_version_lock:
+        cached = _asset_version_cache.get(_ASSET_VERSION_ASSET)
+        if cached is not None and now - cached[0] < _ASSET_VERSION_TTL_S:
+            return cached[1]
+    file_path = static_dir / _ASSET_VERSION_ASSET
+    try:
+        digest = hashlib.sha256(file_path.read_bytes()).hexdigest()[:16]
+    except OSError:
+        digest = ""
+    with _asset_version_lock:
+        _asset_version_cache[_ASSET_VERSION_ASSET] = (now, digest)
+    return digest
+
+
+async def stamp_asset_version(response: Response) -> None:
+    """Dependency that advertises the shipped dashboard.js version.
+
+    Registered on the cluster router *after* ``require_admin`` (see
+    ``_register_cluster_routes`` in ``omlx/server.py``), so an
+    unauthenticated request never carries the header — a login redirect
+    must not be misread client-side as version churn (design B6).
+    """
+
+    version = asset_version()
+    if version:
+        response.headers["X-Omlx-Asset-Version"] = version
+
+
 def _static_version(path: str) -> str:
-    """Append file mtime as query string for cache busting."""
+    """Append a version query string for cache busting.
+
+    ``dashboard.js`` uses the same content hash as the B6 handshake so that
+    the reload the "Dashboard updated" bar demands actually fetches the new
+    bundle — an mtime that survived packaging unchanged would let the browser
+    re-serve the stale copy forever. Other assets keep the cheap mtime stamp.
+    """
     file_path = static_dir / path
     if file_path.is_file():
+        if path == _ASSET_VERSION_ASSET:
+            version = asset_version()
+            if version:
+                return f"/admin/static/{path}?v={version}"
         mtime = int(file_path.stat().st_mtime)
         return f"/admin/static/{path}?v={mtime}"
     return f"/admin/static/{path}"
 
 
 templates.env.globals["static"] = _static_version
+templates.env.globals["asset_version"] = asset_version
 
 from omlx._version import __version__ as _omlx_version
 
