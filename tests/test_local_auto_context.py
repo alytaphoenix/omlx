@@ -28,7 +28,7 @@ def _model(size_gib, layers=48, kv=KV_BYTES_PER_TOKEN_PER_LAYER):
         layer_weight_bytes=tuple(
             base + (1 if index < remainder else 0) for index in range(layers)
         ),
-        kv_bytes_per_token_per_layer=kv,
+        kv_bytes_per_token_by_layer=(kv,) * layers,
         supports_tensor_parallel=True,
         supports_pipeline=True,
     )
@@ -53,7 +53,7 @@ def test_auto_never_exceeds_the_declared_context_length():
 
 def test_a_layout_with_no_kv_information_says_zero_not_a_guess():
     layout = synthetic_model_layout(total_weight_bytes=20 * GiB, layer_count=48)
-    assert layout.kv_bytes_per_token_per_layer == 0
+    assert layout.kv_bytes_per_token_by_layer == ()
     assert auto_context_for_layout(layout, capacity_bytes=128 * GiB) == 0
 
 
