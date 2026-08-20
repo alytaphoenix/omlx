@@ -278,6 +278,25 @@ class RuntimeMarker:
             thread.join(timeout=timeout)
 
 
+def _worker_mtp_settings(args: argparse.Namespace) -> SimpleNamespace:
+    """A minimal ``model_settings``-shaped object for pre-load patch dispatch.
+
+    ``maybe_apply_pre_load_patches`` only reads ``mtp_enabled`` and
+    ``mtp_num_draft_tokens`` off its ``model_settings`` argument (it never
+    sees the rank's full ``ModelSettings`` -- the rank process only has the
+    two CLI flags threaded onto its launch argv). Always returning an object
+    (never None) keeps the call site's behavior identical to the single-node
+    path when MTP is off: ``mtp_enabled=False`` still runs the sanitize-only
+    branch that keeps a checkpoint carrying unused ``mtp.*`` weights loading
+    correctly.
+    """
+
+    return SimpleNamespace(
+        mtp_enabled=bool(getattr(args, "mtp_enabled", False)),
+        mtp_num_draft_tokens=getattr(args, "mtp_num_draft_tokens", None),
+    )
+
+
 def _server_arguments(
     args: argparse.Namespace,
     *,
@@ -968,7 +987,40 @@ def run_worker(args: argparse.Namespace) -> int:
             assignments=[_runtime_assignment(item) for item in assignments],
         )
 
-        maybe_apply_pre_load_patches(args.model)
+        # Must run before provider.load_default() below: apply_mlx_lm_mtp_patch
+        # (invoked inside maybe_apply_pre_load_patches when this rank's model
+        # has MTP heads) documents that its __init__/sanitize/from_dict
+        # patches must be live before mlx_lm.load() so the loaded model sees
+        # MTP weights. A minimal settings-like object carries only the two
+        # attributes that function reads off model_settings for MTP
+        # (mtp_enabled, mtp_num_draft_tokens) -- the rank process never
+        # receives the full ModelSettings, only what --mtp-enabled /
+        # --mtp-num-draft-tokens threaded onto its launch argv (see
+        # build_mlx_launch_argv / ClusterDeployment.mtp_enabled).
+        maybe_apply_pre_load_patches(
+            args.model, model_settings=_worker_mtp_settings(args)
+        )
+        # Rank-0-owned depth/park coordination for MTP under TP clustering
+        # (see omlx.patches.mlx_lm_mtp.batch_generator's distributed-MTP
+        # section). Gated on tensor_parallel_size == world_size (pure TP,
+        # no pipeline stages) as defense in depth --
+        # DistributedBatchedEngine._validate_model_settings and
+        # ClusterDeployment.__post_init__ both already refuse to launch a
+        # pipeline-parallel plan with mtp_enabled=True, so this should
+        # always be true here, but a rank silently running independent
+        # per-machine depth controllers is exactly the "hangs instead of
+        # crashes" failure mode this whole feature exists to avoid.
+        if args.mtp_enabled and tensor_parallel_size == world_size:
+            from omlx.patches.mlx_lm_mtp.batch_generator import (
+                configure_distributed_mtp,
+            )
+
+            checksum_env = os.environ.get("OMLX_MTP_DISTRIBUTED_CHECKSUM", "1")
+            configure_distributed_mtp(
+                group=group,
+                coordinator=rank == 0,
+                checksum=checksum_env not in ("0", "false", "False", ""),
+            )
         # MLX-LM's pipeline shard selection rejects any parameter absent
         # from the safetensors index, though it loads with strict=False
         # moments later. Architectures oMLX patches in (glm_moe_dsa's
@@ -1229,6 +1281,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-cache-ssd", action="store_true")
     parser.add_argument("--sampling-rank-only", action="store_true")
     parser.add_argument("--async-overlap", action="store_true")
+    parser.add_argument(
+        "--mtp-enabled",
+        action="store_true",
+        help=(
+            "Attach and run native MTP (mlx_lm_mtp patch) on this rank. Only "
+            "valid for a pure tensor-parallel deployment -- "
+            "DistributedBatchedEngine._validate_model_settings refuses to "
+            "launch a pipeline-parallel plan with this set."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-num-draft-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Max MTP draft depth. Omit to defer to "
+            "maybe_apply_pre_load_patches' per-model-type default."
+        ),
+    )
     parser.add_argument("--ring-connections-per-ip", type=int, default=1)
     parser.add_argument(
         "--tuning-reason",
