@@ -884,18 +884,36 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
 # activation footprint, not something this pass separately budgets).
 _CONSTANT_STATE_LAYER_TYPES = frozenset({"linear_attention"})
 
+# Nemotron-H's ``layers_block_type`` vocabulary is unrelated to Qwen's
+# ``layer_types`` one (see _layers_block_type below): only "attention" gets a
+# real growing KVCache in mlx_lm's Model.make_cache(). "mamba" gets a
+# constant-size ArraysCache (same shape of fact as linear_attention above).
+# "moe" and "mlp" layers get no cache entry at all -- verified directly
+# against mlx_lm/models/nemotron_h.py's Model.make_cache() and
+# NemotronHBlock.__call__, which only ever pass a cache to "M" (mamba) and
+# "*" (attention) blocks.
+_CONSTANT_STATE_BLOCK_TYPES = frozenset({"mamba", "moe", "mlp"})
 
-def _layer_types(config: dict[str, Any], layer_count: int) -> tuple[str, ...] | None:
-    """This model's per-layer attention type, or ``None`` when unreadable.
+
+def _config_field_by_name(
+    config: dict[str, Any], layer_count: int, field_name: str
+) -> tuple[str, ...] | None:
+    """This model's per-layer type list read from ``field_name``, or ``None``.
 
     Checked in the same nested ``text_config``/``language_config``/
     ``llm_config`` locations ``_config_int`` already searches: VLM
     checkpoints (Qwen3.8-27B among them) nest ``layer_types`` under
     ``text_config`` alongside every other decoder field this module reads
-    from there. A length mismatch against ``layer_count`` is treated the
-    same as absence -- this module cannot confidently line the list up
-    against ``layer_weight_bytes`` index-for-index, so it falls back to the
-    uniform, pre-hybrid-aware behavior rather than guess an alignment.
+    from there. Shared by both ``_layer_types`` (Qwen-family's
+    ``layer_types`` field) and ``_layers_block_type`` (Nemotron-H's
+    differently-named ``layers_block_type`` field, confirmed top-level --
+    not nested -- in this model's real downloaded config.json) since the
+    lookup shape is identical; only the field name and the per-type
+    classification differ. A length mismatch against ``layer_count`` is
+    treated the same as absence -- this module cannot confidently line the
+    list up against ``layer_weight_bytes`` index-for-index, so it falls back
+    to the uniform, pre-hybrid-aware behavior rather than guess an
+    alignment.
     """
 
     candidates = [config]
@@ -904,7 +922,7 @@ def _layer_types(config: dict[str, Any], layer_count: int) -> tuple[str, ...] | 
         if isinstance(value, dict):
             candidates.append(value)
     for candidate in candidates:
-        value = candidate.get("layer_types")
+        value = candidate.get(field_name)
         if (
             isinstance(value, list)
             and len(value) == layer_count
@@ -912,6 +930,31 @@ def _layer_types(config: dict[str, Any], layer_count: int) -> tuple[str, ...] | 
         ):
             return tuple(value)
     return None
+
+
+def _layer_types(config: dict[str, Any], layer_count: int) -> tuple[str, ...] | None:
+    """This model's per-layer attention type from ``config["layer_types"]``.
+
+    Qwen-family vocabulary: ``"full_attention"``/``"sliding_attention"``
+    (grows) vs. ``"linear_attention"`` (constant state). See
+    ``_config_field_by_name`` for the lookup shape.
+    """
+
+    return _config_field_by_name(config, layer_count, "layer_types")
+
+
+def _layers_block_type(
+    config: dict[str, Any], layer_count: int
+) -> tuple[str, ...] | None:
+    """This model's per-layer block type from ``config["layers_block_type"]``.
+
+    Nemotron-H's vocabulary, unrelated to Qwen's ``layer_types`` field this
+    planner already reads: ``"mamba"``/``"moe"``/``"mlp"`` (no growing KV
+    cache) vs. ``"attention"`` (grows). See ``_config_field_by_name`` for the
+    lookup shape.
+    """
+
+    return _config_field_by_name(config, layer_count, "layers_block_type")
 
 
 def _kv_bytes_per_token_by_layer(
@@ -934,21 +977,41 @@ def _kv_bytes_per_token_by_layer(
     currently targets has one (only a speculative-decode draft checkpoint
     does, and drafts are not planned by this code path).
 
+    Nemotron-H models use a completely different config field,
+    ``layers_block_type`` (not ``layer_types``), with its own vocabulary --
+    see ``_layers_block_type`` and ``_CONSTANT_STATE_BLOCK_TYPES``. Only 6 of
+    Nemotron-3.5-Lightning-30B-A3B's 52 layers are real attention layers; the
+    rest are mamba (constant-size state) or moe/mlp (no cache at all), so
+    charging every layer the uniform rate overestimated this model's KV
+    reservation by the same shape of ratio Qwen's fix addressed. If a config
+    somehow defines both fields (not expected for any real model), this
+    checks ``layer_types`` first and only falls through to
+    ``layers_block_type`` when it is absent or unusable -- an explicit,
+    documented tie-break, not an accidental one -- since the two vocabularies
+    are not interchangeable and must never be classified against each
+    other's rules.
+
     Falls back to a uniform tuple -- today's behavior, unchanged -- when
-    ``layer_types`` is absent, unreadable, or does not line up with
-    ``layer_count``. This is the regression guard: every pure-transformer
-    model without ``layer_types`` sees exactly the same numbers as before
-    this function existed.
+    neither field is present, readable, or lines up with ``layer_count``.
+    This is the regression guard: every pure-transformer model without
+    either field sees exactly the same numbers as before this function
+    existed.
     """
 
     uniform = _kv_bytes_per_token_per_layer(config)
     layer_types = _layer_types(config, layer_count)
-    if layer_types is None:
-        return (uniform,) * layer_count
-    return tuple(
-        0 if layer_type in _CONSTANT_STATE_LAYER_TYPES else uniform
-        for layer_type in layer_types
-    )
+    if layer_types is not None:
+        return tuple(
+            0 if layer_type in _CONSTANT_STATE_LAYER_TYPES else uniform
+            for layer_type in layer_types
+        )
+    block_types = _layers_block_type(config, layer_count)
+    if block_types is not None:
+        return tuple(
+            0 if block_type in _CONSTANT_STATE_BLOCK_TYPES else uniform
+            for block_type in block_types
+        )
+    return (uniform,) * layer_count
 
 
 def _attention_head_count(model_path: Path) -> int:

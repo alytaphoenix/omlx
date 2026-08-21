@@ -723,6 +723,192 @@ def test_sliding_attention_falls_through_to_full_attention():
     assert _kv_bytes_per_token_by_layer(config, 3) == (uniform, uniform, 0)
 
 
+# --- Nemotron-H `layers_block_type` KV accounting ---------------------------
+#
+# Nemotron-H uses a completely different config field than Qwen's
+# layer_types -- layers_block_type, with vocabulary "mamba"/"moe"/"mlp"
+# (no growing KV cache) vs. "attention" (grows). Confirmed directly against
+# mlx_lm's nemotron_h.py Model.make_cache(): only "attention" ("*") blocks
+# get a real KVCache; "mamba" ("M") blocks get a constant-size ArraysCache;
+# "moe" and "mlp" blocks get no cache entry at all. Confirmed top-level (not
+# nested under text_config) in NVIDIA-Nemotron-3.5-Lightning-30B-A3B's real
+# downloaded config.json, which has 6 attention layers out of 52.
+
+
+def test_nemotron_layers_block_type_zeros_the_non_attention_layers():
+    from omlx.cluster.planner import _kv_bytes_per_token_by_layer
+
+    config = {
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "layers_block_type": [
+            "mamba",
+            "moe",
+            "attention",
+            "mamba",
+            "moe",
+            "mlp",
+        ],
+    }
+    uniform = 8 * 128 * 2 * 2
+    assert _kv_bytes_per_token_by_layer(config, 6) == (
+        0,
+        0,
+        uniform,
+        0,
+        0,
+        0,
+    )
+
+
+def test_nemotron_3_5_lightning_shaped_config_produces_the_confirmed_6_52_split():
+    """Pinning the real ratio this fix was written against: 6 attention, 46
+    non-attention (23 mamba, 23 moe), on the real downloaded config.json.
+    """
+
+    from omlx.cluster.planner import _kv_bytes_per_token_by_layer
+
+    # The exact layers_block_type list from
+    # NVIDIA-Nemotron-3.5-Lightning-30B-A3B-oQ4-mtp's real downloaded
+    # config.json.
+    layers_block_type = [
+        "mamba",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "attention",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "attention",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "attention",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "attention",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "attention",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "attention",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "moe",
+        "mamba",
+        "moe",
+    ]
+    assert len(layers_block_type) == 52
+    assert layers_block_type.count("attention") == 6
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "layers_block_type": layers_block_type,
+    }
+    tup = _kv_bytes_per_token_by_layer(config, 52)
+    assert sum(1 for v in tup if v) == 6
+    assert sum(1 for v in tup if not v) == 46
+
+
+def test_layers_block_type_length_mismatch_falls_back_to_uniform():
+    from omlx.cluster.planner import _kv_bytes_per_token_by_layer
+
+    config = {
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "layers_block_type": ["mamba", "attention"],  # length 2
+    }
+    uniform = 8 * 128 * 2 * 2
+    assert _kv_bytes_per_token_by_layer(config, 4) == (uniform,) * 4
+
+
+def test_layers_block_type_unrecognized_value_falls_through_to_growing():
+    """An unrecognized block type is not in _CONSTANT_STATE_BLOCK_TYPES, so
+    it is treated as growing -- the same conservative default the module
+    already applies to sliding_attention under layer_types.
+    """
+
+    from omlx.cluster.planner import _kv_bytes_per_token_by_layer
+
+    config = {
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "layers_block_type": ["mamba", "some_future_block_type", "attention"],
+    }
+    uniform = 8 * 128 * 2 * 2
+    assert _kv_bytes_per_token_by_layer(config, 3) == (0, uniform, uniform)
+
+
+def test_layer_types_takes_precedence_over_layers_block_type_when_both_present():
+    """Not expected for any real model, but must be deterministic and
+    documented rather than an accidental byproduct of dict key order: when a
+    config somehow defines both fields, layer_types (checked first) wins and
+    layers_block_type is not consulted at all.
+    """
+
+    from omlx.cluster.planner import _kv_bytes_per_token_by_layer
+
+    config = {
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "layer_types": ["linear_attention", "full_attention"],
+        # If this were consulted it would zero index 1 instead of index 0.
+        "layers_block_type": ["attention", "mamba"],
+    }
+    uniform = 8 * 128 * 2 * 2
+    assert _kv_bytes_per_token_by_layer(config, 2) == (0, uniform)
+
+
+def test_no_layer_types_or_layers_block_type_field_matches_todays_behavior():
+    """The regression guard for the Nemotron-H extension: a model with
+    neither field must see the identical uniform tuple this planner produced
+    before this extension existed (and before hybrid-attention accounting
+    existed at all).
+    """
+
+    from omlx.cluster.planner import (
+        _kv_bytes_per_token_by_layer,
+        _kv_bytes_per_token_per_layer,
+    )
+
+    config = {"num_attention_heads": 40, "num_key_value_heads": 8, "head_dim": 128}
+    uniform = _kv_bytes_per_token_per_layer(config)
+    assert _kv_bytes_per_token_by_layer(config, 6) == (uniform,) * 6
+
+
 def test_kv_bytes_for_stage_sums_only_the_sliced_layers():
     from omlx.cluster.planner import ModelLayout, _kv_bytes_for_stage
 
