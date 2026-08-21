@@ -816,6 +816,30 @@ def test_ane_bank_memory_headroom_ok_defaults_true_on_error(monkeypatch):
     assert ane_patch._ane_bank_memory_headroom_ok() is True
 
 
+def test_ane_bank_memory_footprint_snapshot_reports_measured_bytes(monkeypatch):
+    """The skip-warning log needs the actual measured numbers, not just the
+    fixed threshold constant, so a future "why is ANE slow on this box" is
+    answerable from one log line."""
+    import omlx.utils.hardware as hardware
+    import omlx.utils.proc_memory as proc_memory
+
+    gib = 1024**3
+    monkeypatch.setattr(proc_memory, "get_phys_footprint", lambda: 34 * gib)
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", lambda: 48 * gib)
+
+    assert ane_patch._ane_bank_memory_footprint_snapshot() == (34 * gib, 48 * gib)
+
+
+def test_ane_bank_memory_footprint_snapshot_defaults_zero_on_error(monkeypatch):
+    import omlx.utils.hardware as hardware
+
+    def boom():
+        raise RuntimeError("sysctl unavailable")
+
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", boom)
+    assert ane_patch._ane_bank_memory_footprint_snapshot() == (0, 0)
+
+
 def test_bank_split_ladder_stops_retrying_when_headroom_runs_out(monkeypatch):
     """The circuit breaker must stop issuing further compile attempts (not
     just refuse to start) once memory tightens mid-ladder -- this is what
@@ -836,6 +860,9 @@ def test_bank_split_ladder_stops_retrying_when_headroom_runs_out(monkeypatch):
         return len(headroom_calls) == 1  # only the first attempt has headroom
 
     monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", headroom_ok)
+    monkeypatch.setattr(
+        ane_patch, "_ane_bank_memory_footprint_snapshot", lambda: (0, 0)
+    )
 
     result = ane_patch._bank_split_ladder([4, 4, 4, 4], compile_span)
 
@@ -883,6 +910,9 @@ def test_compile_single_banks_stops_retrying_when_headroom_runs_out(monkeypatch)
         return len(headroom_calls) == 1
 
     monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", headroom_ok)
+    monkeypatch.setattr(
+        ane_patch, "_ane_bank_memory_footprint_snapshot", lambda: (0, 0)
+    )
 
     weights = [mx.zeros((4, 4), dtype=mx.int8) for _ in range(4)]
     result = ane_patch._compile_single_banks(weights, 2048)

@@ -75,6 +75,21 @@ def _ane_bank_memory_headroom_ok() -> bool:
         return True
 
 
+def _ane_bank_memory_footprint_snapshot() -> tuple[int, int]:
+    """``(current phys_footprint, total system memory)`` in bytes for the
+    skip-warning log, so "why did ANE bank compile stop retrying on this
+    box" is answerable from one log line instead of just the fixed 70%
+    threshold. Best-effort: returns ``(0, 0)`` if either measurement is
+    unavailable."""
+    try:
+        from omlx.utils.hardware import get_total_memory_bytes
+        from omlx.utils.proc_memory import get_phys_footprint
+
+        return get_phys_footprint(), get_total_memory_bytes()
+    except Exception:
+        return 0, 0
+
+
 @dataclass(frozen=True)
 class _AnePrefillConfig:
     sequence_length: int
@@ -2036,12 +2051,15 @@ def _bank_split_ladder(
 
     for attempt in range(4):
         if not _ane_bank_memory_headroom_ok():
+            current, total = _ane_bank_memory_footprint_snapshot()
             logger.warning(
                 "Skipping ANE procedure bank compile attempt %d/4: phys "
-                "footprint already past the %.0f%% safety fraction of "
-                "system memory. Falling back to per-layer programs instead "
-                "of risking a jetsam kill.",
+                "footprint %.2f GiB / %.2f GiB total already past the "
+                "%.0f%% safety fraction of system memory. Falling back to "
+                "per-layer programs instead of risking a jetsam kill.",
                 attempt + 1,
+                current / (1 << 30),
+                total / (1 << 30),
                 _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
             )
             break
@@ -2156,12 +2174,15 @@ def _compile_single_banks(
 
     for attempt in range(4):
         if not _ane_bank_memory_headroom_ok():
+            current, total = _ane_bank_memory_footprint_snapshot()
             logger.warning(
                 "Skipping single-ANE procedure bank compile attempt %d/4: "
-                "phys footprint already past the %.0f%% safety fraction of "
-                "system memory. Falling back to per-layer programs instead "
-                "of risking a jetsam kill.",
+                "phys footprint %.2f GiB / %.2f GiB total already past the "
+                "%.0f%% safety fraction of system memory. Falling back to "
+                "per-layer programs instead of risking a jetsam kill.",
                 attempt + 1,
+                current / (1 << 30),
+                total / (1 << 30),
                 _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
             )
             break
