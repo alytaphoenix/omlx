@@ -167,7 +167,9 @@ def _parse_qsplit_env() -> bool:
     return os.environ.get("OMLX_SDPA256_QSPLIT", "").strip() != "0"
 
 
-def _route_decision(queries, keys, force_conservative: bool = False) -> tuple[str, int]:
+def _route_decision(
+    queries, keys, q_sub_ceiling: int | None = None
+) -> tuple[str, int]:
     """Decide unfused / q-split / tiled for a shape-matched prefill call.
 
     Returns ``(route, q_sub)`` — ``q_sub`` is only meaningful for
@@ -181,13 +183,18 @@ def _route_decision(queries, keys, force_conservative: bool = False) -> tuple[st
     wouldn't fit, or when headroom info is unavailable (memory-safe
     #2025 default).
 
-    ``force_conservative`` is this request's hysteresis floor (set by
-    ``_should_route`` once a call has ever needed q-split or tiled): skips
-    the "does the full call fit" fast path so a later chunk's momentarily
-    better-looking estimate can't flip back to unfused. kv_len only grows
-    within a request, so a route shed earlier reflects real, non-relaxing
-    pressure -- confirmed live, a request flickered qsplit->unfused 16
-    seconds before the reactive guard aborted it."""
+    ``q_sub_ceiling`` is this request's hysteresis floor (set by
+    ``_should_route`` once a call has ever needed a smaller transient than
+    the full call): caps how large a transient this call may use, not just
+    which route label it gets. kv_len only grows within a request, so a
+    transient shed earlier reflects real, non-relaxing pressure -- and
+    capping only the *route* (skip the "fits" fast path but still let
+    q_sub float back up to q_len when headroom looks momentarily generous)
+    was verified live to reproduce byte-for-byte the same full-size
+    transient as plain unfused, just labeled qsplit, moments before the
+    reactive guard aborted a request. ``q_sub_ceiling == 0`` means a
+    previous call already needed tiled -- never try qsplit or unfused
+    again this request."""
     if _FORCE_TILED is not None:
         if _FORCE_TILED:
             _note_route(_ROUTE_TILED, "forced by OMLX_SDPA256_TILED=1")
@@ -195,6 +202,12 @@ def _route_decision(queries, keys, force_conservative: bool = False) -> tuple[st
         _note_route(_ROUTE_UNFUSED, "forced by OMLX_SDPA256_TILED=0")
         return _ROUTE_UNFUSED, 0
     try:
+        if q_sub_ceiling == 0:
+            _note_route(
+                _ROUTE_TILED,
+                "held at tiled by this request's hysteresis floor",
+            )
+            return _ROUTE_TILED, 0
         provider = _HEADROOM_PROVIDER() if _HEADROOM_PROVIDER is not None else None
         if provider is None:
             _note_route(
@@ -218,7 +231,7 @@ def _route_decision(queries, keys, force_conservative: bool = False) -> tuple[st
         transient = estimate_unfused_sdpa_call_bytes(
             n_q_heads, q_len, kv_len, HEAD_DIM, score_dtype_size=dtype_size
         )
-        if transient <= headroom and not force_conservative:
+        if transient <= headroom and q_sub_ceiling is None:
             _note_route(
                 _ROUTE_UNFUSED,
                 lambda: f"full call ~{transient / 2**20:.0f}MiB fits "
@@ -230,6 +243,8 @@ def _route_decision(queries, keys, force_conservative: bool = False) -> tuple[st
                 n_q_heads, kv_len, HEAD_DIM, dtype_size, headroom
             )
             q_sub = (q_sub // 128) * 128
+            if q_sub_ceiling is not None:
+                q_sub = min(q_sub, q_sub_ceiling)
             if q_sub >= _QSPLIT_MIN_Q:
                 q_sub = min(q_sub, q_len)
                 _note_route(
@@ -398,17 +413,27 @@ def _should_route(queries, keys, cache, mask, sinks) -> tuple[str, int]:
         n_kv = keys.shape[-3]
         if n_kv <= 0 or n_q % n_kv != 0:
             return _ROUTE_UNFUSED, 0
-        # Hysteresis floor: once this request's cache has needed to shed the
-        # full-unfused route, never let it climb back -- kv_len is monotone
-        # within a request, so the pressure that forced the downgrade cannot
-        # have relaxed by the next chunk. Stashed on ``cache`` since that is
-        # the one object stable across every chunk/layer of a single request
-        # but never shared across requests.
-        downgraded = bool(getattr(cache, "_sdpa256_downgraded", False))
-        route, q_sub = _route_decision(queries, keys, force_conservative=downgraded)
-        if not downgraded and route != _ROUTE_UNFUSED and cache is not None:
+        # Hysteresis floor: once this request's cache has needed a smaller
+        # transient than the full call, never let a later chunk's estimate
+        # push the transient back up -- kv_len is monotone within a
+        # request, so the pressure that forced the downgrade cannot have
+        # relaxed by the next chunk. Ratchets on transient SIZE (q_sub),
+        # not just the route label: capping only the label and letting
+        # q_sub float back up to q_len when headroom looks momentarily
+        # generous was verified live to reproduce the identical full-size
+        # transient labeled qsplit instead of unfused. Stashed on ``cache``
+        # since that is the one object stable across every chunk/layer of a
+        # single request but never shared across requests.
+        ceiling = getattr(cache, "_sdpa256_q_sub_ceiling", None)
+        route, q_sub = _route_decision(queries, keys, q_sub_ceiling=ceiling)
+        if cache is not None:
             try:
-                cache._sdpa256_downgraded = True
+                if route == _ROUTE_TILED:
+                    cache._sdpa256_q_sub_ceiling = 0
+                elif route == _ROUTE_QSPLIT:
+                    cache._sdpa256_q_sub_ceiling = (
+                        q_sub if ceiling is None else min(ceiling, q_sub)
+                    )
             except Exception:
                 pass
         return route, q_sub

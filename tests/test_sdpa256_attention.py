@@ -461,13 +461,13 @@ def test_route_hysteresis_never_climbs_back_to_unfused(_sdpa256_provider_reset):
 
     # First call: plenty of headroom, stays unfused, no downgrade recorded.
     assert sdpa256._should_route(q, k, cache, "causal", None) == ("unfused", 0)
-    assert getattr(cache, "_sdpa256_downgraded", False) is False
+    assert getattr(cache, "_sdpa256_q_sub_ceiling", None) is None
 
     # Headroom tightens (simulating real pressure) and the route sheds to
     # tiled; the cache now carries a permanent downgrade marker.
     owner.value = 0
     assert sdpa256._should_route(q, k, cache, "causal", None) == ("tiled", 0)
-    assert cache._sdpa256_downgraded is True
+    assert cache._sdpa256_q_sub_ceiling == 0
 
     # Headroom "recovers" (e.g. a momentarily generous estimate) -- without
     # hysteresis this would flip back to unfused. It must not.
@@ -481,6 +481,58 @@ def test_route_hysteresis_never_climbs_back_to_unfused(_sdpa256_provider_reset):
         "unfused",
         0,
     )
+
+
+def test_route_hysteresis_caps_q_sub_not_just_the_route_label(
+    _sdpa256_provider_reset,
+):
+    """A request downgraded to qsplit must not have q_sub float back up to
+    q_len (a full-size transient, byte-for-byte identical to unfused) just
+    because a later chunk's headroom estimate looks momentarily generous
+    again -- capping only the route *label* while leaving q_sub uncapped
+    was verified live to reproduce exactly that: a single qsplit sub-call
+    the same size as the plain unfused call it was supposed to avoid."""
+    from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+
+    sdpa256 = _sdpa256_provider_reset
+
+    class _Cache:
+        pass
+
+    cache = _Cache()
+    q, k, _ = _qkv(2048, 16384)
+    need = estimate_unfused_sdpa_call_bytes(24, 2048, 16384, 256, q.dtype.size)
+    per_row = need // 2048
+
+    # First call: headroom fits ~1024 rows, not the full 2048 -> qsplit,
+    # ceiling latches to that q_sub.
+    owner = _HeadroomOwner(1024 * per_row)
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    route, q_sub = sdpa256._should_route(q, k, cache, "causal", None)
+    assert route == "qsplit"
+    assert q_sub == 1024
+    assert cache._sdpa256_q_sub_ceiling == 1024
+
+    # Headroom "recovers" to ample -- without capping q_sub itself, this
+    # would compute q_sub=2048 (== q_len), a full-size transient.
+    owner.value = 1 << 40
+    route, q_sub = sdpa256._should_route(q, k, cache, "causal", None)
+    assert route == "qsplit"
+    assert q_sub <= 1024
+    assert cache._sdpa256_q_sub_ceiling <= 1024
+
+    # Headroom tightens further -> ceiling ratchets down, never back up.
+    owner.value = 256 * per_row
+    route, q_sub = sdpa256._should_route(q, k, cache, "causal", None)
+    assert route == "qsplit"
+    assert q_sub == 256
+    assert cache._sdpa256_q_sub_ceiling == 256
+
+    # Recovers again -- still held at the smallest q_sub ever proven safe.
+    owner.value = 1 << 40
+    route, q_sub = sdpa256._should_route(q, k, cache, "causal", None)
+    assert route == "qsplit"
+    assert q_sub <= 256
 
 
 def test_route_defaults_to_tiled_when_provider_owner_dies(_sdpa256_provider_reset):
