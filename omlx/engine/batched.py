@@ -828,6 +828,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.get("request_id"),
             tools=tools,
             **specprefill_kwargs,
         )
@@ -905,6 +906,7 @@ class BatchedEngine(BaseEngine):
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.get("request_id"),
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
