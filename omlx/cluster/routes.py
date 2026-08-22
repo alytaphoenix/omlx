@@ -50,7 +50,8 @@ from .discovery import (
     verify_pairing_token,
 )
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
-from .guidance import explain_code
+from .guidance import explain, explain_code
+from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
@@ -93,6 +94,7 @@ from .runtime import read_runtime_markers
 from .staging import (
     DEFAULT_REMOTE_PYTHON,
     InsufficientDiskError,
+    home_relative_model_path,
     index_shards,
     model_staging_inventory,
     home_relative_model_path,
@@ -150,7 +152,7 @@ class ClusterJoinKeyRequest(BaseModel):
     controller_ip: str = Field(min_length=2, max_length=64)
     controller_port: int = Field(ge=1, le=65535)
     scheme: Literal["http", "https"] = "http"
-    ttl_seconds: int = Field(default=600, ge=30, le=600)
+    ttl_seconds: int = Field(default=1800, ge=30, le=1800)
 
 
 class ClusterWorkerClaimRequest(BaseModel):
@@ -333,6 +335,42 @@ def _redact_diagnostic(value: Any, *, field: str = "", depth: int = 0) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return str(value)[:4096]
+
+
+def _record_cluster_incident(
+    severity: Severity,
+    state_code: str,
+    message: str,
+    *,
+    source: str = "coordinator",
+    job_id: str | None = None,
+    deployment_id: str | None = None,
+) -> None:
+    """Best-effort incident funnel for the routes layer.
+
+    Failure paths call this immediately before re-raising, so nothing here may
+    mask the original error: an unconfigured store (worker-only installs,
+    bare test apps) or a failed save is swallowed. The message is redacted at
+    record time so the stored copy is already safe to serve.
+    """
+
+    try:
+        store = get_cluster_incidents()
+    except RuntimeError:
+        return
+    redacted = str(_redact_diagnostic(str(message)))
+    try:
+        store.record(
+            severity,
+            source,
+            state_code,
+            redacted,
+            guidance_code=explain(redacted).code,
+            job_id=job_id,
+            deployment_id=deployment_id,
+        )
+    except Exception:  # noqa: BLE001 - logging must never outrank the failure
+        return
 
 
 class ClusterPlanNodeRequest(BaseModel):
@@ -1475,6 +1513,13 @@ _STAGING_JOBS: dict[str, dict[str, Any]] = {}
 _STAGING_JOBS_LOCK = threading.Lock()
 _MAX_STAGING_JOBS = 32
 
+# The coordinator narrates deaths: the first health poll that sees a
+# previously-healthy deployment report unhealthy records the incident, once
+# per transition rather than once per poll. In-memory is enough — after a
+# server restart the next healthy poll re-arms the transition.
+_PEER_HEALTH_LAST_HEALTHY: dict[str, bool] = {}
+_PEER_HEALTH_LOCK = threading.Lock()
+
 
 def _staging_job_snapshot(job_id: str) -> dict[str, Any] | None:
     with _STAGING_JOBS_LOCK:
@@ -1529,7 +1574,7 @@ def _run_staging_job(
             }
         else:
             shards, sidecar_sizes = remote_model_staging_inventory(
-                source_host, str(model_path)
+                source_host, home_relative_model_path(str(model_path))
             )
         shard_sizes = {item.name: item.size_bytes for item in shards}
         sidecars = tuple(sorted(sidecar_sizes))
@@ -1652,6 +1697,14 @@ def _run_staging_job(
                 job["error"] = "Model staging failed on " + ", ".join(failed_nodes)
 
         _update_staging_job(job_id, complete)
+        if failed_nodes:
+            _record_cluster_incident(
+                Severity.ERROR,
+                "staging_failed",
+                "Model staging failed on " + ", ".join(failed_nodes),
+                job_id=job_id,
+                deployment_id=deployment.deployment_id,
+            )
     except Exception as exc:  # noqa: BLE001 - background job reports the failure
         def fail(job: dict[str, Any], *, error=str(exc)) -> None:
             job["status"] = "failed"
@@ -1659,6 +1712,14 @@ def _run_staging_job(
             job["error"] = error
 
         _update_staging_job(job_id, fail)
+        # Already on the staging worker thread: a blocking record is fine.
+        _record_cluster_incident(
+            Severity.ERROR,
+            "staging_failed",
+            str(exc),
+            job_id=job_id,
+            deployment_id=deployment.deployment_id,
+        )
 
 
 @router.post("/stage")
@@ -1842,6 +1903,13 @@ async def cluster_diagnostics():
         staging_jobs = json.loads(
             json.dumps(list(_STAGING_JOBS.values())[-_MAX_STAGING_JOBS:])
         )
+    incidents: list[dict[str, Any]] = []
+    try:
+        incidents = [
+            incident.to_dict() for incident in get_cluster_incidents().list()
+        ]
+    except RuntimeError as exc:
+        errors.append(f"incidents: {type(exc).__name__}: {exc}")
     payload = {
         "schema_version": 1,
         "generated_at": datetime.now(UTC).isoformat(),
@@ -1851,9 +1919,49 @@ async def cluster_diagnostics():
         "registry": registry_payload,
         "peer_health": peer_health,
         "staging_jobs": staging_jobs,
+        "incidents": incidents,
         "errors": errors,
     }
     return _redact_diagnostic(payload)
+
+
+@router.get("/incidents")
+async def cluster_incidents(since: int = Query(default=0, ge=0)):
+    """Return incidents after the caller's cursor, plus the new cursor.
+
+    The ``since`` cursor makes monotonic merge a server-enforced property: a
+    poll can only ever add records the browser has not seen, so no refresh can
+    wipe error state. Dismissal (below) is the only removal path.
+    """
+
+    try:
+        store = get_cluster_incidents()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    incidents = [incident.to_dict() for incident in store.list(since_seq=since)]
+    for item in incidents:
+        item["message"] = _redact_diagnostic(item["message"])
+    return {
+        "incidents": incidents,
+        "latest_seq": store.latest_seq(),
+        # Identity of the seq numbering. A corrupt-log reset restarts seq at
+        # 1 under a new epoch; a client holding an old cursor must detect the
+        # change and restart from 0 instead of going silent forever.
+        "epoch": store.epoch,
+    }
+
+
+@router.post("/incidents/{incident_id}/dismiss")
+async def dismiss_cluster_incident(incident_id: str):
+    """Mark one incident dismissed — server-owned, so it survives reloads."""
+
+    try:
+        store = get_cluster_incidents()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not store.dismiss(incident_id):
+        raise HTTPException(status_code=404, detail="Unknown incident.")
+    return {"ok": True}
 
 
 @router.get("/discover")
@@ -2100,20 +2208,27 @@ async def cluster_ssh_key():
 
 
 @router.post("/ssh-key/generate")
-async def cluster_generate_ssh_key():
-    """Generate a new SSH key pair for cluster authentication."""
+async def cluster_generate_ssh_key(
+    overwrite: bool = Query(default=False),
+):
+    """Create the managed SSH key, rotating it only when explicitly requested."""
 
     from .ssh_keys import generate_ssh_key_pair
 
     try:
-        key_pair = await asyncio.to_thread(generate_ssh_key_pair, overwrite=True)
+        key_pair = await asyncio.to_thread(
+            generate_ssh_key_pair,
+            overwrite=overwrite,
+        )
         return {
             "success": True,
+            "available": True,
             "key_type": key_pair.key_type,
             "fingerprint": key_pair.fingerprint,
             "public_key": key_pair.public_key,
             "private_key_path": str(key_pair.private_key_path),
             "public_key_path": str(key_pair.public_key_path),
+            "created_at": key_pair.created_at,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -2211,9 +2326,30 @@ async def cluster_peer_health(hosts: str = Query(...), deployment_id: str = ""):
         deployment_id=deployment_id,
         require_heartbeat=bool(deployment_id),
     )
+    healthy = all(item.healthy for item in health)
+    if deployment_id:
+        with _PEER_HEALTH_LOCK:
+            was_healthy = _PEER_HEALTH_LAST_HEALTHY.get(deployment_id)
+            _PEER_HEALTH_LAST_HEALTHY[deployment_id] = healthy
+        if was_healthy and not healthy:
+            lost = next((item for item in health if not item.healthy), None)
+            # to_thread: the store fsyncs while holding its lock, which must
+            # not stall the event loop mid-stream for every other request.
+            await asyncio.to_thread(
+                _record_cluster_incident,
+                Severity.ERROR,
+                "peer_unhealthy",
+                describe_failure(health),
+                source=(
+                    f"peer:{lost.node_id}"
+                    if lost is not None and lost.node_id
+                    else "coordinator"
+                ),
+                deployment_id=deployment_id,
+            )
     return {
         "peers": [item.to_dict() for item in health],
-        "healthy": all(item.healthy for item in health),
+        "healthy": healthy,
         "summary": describe_failure(health),
     }
 
@@ -2988,6 +3124,9 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
         "launched_signature": "",
         "ranks": [],
     }
+    # Bound before the try so the incident emitters below can attach the
+    # deployment ID when planning got far enough to assign one.
+    deployment = None
     try:
         deployment, plan = await asyncio.to_thread(_create_deployment, request)
         # Before anything touches another Mac: is this the plan the user was
@@ -3176,8 +3315,23 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
     except PeerLostError as exc:
         # 409: the cluster is not in a state to start. Launching into a peer
         # that is not answering yields a collective that blocks forever.
+        await asyncio.to_thread(
+            _record_cluster_incident,
+            Severity.ERROR,
+            "activation_peer_lost",
+            str(exc),
+            deployment_id=deployment.deployment_id if deployment else None,
+        )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ModelBusyError as exc:
+        await asyncio.to_thread(
+            _record_cluster_incident,
+            Severity.ERROR,
+            "activation_model_busy",
+            "This model is serving a request and cannot change cluster "
+            "topology until that request finishes.",
+            deployment_id=deployment.deployment_id if deployment else None,
+        )
         raise HTTPException(
             status_code=409,
             detail=(
@@ -3186,10 +3340,31 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
             ),
         ) from exc
     except DistributedLaunchError as exc:
+        await asyncio.to_thread(
+            _record_cluster_incident,
+            Severity.ERROR,
+            "activation_launch_failed",
+            str(exc),
+            deployment_id=deployment.deployment_id if deployment else None,
+        )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ModelNotFoundError as exc:
+        await asyncio.to_thread(
+            _record_cluster_incident,
+            Severity.ERROR,
+            "activation_model_not_found",
+            str(exc),
+            deployment_id=deployment.deployment_id if deployment else None,
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (OSError, PlanningError, ValueError) as exc:
+        await asyncio.to_thread(
+            _record_cluster_incident,
+            Severity.ERROR,
+            "activation_rejected",
+            str(exc),
+            deployment_id=deployment.deployment_id if deployment else None,
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "ok": True,

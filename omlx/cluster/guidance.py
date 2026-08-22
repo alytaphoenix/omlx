@@ -20,8 +20,10 @@ class Guidance:
     """A readable failure with steps that resolve it.
 
     ``code`` is the stable machine key: readiness-ladder states and structured
-    diagnostics look guidance up by code (``explain_code``) so message-regex
-    and state-code paths converge on the same copy objects.
+    diagnostics (the incident feed) look guidance up by code (``explain_code``)
+    and record it next to the redacted message, so message-regex and
+    state-code paths converge on the same copy objects, and different failure
+    funnels that map to the same guidance stay groupable.
     """
 
     title: str
