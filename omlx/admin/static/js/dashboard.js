@@ -30,12 +30,20 @@
         'turboquant_skip_last',
         'qwen35_ane_prefill_enabled',
         'qwen35_ane_prefill_sequence_length',
+        'qwen35_ane_prefill_tail_padding_min_tokens',
         'qwen35_ane_prefill_fraction',
+        'qwen35_ane_prefill_fused_down',
         'qwen35_ane_prefill_max_layers',
         'qwen35_ane_prefill_dual_ane',
         'qwen35_ane_prefill_gdn',
         'qwen35_ane_prefill_gdn_fraction',
         'qwen35_ane_prefill_gdn_max_layers',
+        'qwen35_ane_prefill_cpu_enabled',
+        'qwen35_ane_prefill_cpu_fraction',
+        'qwen35_ane_prefill_cpu_down_fraction',
+        'qwen35_ane_prefill_cpu_gdn_fraction',
+        'qwen35_ane_prefill_cpu_threads',
+        'qwen35_ane_prefill_cpu_shared_resource',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -54,6 +62,7 @@
         'dflash_ssd_cache_max_bytes',
         'dflash_draft_window_size',
         'dflash_draft_sink_size',
+        'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
         'vlm_mtp_enabled',
@@ -216,12 +225,20 @@
                 is_diffusion_model: false,
                 qwen35_ane_prefill_enabled: false,
                 qwen35_ane_prefill_sequence_length: 2048,
+                qwen35_ane_prefill_tail_padding_min_tokens: 0,
                 qwen35_ane_prefill_fraction: 0.53,
+                qwen35_ane_prefill_fused_down: false,
                 qwen35_ane_prefill_max_layers: 64,
                 qwen35_ane_prefill_dual_ane: true,
                 qwen35_ane_prefill_gdn: true,
                 qwen35_ane_prefill_gdn_fraction: 0.5,
                 qwen35_ane_prefill_gdn_max_layers: 48,
+                qwen35_ane_prefill_cpu_enabled: false,
+                qwen35_ane_prefill_cpu_fraction: 0.135,
+                qwen35_ane_prefill_cpu_down_fraction: 0,
+                qwen35_ane_prefill_cpu_gdn_fraction: 0,
+                qwen35_ane_prefill_cpu_threads: 8,
+                qwen35_ane_prefill_cpu_shared_resource: true,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
@@ -238,6 +255,14 @@
                 total: 0,
                 status: null,
                 error: '',
+            },
+            aneTuningOverrides: {
+                allowCpu: true,
+                allowCpuGate: true,
+                allowCpuDown: true,
+                allowAneGdn: true,
+                allowCpuGdn: true,
+                allowCpuSharedResource: true,
             },
             _aneTuningPollTimer: null,
 
@@ -349,6 +374,7 @@
             clusterIncidents: [],
             _clusterIncidentSeq: 0,
             _clusterIncidentsById: null,
+            _clusterIncidentEpoch: '',
             // Fabric Doctor (C3): one run at a time; the report renders as
             // minimal check · state · evidence · fix rows until B4's panel.
             clusterDoctor: null,
@@ -694,6 +720,7 @@
             // Benchmark state
             benchModelId: '',
             benchContextProfile: 'code_python',
+            benchAlignPromptToAne: false,
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
             benchBatchSizes: { 2: true, 4: true, 8: false },
             benchForceLmEngine: false,
@@ -798,6 +825,10 @@
             accExternalEnabled: false,
             // Provider-specific JSON is intentionally session-only.
             accExternalExtraBody: '',
+            // Accuracy-only max_tokens floor; persisted like the shared
+            // endpoint settings because it is a simple number the user sets
+            // once per endpoint (thinking models need a larger budget).
+            accExternalMaxTokens: localStorage.getItem('omlx_acc_external_max_tokens') || '',
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -1275,7 +1306,7 @@
                             controller_ip: controllerIp,
                             controller_port: port,
                             scheme: secure ? 'https' : 'http',
-                            ttl_seconds: 600,
+                            ttl_seconds: 1800,
                         }),
                     });
                     if (response.status === 401) {
@@ -1534,6 +1565,17 @@
                     }
                     if (!response.ok) return;
                     const payload = await response.json();
+                    // The epoch names the seq numbering. A corrupt-log reset
+                    // restarts seq at 1 under a new epoch; keeping the old
+                    // cursor there would silence the feed for this tab
+                    // forever, so restart the merge from scratch.
+                    if (payload.epoch && payload.epoch !== this._clusterIncidentEpoch) {
+                        if (this._clusterIncidentEpoch) {
+                            this._clusterIncidentSeq = 0;
+                            this._clusterIncidentsById = null;
+                        }
+                        this._clusterIncidentEpoch = payload.epoch;
+                    }
                     const incidents = Array.isArray(payload.incidents) ? payload.incidents : [];
                     if (!this._clusterIncidentsById) this._clusterIncidentsById = new Map();
                     for (const incident of incidents) {
@@ -1961,7 +2003,9 @@
                 if (this.clusterAutoconfigureLoading
                     || this.clusterActivationLoading
                     || this.clusterLinkSetupLoading) {
-                    return;
+                    // Report the skip so callers holding a pending-sync flag
+                    // keep it armed for the next tick instead of dropping it.
+                    return false;
                 }
                 this.clusterModelInventory = null;
                 this.clusterCatalogue = null;
@@ -2124,6 +2168,7 @@
                 if (nodesChanged) {
                     this.invalidateClusterPlan();
                 }
+                return true;
             },
 
             // Turn every unambiguous fast-link discovery into the default
@@ -2137,8 +2182,13 @@
                     && this.clusterStatus
                     && this.clusterWorkerPeers().length
                 ) {
-                    this.syncClusterNodesFromPeers();
-                    this._clusterKnownNodesNeedsSync = false;
+                    // Clear the flag only when the sync actually ran: it
+                    // skips itself during activation loads, and dropping the
+                    // flag on a skipped run lost the joining node until the
+                    // next join event re-armed it.
+                    if (this.syncClusterNodesFromPeers() === true) {
+                        this._clusterKnownNodesNeedsSync = false;
+                    }
                 }
                 if (!this.clusterWorkerPeers().length) {
                     const deployedPeers = (deployment?.hosts || []).filter(
@@ -2345,15 +2395,30 @@
 
             async generateClusterSshKey() {
                 if (this.clusterSshKeyGenerating) return;
+                const overwrite = Boolean(this.clusterSshKey?.available);
+                if (overwrite && !window.confirm(
+                    'Regenerating this key disconnects every paired worker. '
+                    + 'You will need to exchange keys again on every Mac. Continue?'
+                )) return;
                 this.clusterSshKeyGenerating = true;
                 try {
-                    const response = await fetch('/admin/api/cluster/ssh-key/generate', {
+                    const endpoint = '/admin/api/cluster/ssh-key/generate'
+                        + (overwrite ? '?overwrite=true' : '');
+                    const response = await fetch(endpoint, {
                         method: 'POST',
                     });
                     if (response.ok) {
                         this.clusterSshKey = await response.json();
-                        // Show success notification
-                        this.showNotification('SSH key generated successfully', 'success');
+                        this.clusterExchangeToken = null;
+                        this.clusterPeerExchangeToken = '';
+                        this.clusterKeyExchangeResult = null;
+                        if (overwrite) this.invalidateClusterPeer(true);
+                        this.showNotification(
+                            overwrite
+                                ? 'SSH key regenerated. Pair every worker again before reconnecting.'
+                                : 'SSH key generated successfully',
+                            'success'
+                        );
                     } else {
                         const error = await response.json();
                         this.showNotification('SSH key generation failed: ' + (error.detail || 'Unknown error'), 'error');
@@ -3645,7 +3710,14 @@
                 const nodes = Math.max(1, this.clusterPlanNodes.length);
                 const fitted = Number(fit?.tensor_parallel_size || 1);
                 if (Number(fit?.nodes_required || 1) >= nodes) return fitted;
-                if (fit?.supports_pipeline === false) return nodes;
+                // Force full tensor only when the architecture actually
+                // supports it — both flags can be false (unsplittable), and
+                // tp=nodes there turns the accurate "cannot combine Macs"
+                // refusal into a confusing heads-divisibility error.
+                if (
+                    fit?.supports_pipeline === false
+                    && fit?.supports_tensor_parallel === true
+                ) return nodes;
                 // Pipeline is possible too: keep whatever is selected.
                 return Number(this.clusterPlanTensorParallelSize) || 1;
             },
@@ -4340,10 +4412,35 @@
                 const candidates = this.clusterLogicalNodes().filter(node => (
                     node.memberCount === 2
                     && node.accelerator === 'cuda'
-                    && !node.fabricVerified
                 ));
                 for (const node of candidates) {
                     if (!await this.verifyCudaSupernode(node)) return false;
+                }
+                return true;
+            },
+
+            async prepareCudaSupernodesForActivation({ rebuildPlan = false } = {}) {
+                const planRevision = Number(this._clusterPlanRevision || 0);
+                if (
+                    typeof this.ensureCudaSupernodesVerified === 'function'
+                    && !await this.ensureCudaSupernodesVerified()
+                ) {
+                    const message = this.clusterCudaFabricVerificationError
+                        || 'Verify the CUDA direct link before starting the cluster.';
+                    if (rebuildPlan) this.clusterPlanError = message;
+                    else this.clusterAutoconfigureError = message;
+                    return false;
+                }
+                if (
+                    rebuildPlan
+                    && Number(this._clusterPlanRevision || 0) !== planRevision
+                ) {
+                    await this.runClusterPlan();
+                    if (!this.clusterActivationReady()) {
+                        this.clusterPlanError = this.clusterPlanError
+                            || 'Rebuild the plan after verifying the CUDA direct link.';
+                        return false;
+                    }
                 }
                 return true;
             },
@@ -6625,6 +6722,9 @@
 
             async activateClusterDeployment() {
                 if (!this.clusterActivationReady()) return;
+                if (!await this.prepareCudaSupernodesForActivation({
+                    rebuildPlan: true,
+                })) return;
                 this.clusterActivationLoading = true;
                 this.clusterActivationResult = null;
                 this.clusterPlanChanges = null;
@@ -7565,7 +7665,9 @@
                 if (DFLASH_DRAFTER_CONFIG_MODEL_TYPES.has(configType)) {
                     return true;
                 }
-                return /(^|[-_/\s])dflash($|[-_/\s])/i.test(this.draftModelSearchText(model));
+                // DFlash 2 checkpoints are versioned ("-DFlash2"), so allow an
+                // optional numeric suffix after the "dflash" token.
+                return /(^|[-_/\s])dflash[0-9]*($|[-_/\s])/i.test(this.draftModelSearchText(model));
             },
 
             isVlmMtpDraftModel(model) {
@@ -7706,12 +7808,20 @@
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
+                    qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
                     qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53,
+                    qwen35_ane_prefill_fused_down: s.qwen35_ane_prefill_fused_down || false,
                     qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64,
                     qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false,
                     qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false,
                     qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5,
                     qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48,
+                    qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false,
+                    qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135,
+                    qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0,
+                    qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0,
+                    qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8,
+                    qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false,
                     specprefill_enabled: s.specprefill_enabled || false,
                     specprefill_draft_model: s.specprefill_draft_model || '',
                     specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
@@ -7733,7 +7843,8 @@
                         ? Math.round(s.dflash_ssd_cache_max_bytes / (1024 ** 3))
                         : 20,
                     dflash_draft_window_size: s.dflash_draft_window_size ?? null,
-                    dflash_draft_sink_size: s.dflash_draft_sink_size ?? null,
+                    dflash_draft_sink_size: s.dflash_draft_sink_size ?? 0,
+                    dflash_block_size: s.dflash_block_size ?? null,
                     dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
@@ -8140,7 +8251,7 @@
                     return `GPU only · ${speed} prompt tok/s · ${speedupText}`;
                 }
                 const parts = [
-                    `MLP ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
+                    `${recommendation.fused_down ? 'Fused MLP per ANE' : 'MLP'} ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
                 ];
                 if (recommendation.gdn_enabled) {
                     parts.push(
@@ -8149,7 +8260,39 @@
                 } else {
                     parts.push('GDN off');
                 }
+                if (recommendation.cpu_enabled) {
+                    parts.push(
+                        `CPU gate ${Math.round(Number(recommendation.cpu_fraction || 0) * 100)}%`,
+                        `CPU down ${Math.round(Number(recommendation.cpu_down_fraction || 0) * 100)}%`,
+                        `CPU GDN ${Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100)}%`,
+                    );
+                }
+                if (Number(recommendation.tail_padding_min_tokens || 0) > 0) {
+                    parts.push(
+                        `Pad tails ≥${Number(recommendation.tail_padding_min_tokens)}`
+                    );
+                }
                 return `${parts.join(' · ')} · ${speed} prompt tok/s · ${speedupText}`;
+            },
+
+            aneTuningResultText(result) {
+                if (result?.processing_tps === null
+                    || result?.processing_tps === undefined) {
+                    if (result?.latency_ms !== null
+                        && result?.latency_ms !== undefined) {
+                        return `${Number(result.latency_ms).toFixed(2)} ms`;
+                    }
+                    // Keep unfinished rows visible but leave their result cell
+                    // blank, including the candidate that stopped the run.
+                    return '';
+                }
+                const speed = Number(result.processing_tps).toFixed(1);
+                if (result.speedup_percent === null
+                    || result.speedup_percent === undefined) {
+                    return speed;
+                }
+                const speedup = Number(result.speedup_percent);
+                return `${speed} (${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%)`;
             },
 
             _scheduleANETuningPoll() {
@@ -8191,6 +8334,17 @@
                                 this.modelSettings.qwen35_ane_prefill_sequence_length
                             ) || 2048,
                             repeats: 2,
+                            allow_cpu: this.aneTuningOverrides.allowCpu,
+                            allow_cpu_gate: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuGate,
+                            allow_cpu_down: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuDown,
+                            allow_ane_gdn: this.aneTuningOverrides.allowAneGdn,
+                            allow_cpu_gdn: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowAneGdn
+                                && this.aneTuningOverrides.allowCpuGdn,
+                            allow_cpu_shared_resource: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuSharedResource,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -8226,13 +8380,16 @@
                         throw new Error(data.detail || 'Failed to read ANE tuning progress.');
                     }
                     if (this.aneTuning.tuningId !== tuningId) return;
+                    if (!data.termination_reason && data.status === 'error') {
+                        data.termination_reason = data.error || data.message || 'ANE tuning failed.';
+                    }
                     this.aneTuning.status = data;
                     this.aneTuning.total = Number(data.total || this.aneTuning.total || 0);
                     this.aneTuning.running = data.status === 'running';
                     this.aneTuning.cancelling = false;
-                    if (data.status === 'error') {
-                        this.aneTuning.error = data.error || data.message || 'ANE tuning failed.';
-                    } else if (data.status === 'cancelled') {
+                    if (data.status === 'error' || data.status === 'cancelled') {
+                        // Early termination belongs beside the partial result
+                        // matrix. Keep this field for request/transport errors.
                         this.aneTuning.error = '';
                     }
                     this._scheduleANETuningPoll();
@@ -8274,15 +8431,39 @@
                 const patch = {
                     qwen35_ane_prefill_enabled: !!recommendation.enabled,
                     qwen35_ane_prefill_sequence_length: Number(recommendation.sequence_length),
+                    qwen35_ane_prefill_tail_padding_min_tokens: Number(
+                        recommendation.tail_padding_min_tokens || 0
+                    ),
                 };
                 if (recommendation.enabled) {
                     patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
-                    patch.qwen35_ane_prefill_dual_ane = true;
+                    patch.qwen35_ane_prefill_fused_down = !!recommendation.fused_down;
                     patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
                     if (recommendation.gdn_enabled) {
                         patch.qwen35_ane_prefill_gdn_fraction = Number(
                             recommendation.gdn_fraction
                         );
+                    }
+                    patch.qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
+                    patch.qwen35_ane_prefill_cpu_fraction = Number(
+                        recommendation.cpu_fraction || 0
+                    );
+                    patch.qwen35_ane_prefill_cpu_down_fraction = Number(
+                        recommendation.cpu_down_fraction || 0
+                    );
+                    patch.qwen35_ane_prefill_cpu_gdn_fraction = Number(
+                        recommendation.cpu_gdn_fraction || 0
+                    );
+                    if (recommendation.cpu_threads !== null
+                        && recommendation.cpu_threads !== undefined) {
+                        patch.qwen35_ane_prefill_cpu_threads = Number(
+                            recommendation.cpu_threads
+                        );
+                    }
+                    if (recommendation.cpu_shared_resource !== null
+                        && recommendation.cpu_shared_resource !== undefined) {
+                        patch.qwen35_ane_prefill_cpu_shared_resource =
+                            !!recommendation.cpu_shared_resource;
                     }
                 }
 
@@ -8390,8 +8571,90 @@
                 }
             },
 
+            validateQwenAneSettings() {
+                if (!this.modelSettings.qwen35_ane_prefill_enabled) return null;
+
+                const integer = (value, label, minimum) => {
+                    if (value === '' || value === null || value === undefined) {
+                        return `${label} is required.`;
+                    }
+                    const number = Number(value);
+                    if (!Number.isInteger(number)) return `${label} must be an integer.`;
+                    if (number < minimum) return `${label} must be at least ${minimum}.`;
+                    return null;
+                };
+                const fraction = (value, label, minimum, maximum) => {
+                    if (value === '' || value === null || value === undefined) {
+                        return `${label} is required.`;
+                    }
+                    const number = Number(value);
+                    if (!Number.isFinite(number)) return `${label} must be a number.`;
+                    if (number < minimum || number > maximum) {
+                        return `${label} must be between ${minimum} and ${maximum}.`;
+                    }
+                    return null;
+                };
+
+                const sequenceLength = Number(this.modelSettings.qwen35_ane_prefill_sequence_length);
+                let error = integer(sequenceLength, 'ANE prompt block', 1024);
+                if (!error && sequenceLength % 64 !== 0) {
+                    error = 'ANE prompt block must be a multiple of 64.';
+                }
+                if (error) return error;
+                error = integer(
+                    this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens,
+                    'ANE tail padding threshold',
+                    0,
+                );
+                if (error) return error;
+                if (Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens) >= sequenceLength) {
+                    return 'ANE tail padding threshold must be less than the prompt block.';
+                }
+                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, 'MLP ANE fraction', 0.05, 0.90);
+                if (error) return error;
+                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, 'ANE MLP layer limit', 1);
+                if (error) return error;
+
+                if (this.modelSettings.qwen35_ane_prefill_cpu_enabled) {
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, 'CPU MLP fraction', 0, 0.25);
+                    if (error) return error;
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, 'CPU MLP down fraction', 0, 0.50);
+                    if (error) return error;
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, 'CPU GDN fraction', 0, 0.50);
+                    if (error) return error;
+                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, 'CPU worker count', 0);
+                    if (error) return error;
+                    if (Number(this.modelSettings.qwen35_ane_prefill_cpu_threads) > 64) {
+                        return 'CPU worker count must be between 0 and 64.';
+                    }
+                    if (Number(this.modelSettings.qwen35_ane_prefill_fraction)
+                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction) >= 1) {
+                        return 'MLP ANE and CPU fractions must total less than 1.0.';
+                    }
+                }
+
+                if (this.modelSettings.qwen35_ane_prefill_gdn) {
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, 'GDN ANE fraction', 0.05, 0.90);
+                    if (error) return error;
+                    if (this.modelSettings.qwen35_ane_prefill_cpu_enabled
+                        && Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction)
+                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction) >= 1) {
+                        return 'GDN ANE and CPU fractions must total less than 1.0.';
+                    }
+                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, 'ANE GDN layer limit', 0);
+                    if (error) return error;
+                }
+                return null;
+            },
+
             async saveModelSettings() {
                 if (!this.selectedModel) return;
+
+                const qwenAneValidationError = this.validateQwenAneSettings();
+                if (qwenAneValidationError) {
+                    alert(qwenAneValidationError);
+                    return;
+                }
 
                 this.savingModelSettings = true;
                 try {
@@ -8466,15 +8729,33 @@
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
-                                qwen35_ane_prefill_sequence_length: parseInt(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
-                                qwen35_ane_prefill_fraction: parseFloat(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
-                                qwen35_ane_prefill_max_layers: parseInt(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
+                                // Validation only runs when the feature is enabled, so a
+                                // blank numeric input must fall back to the server default
+                                // instead of coercing to 0 and failing an unrelated save.
+                                qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
+                                qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens)
+                                    : 0,
+                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
+                                qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
                                 qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
                                 qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
-                                qwen35_ane_prefill_gdn_fraction: parseFloat(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
+                                qwen35_ane_prefill_gdn_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
                                 qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
                                     : 48,
+                                qwen35_ane_prefill_cpu_enabled: !!this.modelSettings.qwen35_ane_prefill_cpu_enabled,
+                                qwen35_ane_prefill_cpu_fraction: Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction),
+                                qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction)
+                                    : 0,
+                                qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction)
+                                    : 0,
+                                qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_threads))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_threads)
+                                    : 8,
+                                qwen35_ane_prefill_cpu_shared_resource: !!this.modelSettings.qwen35_ane_prefill_cpu_shared_resource,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled
@@ -8514,7 +8795,7 @@
                                 dflash_ssd_cache_max_bytes: this.modelSettings.dflash_enabled
                                     ? Math.max(1, parseInt(this.modelSettings.dflash_ssd_cache_max_gib) || 20) * (1024 ** 3)
                                     : 20 * (1024 ** 3),
-                                // Long-context tuning. Null → server keeps it null → dflash-mlx default.
+                                // Long-context tuning. Empty → oMLX default.
                                 dflash_draft_window_size: this.modelSettings.dflash_enabled
                                     && this.modelSettings.dflash_draft_window_size
                                     ? parseInt(this.modelSettings.dflash_draft_window_size)
@@ -8524,6 +8805,10 @@
                                     && this.modelSettings.dflash_draft_sink_size !== undefined
                                     && this.modelSettings.dflash_draft_sink_size !== ''
                                     ? parseInt(this.modelSettings.dflash_draft_sink_size)
+                                    : 0,
+                                dflash_block_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_block_size
+                                    ? parseInt(this.modelSettings.dflash_block_size)
                                     : null,
                                 dflash_verify_mode: this.modelSettings.dflash_enabled
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
@@ -8559,12 +8844,19 @@
                                     turboquant_kv_bits: 4,
                                     qwen35_ane_prefill_enabled: false,
                                     qwen35_ane_prefill_sequence_length: 2048,
+                                    qwen35_ane_prefill_tail_padding_min_tokens: 0,
                                     qwen35_ane_prefill_fraction: 0.53,
                                     qwen35_ane_prefill_max_layers: 64,
                                     qwen35_ane_prefill_dual_ane: true,
                                     qwen35_ane_prefill_gdn: true,
                                     qwen35_ane_prefill_gdn_fraction: 0.5,
                                     qwen35_ane_prefill_gdn_max_layers: 48,
+                                    qwen35_ane_prefill_cpu_enabled: false,
+                                    qwen35_ane_prefill_cpu_fraction: 0.135,
+                                    qwen35_ane_prefill_cpu_down_fraction: 0,
+                                    qwen35_ane_prefill_cpu_gdn_fraction: 0,
+                                    qwen35_ane_prefill_cpu_threads: 8,
+                                    qwen35_ane_prefill_cpu_shared_resource: true,
                                     specprefill_enabled: false,
                                     specprefill_draft_model: null,
                                     specprefill_keep_pct: null,
@@ -8583,6 +8875,7 @@
                                     dflash_ssd_cache_max_bytes: 20 * (1024 ** 3),
                                     dflash_draft_window_size: null,
                                     dflash_draft_sink_size: null,
+                                    dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
                                     vlm_mtp_enabled: false,
@@ -8655,12 +8948,19 @@
                         this.modelSettings.turboquant_kv_bits = 4;
                         this.modelSettings.qwen35_ane_prefill_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
+                        this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens = 0;
                         this.modelSettings.qwen35_ane_prefill_fraction = 0.53;
                         this.modelSettings.qwen35_ane_prefill_max_layers = 64;
                         this.modelSettings.qwen35_ane_prefill_dual_ane = true;
                         this.modelSettings.qwen35_ane_prefill_gdn = true;
                         this.modelSettings.qwen35_ane_prefill_gdn_fraction = 0.5;
                         this.modelSettings.qwen35_ane_prefill_gdn_max_layers = 48;
+                        this.modelSettings.qwen35_ane_prefill_cpu_enabled = false;
+                        this.modelSettings.qwen35_ane_prefill_cpu_fraction = 0.135;
+                        this.modelSettings.qwen35_ane_prefill_cpu_down_fraction = 0;
+                        this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction = 0;
+                        this.modelSettings.qwen35_ane_prefill_cpu_threads = 8;
+                        this.modelSettings.qwen35_ane_prefill_cpu_shared_resource = true;
                         this.modelSettings.specprefill_enabled = false;
                         this.modelSettings.specprefill_draft_model = null;
                         this.modelSettings.specprefill_keep_pct = 0.2;
@@ -8678,7 +8978,8 @@
                         this.modelSettings.dflash_ssd_cache = false;
                         this.modelSettings.dflash_ssd_cache_max_gib = 20;
                         this.modelSettings.dflash_draft_window_size = null;
-                        this.modelSettings.dflash_draft_sink_size = null;
+                        this.modelSettings.dflash_draft_sink_size = 0;
+                        this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;
@@ -9442,10 +9743,28 @@
                 return value;
             },
 
+            saveAccExternalMaxTokens() {
+                localStorage.setItem('omlx_acc_external_max_tokens', this.accExternalMaxTokens.trim());
+            },
+
+            // Optional accuracy-only floor for per-question max_tokens.
+            // Returns null when unset; throws on invalid input.
+            parseAccuracyMaxTokens() {
+                const raw = this.accExternalMaxTokens.trim();
+                if (!raw) return null;
+                const value = Number(raw);
+                if (!Number.isInteger(value) || value < 1 || value > 1000000) {
+                    throw new Error(window.t('js.error.external_max_tokens_invalid'));
+                }
+                return value;
+            },
+
             accuracyExternalRequestBody() {
                 const body = this.externalRequestBody();
                 const extraBody = this.parseAccuracyExtraBody();
                 if (Object.keys(extraBody).length > 0) body.extra_body = extraBody;
+                const maxTokens = this.parseAccuracyMaxTokens();
+                if (maxTokens !== null) body.max_tokens_override = maxTokens;
                 return body;
             },
 
@@ -9503,6 +9822,7 @@
                         body: JSON.stringify({
                             model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
                             context_profile: this.benchContextProfile,
+                            align_prompt_to_ane: this.benchAlignPromptToAne,
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
