@@ -348,8 +348,8 @@
                                                         ? 'text-neutral-900 border-neutral-900'
                                                         : 'text-neutral-500 border-neutral-200 hover:text-neutral-900 hover:border-neutral-400'"
                                                     class="mt-2 px-2.5 py-1 border rounded-lg text-xs font-medium transition-all"
-                                                    :title="'{{ t('modal.model_settings.auto_context_hint') }}'"
-                                                    x-text="'{{ t('modal.model_settings.auto_context') }} · ' + clusterTokens(modelSettingsAutoContext?.max_context_tokens) + ' {{ t('modal.model_settings.auto_context_tokens') }}'"></button>
+                                                    :title="'{{ t('modal.model_settings.auto_context_hint')|replace('\\', '\\\\')|replace("'", "\\'") }}'"
+                                                    x-text="'{{ t('modal.model_settings.auto_context')|replace('\\', '\\\\')|replace("'", "\\'") }} · ' + clusterTokens(modelSettingsAutoContext?.max_context_tokens) + ' {{ t('modal.model_settings.auto_context_tokens')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></button>
                                         </div>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_tokens') }}</label>
