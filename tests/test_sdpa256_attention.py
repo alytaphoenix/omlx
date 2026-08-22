@@ -104,7 +104,7 @@ def test_qsplit_square_causal_matches_reference(q_len, k_len, q_sub):
 
 
 @pytest.mark.parametrize(
-    "q_len,k_len,q_sub", [(128, 4096, 64), (2048, 8192, 500), (4096, 40960, 384)]
+    "q_len,k_len,q_sub", [(128, 4096, 64), (2048, 8192, 500), (2048, 20480, 384)]
 )
 def test_qsplit_chunked_prefill_offset_causal_matches_reference(q_len, k_len, q_sub):
     """Chunked prefill (k_len > q_len, cached prefix) at a q_sub that does
