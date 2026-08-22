@@ -21,7 +21,9 @@ class Guidance:
 
     ``code`` is the stable machine key: readiness-ladder states and structured
     diagnostics look guidance up by code (``explain_code``) so message-regex
-    and state-code paths converge on the same copy objects.
+    and state-code paths converge on the same copy objects, and structured
+    diagnostics (the incident feed) record it next to the redacted message so
+    different failure funnels that map to the same guidance stay groupable.
     """
 
     title: str

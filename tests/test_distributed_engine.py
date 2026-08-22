@@ -251,6 +251,15 @@ def test_completion_payload_folds_thinking_budget_into_chat_template_kwargs():
     assert payload["chat_template_kwargs"] == {"thinking_budget": 512}
 
 
+def test_model_thinking_budget_is_supported_by_distributed_engine():
+    engine = DistributedBatchedEngine(
+        _deployment(),
+        model_settings=SimpleNamespace(thinking_budget_enabled=True),
+    )
+
+    engine._validate_model_settings()
+
+
 @pytest.mark.asyncio
 async def test_distributed_generate_translates_backend_completion():
     def handler(request):
@@ -842,6 +851,48 @@ async def test_distributed_chat_retries_unsupported_reasoning_effort():
 
 
 @pytest.mark.asyncio
+async def test_distributed_chat_tries_the_normalized_value_first():
+    # Local engines normalize before the first render, so "High" succeeds
+    # locally; the cluster path must land on the same value, not jump
+    # straight to the alias tier.
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        effort = body.get("chat_template_kwargs", {}).get("reasoning_effort")
+        calls.append(effort)
+        if effort == "high":
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                },
+            )
+        return httpx.Response(
+            404,
+            json={"error": "Unexpected reasoning effort High."},
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.chat(
+            [{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"reasoning_effort": "High"},
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert calls == ["High", "high"]
+    assert output.text == "ok"
+
+
+@pytest.mark.asyncio
 async def test_distributed_generate_retries_unsupported_reasoning_effort():
     calls = []
 
@@ -919,28 +970,29 @@ async def test_distributed_stream_chat_retries_unsupported_reasoning_effort():
 
 @pytest.mark.asyncio
 async def test_distributed_stream_generate_bounds_retries_and_gives_up():
-    # Every attempt is rejected: must try at most 1 (original) + 2 (fallback
-    # tiers) = 3 times, then raise -- never an unbounded loop.
+    # Every attempt is rejected. "High" walks the full ladder — original,
+    # normalized ("high"), alias ("xhigh"), dropped — exactly 4 requests,
+    # then raise; never an unbounded loop.
     calls = []
 
     def handler(request):
         calls.append(1)
         return httpx.Response(
             404,
-            json={"error": "Unexpected reasoning effort weird."},
+            json={"error": "Unexpected reasoning effort High."},
         )
 
     engine = _ready_engine(handler)
     try:
         with pytest.raises(DistributedInferenceError, match="HTTP 404"):
             async for _ in engine.stream_generate(
-                "hi", chat_template_kwargs={"reasoning_effort": "weird"}
+                "hi", chat_template_kwargs={"reasoning_effort": "High"}
             ):
                 pass
     finally:
         await engine._client.aclose()
 
-    assert len(calls) <= 3
+    assert len(calls) == 4
 
 
 @pytest.mark.asyncio
@@ -959,3 +1011,92 @@ async def test_distributed_chat_does_not_retry_unrelated_404():
         await engine._client.aclose()
 
     assert len(calls) == 1
+
+
+def _healthy_supervisor_status():
+    return SimpleNamespace(returncode=None, failure_reason=None)
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_an_unhealthy_rank_before_streaming(monkeypatch):
+    # The 200 commits before a streaming body runs, so preflight is the last
+    # point a half-dead cluster can still become a clean HTTP error (#2708).
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    monkeypatch.setattr(
+        distributed,
+        "check_peers",
+        lambda hosts, **kwargs: (
+            SimpleNamespace(healthy=True),
+            SimpleNamespace(healthy=False),
+        ),
+    )
+    monkeypatch.setattr(
+        distributed,
+        "describe_failure",
+        lambda health: "rank 1 (peer) stopped heartbeating",
+    )
+    try:
+        with pytest.raises(DistributedInferenceError, match="not serving"):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_preflight_caches_the_peer_health_read(monkeypatch):
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    calls = []
+
+    def fake_check_peers(hosts, **kwargs):
+        calls.append(hosts)
+        return (SimpleNamespace(healthy=True),)
+
+    monkeypatch.setattr(distributed, "check_peers", fake_check_peers)
+    try:
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        await engine.preflight_completion("hi")
+        assert len(calls) == 1  # second preflight served from the TTL cache
+        assert calls[0] == {0: ("local", "127.0.0.1"), 1: ("peer", "peer.local")}
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_a_reported_failure_without_probing(monkeypatch):
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(
+        engine._supervisor,
+        "status",
+        lambda: SimpleNamespace(
+            returncode=None, failure_reason="rank 1 connection closed"
+        ),
+    )
+    probed = []
+    monkeypatch.setattr(
+        distributed, "check_peers", lambda *a, **k: probed.append(1) or ()
+    )
+    try:
+        with pytest.raises(DistributedInferenceError, match="rank 1 connection"):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        assert probed == []
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_preflight_fails_open_when_the_probe_itself_breaks(monkeypatch):
+    # A broken probe must not take down a serving cluster; the supervisor
+    # checks still catch hard failures.
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+
+    def broken_check_peers(hosts, **kwargs):
+        raise OSError("ssh binary missing")
+
+    monkeypatch.setattr(distributed, "check_peers", broken_check_peers)
+    try:
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+    finally:
+        await engine._client.aclose()
