@@ -94,6 +94,7 @@ from .runtime import read_runtime_markers
 from .staging import (
     DEFAULT_REMOTE_PYTHON,
     InsufficientDiskError,
+    home_relative_model_path,
     index_shards,
     model_staging_inventory,
     home_relative_model_path,
@@ -152,7 +153,7 @@ class ClusterJoinKeyRequest(BaseModel):
     controller_ip: str = Field(min_length=2, max_length=64)
     controller_port: int = Field(ge=1, le=65535)
     scheme: Literal["http", "https"] = "http"
-    ttl_seconds: int = Field(default=600, ge=30, le=600)
+    ttl_seconds: int = Field(default=1800, ge=30, le=1800)
 
 
 class ClusterWorkerClaimRequest(BaseModel):
@@ -1615,7 +1616,7 @@ def _run_staging_job(
             }
         else:
             shards, sidecar_sizes = remote_model_staging_inventory(
-                source_host, str(model_path)
+                source_host, home_relative_model_path(str(model_path))
             )
         shard_sizes = {item.name: item.size_bytes for item in shards}
         sidecars = tuple(sorted(sidecar_sizes))
@@ -1753,6 +1754,7 @@ def _run_staging_job(
             job["error"] = error
 
         _update_staging_job(job_id, fail)
+        # Already on the staging worker thread: a blocking record is fine.
         _record_cluster_incident(
             Severity.ERROR,
             "staging_failed",
@@ -1981,7 +1983,14 @@ async def cluster_incidents(since: int = Query(default=0, ge=0)):
     incidents = [incident.to_dict() for incident in store.list(since_seq=since)]
     for item in incidents:
         item["message"] = _redact_diagnostic(item["message"])
-    return {"incidents": incidents, "latest_seq": store.latest_seq()}
+    return {
+        "incidents": incidents,
+        "latest_seq": store.latest_seq(),
+        # Identity of the seq numbering. A corrupt-log reset restarts seq at
+        # 1 under a new epoch; a client holding an old cursor must detect the
+        # change and restart from 0 instead of going silent forever.
+        "epoch": store.epoch,
+    }
 
 
 @router.post("/incidents/{incident_id}/dismiss")
@@ -2241,20 +2250,27 @@ async def cluster_ssh_key():
 
 
 @router.post("/ssh-key/generate")
-async def cluster_generate_ssh_key():
-    """Generate a new SSH key pair for cluster authentication."""
+async def cluster_generate_ssh_key(
+    overwrite: bool = Query(default=False),
+):
+    """Create the managed SSH key, rotating it only when explicitly requested."""
 
     from .ssh_keys import generate_ssh_key_pair
 
     try:
-        key_pair = await asyncio.to_thread(generate_ssh_key_pair, overwrite=True)
+        key_pair = await asyncio.to_thread(
+            generate_ssh_key_pair,
+            overwrite=overwrite,
+        )
         return {
             "success": True,
+            "available": True,
             "key_type": key_pair.key_type,
             "fingerprint": key_pair.fingerprint,
             "public_key": key_pair.public_key,
             "private_key_path": str(key_pair.private_key_path),
             "public_key_path": str(key_pair.public_key_path),
+            "created_at": key_pair.created_at,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -2359,7 +2375,10 @@ async def cluster_peer_health(hosts: str = Query(...), deployment_id: str = ""):
             _PEER_HEALTH_LAST_HEALTHY[deployment_id] = healthy
         if was_healthy and not healthy:
             lost = next((item for item in health if not item.healthy), None)
-            _record_cluster_incident(
+            # to_thread: the store fsyncs while holding its lock, which must
+            # not stall the event loop mid-stream for every other request.
+            await asyncio.to_thread(
+                _record_cluster_incident,
                 Severity.ERROR,
                 "peer_unhealthy",
                 describe_failure(health),
@@ -3338,7 +3357,8 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
     except PeerLostError as exc:
         # 409: the cluster is not in a state to start. Launching into a peer
         # that is not answering yields a collective that blocks forever.
-        _record_cluster_incident(
+        await asyncio.to_thread(
+            _record_cluster_incident,
             Severity.ERROR,
             "activation_peer_lost",
             str(exc),
@@ -3346,7 +3366,8 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
         )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ModelBusyError as exc:
-        _record_cluster_incident(
+        await asyncio.to_thread(
+            _record_cluster_incident,
             Severity.ERROR,
             "activation_model_busy",
             "This model is serving a request and cannot change cluster "
@@ -3361,7 +3382,8 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
             ),
         ) from exc
     except DistributedLaunchError as exc:
-        _record_cluster_incident(
+        await asyncio.to_thread(
+            _record_cluster_incident,
             Severity.ERROR,
             "activation_launch_failed",
             str(exc),
@@ -3369,7 +3391,8 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
         )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ModelNotFoundError as exc:
-        _record_cluster_incident(
+        await asyncio.to_thread(
+            _record_cluster_incident,
             Severity.ERROR,
             "activation_model_not_found",
             str(exc),
@@ -3377,7 +3400,8 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (OSError, PlanningError, ValueError) as exc:
-        _record_cluster_incident(
+        await asyncio.to_thread(
+            _record_cluster_incident,
             Severity.ERROR,
             "activation_rejected",
             str(exc),
