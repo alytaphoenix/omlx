@@ -18,11 +18,18 @@ import httpx
 
 from ..cluster.deployment import ClusterDeployment
 from ..cluster.launch import DistributedJobSupervisor, DistributedLaunchError
+from ..cluster.liveness import check_peers, describe_failure
 from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
 
 logger = logging.getLogger(__name__)
+
+# How long one per-rank marker health read stays authoritative. Every request
+# preflights the cluster, so this bounds both the added latency (one SSH read
+# per peer, paid once per window) and how long a half-dead cluster can keep
+# answering 200s before requests start failing cleanly (#2708).
+_PEER_HEALTH_TTL = 10.0
 
 
 def _reasoning_effort_retry_payloads(
@@ -38,10 +45,11 @@ def _reasoning_effort_retry_payloads(
     this failed response — which value it rejected. This mirrors the same
     alias-then-drop fallback ladder reactively, at the HTTP boundary.
 
-    Returns at most two payloads (alias fallback, then reasoning_effort
-    dropped entirely), so a client that always sends an unsupported value can
-    never turn into an unbounded retry loop. Returns ``[]`` when the failure
-    is not about reasoning_effort, or there is nothing to retry.
+    Returns at most three payloads (normalized value, alias fallback, then
+    reasoning_effort dropped entirely), so a client that always sends an
+    unsupported value can never turn into an unbounded retry loop. Returns
+    ``[]`` when the failure is not about reasoning_effort, or there is
+    nothing to retry.
     """
 
     if "reasoning effort" not in detail.lower():
@@ -54,18 +62,38 @@ def _reasoning_effort_retry_payloads(
         return []
 
     variants: list[dict[str, Any]] = []
-    normalized = _normalized_input(value)
-    candidate = _fallback_candidate(normalized)
-    if candidate is not None and candidate != normalized:
+
+    def _variant(effort: Any) -> dict[str, Any]:
         retry = dict(payload)
         retry["chat_template_kwargs"] = {
             **chat_template_kwargs,
-            "reasoning_effort": candidate,
+            "reasoning_effort": effort,
         }
-        variants.append(retry)
+        return retry
+
+    # Local engines normalize ("High" -> "high") before their first render
+    # attempt (reasoning_effort.py), so the normalized tier must come first
+    # here too or the same request behaves differently on a cluster.
+    normalized = _normalized_input(value)
+    if normalized != value:
+        variants.append(_variant(normalized))
+    candidate = _fallback_candidate(normalized)
+    if candidate is not None and candidate != normalized:
+        variants.append(_variant(candidate))
+    logger.info(
+        "rank-zero rejected reasoning_effort=%r; retrying with %s, then "
+        "without it",
+        value,
+        [
+            var["chat_template_kwargs"]["reasoning_effort"]
+            for var in variants
+        ],
+    )
 
     dropped_kwargs = {
-        key: val for key, val in chat_template_kwargs.items() if key != "reasoning_effort"
+        key: val
+        for key, val in chat_template_kwargs.items()
+        if key != "reasoning_effort"
     }
     dropped = dict(payload)
     if dropped_kwargs:
@@ -138,6 +166,8 @@ class DistributedBatchedEngine(BatchedEngine):
         self._model_type: str | None = None
         self._active_requests = 0
         self._active_lock = asyncio.Lock()
+        self._peer_health: tuple[float, bool, str] | None = None
+        self._peer_health_lock = asyncio.Lock()
 
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -237,7 +267,6 @@ class DistributedBatchedEngine(BatchedEngine):
                 "mtp_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
-                "thinking_budget_enabled",
             )
             if bool(getattr(settings, name, False))
         ]
@@ -777,14 +806,17 @@ class DistributedBatchedEngine(BatchedEngine):
                                 raise DistributedInferenceError(
                                     "rank-zero backend emitted invalid chat usage"
                                 )
-                            prompt_tokens = int(usage.get("prompt_tokens", prompt_tokens))
+                            prompt_tokens = int(
+                                usage.get("prompt_tokens", prompt_tokens)
+                            )
                             completion_tokens = int(
                                 usage.get("completion_tokens", completion_tokens)
                             )
                             details = usage.get("prompt_tokens_details") or {}
                             if not isinstance(details, dict):
                                 raise DistributedInferenceError(
-                                    "rank-zero backend emitted invalid chat token details"
+                                    "rank-zero backend emitted invalid "
+                                    "chat token details"
                                 )
                             cached_tokens = int(details.get("cached_tokens", 0))
                         choices = event.get("choices") or []
@@ -831,10 +863,14 @@ class DistributedBatchedEngine(BatchedEngine):
                                 if isinstance(function.get("name"), str):
                                     target["function"]["name"] += function["name"]
                                 if isinstance(function.get("arguments"), str):
-                                    target["function"]["arguments"] += function["arguments"]
+                                    target["function"]["arguments"] += (
+                                        function["arguments"]
+                                    )
 
                         new_text = ""
-                        reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+                        reasoning = delta.get("reasoning") or delta.get(
+                            "reasoning_content"
+                        )
                         if isinstance(reasoning, str) and reasoning:
                             if not reasoning_open:
                                 new_text += "<think>"
@@ -1076,7 +1112,9 @@ class DistributedBatchedEngine(BatchedEngine):
                                 raise DistributedInferenceError(
                                     "rank-zero backend emitted invalid usage"
                                 )
-                            prompt_tokens = int(usage.get("prompt_tokens", prompt_tokens))
+                            prompt_tokens = int(
+                                usage.get("prompt_tokens", prompt_tokens)
+                            )
                             completion_tokens = int(
                                 usage.get("completion_tokens", completion_tokens)
                             )
@@ -1238,12 +1276,71 @@ class DistributedBatchedEngine(BatchedEngine):
             f"rank-zero backend returned HTTP {response.status_code}{suffix}"
         )
 
+    async def _require_healthy_cluster(self) -> None:
+        """Refuse a request the cluster cannot serve, before the 200 commits.
+
+        A streaming response commits its status line before the body
+        generator runs, so any failure detected later reaches the client as
+        an error frame inside a 200 — the empty-response class from #2708.
+        Preflight is the last point a clean HTTP error is still possible.
+        The supervisor read is free; the per-rank marker read costs one SSH
+        round trip per peer and is cached for ``_PEER_HEALTH_TTL`` seconds.
+        """
+
+        status = self._supervisor.status()
+        if status.returncode is not None:
+            raise DistributedInferenceError(
+                f"distributed job exited with code {status.returncode}"
+            )
+        if status.failure_reason:
+            raise DistributedInferenceError(
+                f"distributed cluster failure: {status.failure_reason}"
+            )
+        cached = self._peer_health
+        if cached is None or time.monotonic() - cached[0] >= _PEER_HEALTH_TTL:
+            async with self._peer_health_lock:
+                cached = self._peer_health
+                if cached is None or (
+                    time.monotonic() - cached[0] >= _PEER_HEALTH_TTL
+                ):
+                    hosts_by_rank = {
+                        rank: (host.node_id, host.ssh)
+                        for rank, host in enumerate(self.deployment.hosts)
+                    }
+                    try:
+                        health = await asyncio.to_thread(
+                            check_peers,
+                            hosts_by_rank,
+                            deployment_id=self.deployment.deployment_id,
+                            require_heartbeat=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - probe plumbing
+                        # A broken probe must not take down a serving
+                        # cluster; the supervisor checks above still catch
+                        # hard failures.
+                        logger.warning("peer health probe failed: %s", exc)
+                        cached = (time.monotonic(), True, "")
+                    else:
+                        healthy = all(item.healthy for item in health)
+                        cached = (
+                            time.monotonic(),
+                            healthy,
+                            "" if healthy else describe_failure(health),
+                        )
+                    self._peer_health = cached
+        if not cached[1]:
+            raise DistributedInferenceError(
+                f"cluster is not serving: {cached[2]}"
+            )
+
     async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)
+        await self._require_healthy_cluster()
         return None
 
     async def preflight_completion(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)
+        await self._require_healthy_cluster()
         return None
 
     def has_active_requests(self) -> bool:
