@@ -402,7 +402,7 @@ def _sdpa256_provider_reset(monkeypatch):
     monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER", None, raising=False)
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None, raising=False)
     monkeypatch.setattr(sdpa256, "_QSPLIT_ENABLED", True, raising=False)
-    monkeypatch.setattr(sdpa256, "_LAST_ROUTE_DECISION", None, raising=False)
+    monkeypatch.setattr(sdpa256, "_LAST_ROUTE_DECISION_NO_CACHE", None, raising=False)
     return sdpa256
 
 
@@ -670,6 +670,40 @@ def test_tiled_route_logs_headroom_numbers(_sdpa256_provider_reset, caplog):
     assert "exceeds" in msg
     assert "kv_len=16384" in msg
     assert "MiB" in msg
+
+
+def test_route_dedup_is_keyed_per_cache_not_module_global(
+    _sdpa256_provider_reset, caplog
+):
+    """E5: the model passes one cache per full-attention layer. A single
+    module-global last-decision meant interleaved calls from different
+    layers (or different concurrent requests) flapped the transition log on
+    every call instead of only on real transitions -- each cache's own
+    decision now dedups independently, keyed on that cache object.
+    See docs/qwen35-hardening-and-optimization.md E5."""
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    owner = _HeadroomOwner(1 << 40)  # unfused clearly fits
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+
+    class _FakeCache:
+        pass
+
+    layer_a = _FakeCache()
+    layer_b = _FakeCache()
+
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        # Interleaved calls from two different layers, same decision each
+        # time -- a module-global would see this as alternating (A, B, A,
+        # B, ...) and log every single call. Per-cache keying logs each
+        # cache's FIRST call only.
+        assert sdpa256._should_route(q, k, layer_a, "causal", None) == ("unfused", 0)
+        assert sdpa256._should_route(q, k, layer_b, "causal", None) == ("unfused", 0)
+        assert sdpa256._should_route(q, k, layer_a, "causal", None) == ("unfused", 0)
+        assert sdpa256._should_route(q, k, layer_b, "causal", None) == ("unfused", 0)
+
+    records = _route_log_records(caplog, "unfused")
+    assert len(records) == 2  # one per cache, not one per call
 
 
 def test_tiled_route_logs_forced_env(_sdpa256_provider_reset, caplog, monkeypatch):
