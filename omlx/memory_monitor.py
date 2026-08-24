@@ -222,6 +222,19 @@ class MemoryMonitor:
         # full-attention formula. Empty for non-hybrid models.
         self._rotating_layer_specs: tuple[tuple[int, int], ...] = ()
         self._prefill_memory_profile: PrefillMemoryProfile | None = None
+        # Per-instance tiled-prefill override for kernels whose tiled route
+        # is gated on THIS scheduler's own config (e.g. TurboQuant's
+        # quantized_attention, gated on turboquant_kv_bits), not on head_dim
+        # alone. Unlike _SDPA_TILED_PREFILL_HEAD_DIMS below (a module-level
+        # global, correct only for kernels that are unconditionally active
+        # process-wide for a head_dim, e.g. the sdpa256 monkeypatch), this
+        # must stay scoped to this MemoryMonitor/Scheduler instance:
+        # engine_pool.py keeps two models resident during a swap, and a
+        # global registration would leak one model's turboquant config into
+        # another concurrently-resident model sharing the same head_dim,
+        # under-charging that other model's admission guard.
+        # (query_block, kv_tile, min_kv_len); see register_tiled_prefill_tile.
+        self._tiled_prefill_override: tuple[int, int, int] | None = None
         # Fixed-shape ANE prefill I/O surfaces (issue #2841); set via
         # set_model_info, 0 unless the Qwen ANE prefill backend is attached.
         self._ane_prefill_transient_bytes: int = 0
@@ -684,6 +697,33 @@ class MemoryMonitor:
 
         return total + self._fixed_state_bytes
 
+    def register_tiled_prefill_tile(
+        self, *, query_block: int, kv_tile: int, min_kv_len: int
+    ) -> None:
+        """Register a bounded-transient tiled prefill route for THIS
+        scheduler's model, scoped to this MemoryMonitor instance (unlike
+        ``register_tiled_prefill_head_dim``'s module-global registry — see
+        that function's docstring, and the ``_tiled_prefill_override``
+        field comment, for why this must stay instance-scoped for
+        TurboQuant: its tiled route is gated on this model's own config,
+        not on head_dim alone, and engine_pool.py can keep two models
+        resident concurrently during a swap).
+
+        query_block bounds the query axis the kernel actually tiles at
+        (e.g. TurboQuant's ``quantized_attention`` blocks queries at 256
+        regardless of the chunk's true query_tokens); kv_tile bounds the KV
+        axis. min_kv_len must match the kernel's own route-gate threshold —
+        registering a lower value would charge the cheap tile estimate for
+        calls that actually take the expensive unfused fallback."""
+        self._tiled_prefill_override = (
+            int(query_block),
+            int(kv_tile),
+            int(min_kv_len),
+        )
+
+    def clear_tiled_prefill_tile(self) -> None:
+        self._tiled_prefill_override = None
+
     def _uses_fused_sdpa(self, query_tokens: int, kv_len: int) -> bool:
         hd = self._head_dim or 0
         n_q = self._num_attention_heads or 0
@@ -722,6 +762,26 @@ class MemoryMonitor:
         output = n_q * query_tokens * hd * 4
         if self._uses_fused_sdpa(query_tokens, kv_len):
             return output + bias
+
+        # Per-instance tiled route (e.g. TurboQuant's quantized_attention),
+        # scoped to this model/scheduler -- see register_tiled_prefill_tile.
+        # Checked before the module-global head_dim registry below since it
+        # reflects this specific model's own config, not a process-wide
+        # kernel install. query_tokens is capped at query_block because the
+        # kernel itself tiles the query axis (e.g. TurboQuant blocks queries
+        # at 256 regardless of how large this chunk's query_tokens is) --
+        # using the raw query_tokens here would re-introduce an O(L^2)-ish
+        # over-charge on large chunks, defeating the point of registering it.
+        if self._tiled_prefill_override is not None:
+            query_block, kv_tile, min_kv_len = self._tiled_prefill_override
+            if query_tokens > 1 and kv_len >= min_kv_len:
+                tile_scores = (
+                    n_q
+                    * min(query_tokens, query_block)
+                    * min(kv_tile, kv_len)
+                    * self._score_dtype_size
+                )
+                return output + tile_scores + bias
 
         # O(L) tiled-prefill kernel active for this head_dim (e.g. the head_dim
         # 256 sdpa256 patch): the score matrix is never materialized. The peak

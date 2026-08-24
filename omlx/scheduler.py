@@ -12239,7 +12239,7 @@ class Scheduler:
                 except Exception:
                     pass
 
-            if (
+            tq_active = (
                 self._turboquant_kv_bits is not None
                 and isinstance(head_dim, int)
                 and not isinstance(head_dim, bool)
@@ -12253,7 +12253,8 @@ class Scheduler:
                         self._model_uses_mla() or self._model_uses_attention_sinks()
                     )
                 )
-            ):
+            )
+            if tq_active:
                 tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
                 if (
                     self._turboquant_skip_last
@@ -12342,6 +12343,41 @@ class Scheduler:
                 except Exception:
                     logger.debug(
                         "attention-bias transient registration failed",
+                        exc_info=True,
+                    )
+
+                # TurboQuant's long-prefill route (quantized_attention, once
+                # KV length exceeds its own threshold) tiles at a bounded
+                # query_block x kv_tile, not the full O(L^2) unfused score
+                # matrix -- register it on THIS monitor instance (§B3/3.2).
+                # Deliberately per-instance, not the module-global
+                # register_tiled_prefill_head_dim registry sdpa256 uses:
+                # that registry is correct only for kernels active
+                # unconditionally process-wide for a head_dim (sdpa256's
+                # monkeypatch genuinely is); TurboQuant's tiled route is
+                # gated on THIS scheduler's own config, and engine_pool.py
+                # keeps two models resident during a swap, so a global
+                # registration would leak this model's turboquant config
+                # into a concurrently-resident non-turboquant model
+                # sharing the same head_dim, under-charging its guard.
+                try:
+                    from .patches.turboquant_attention import (
+                        _LONG_PREFILL_KEY_CHUNK_SIZE,
+                        _LONG_PREFILL_QUANTIZED_THRESHOLD,
+                        _LONG_PREFILL_QUERY_BLOCK_SIZE,
+                    )
+
+                    if tq_active:
+                        self.memory_monitor.register_tiled_prefill_tile(
+                            query_block=_LONG_PREFILL_QUERY_BLOCK_SIZE,
+                            kv_tile=_LONG_PREFILL_KEY_CHUNK_SIZE,
+                            min_kv_len=_LONG_PREFILL_QUANTIZED_THRESHOLD,
+                        )
+                    else:
+                        self.memory_monitor.clear_tiled_prefill_tile()
+                except Exception:
+                    logger.debug(
+                        "turboquant tiled-prefill registration failed",
                         exc_info=True,
                     )
                 logger.debug(
