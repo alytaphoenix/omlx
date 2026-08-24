@@ -69,6 +69,7 @@ def _fresh_fa256_patch(monkeypatch):
     monkeypatch.delenv("OMLX_FA256_K_BLOCK", raising=False)
     monkeypatch.delenv("OMLX_FA256_DEBUG", raising=False)
     monkeypatch.delenv("OMLX_FA256_DISPATCH_BUDGET", raising=False)
+    monkeypatch.delenv("OMLX_FA256_STREAM_FOLD", raising=False)
     yield
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
     memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
@@ -513,9 +514,9 @@ def test_stream_fold_disabled_on_old_extension(monkeypatch):
     assert calls == [False]
 
 
-def test_stream_fold_forwarded_when_supported(monkeypatch):
-    # With the capability probe True and the env set, the patch forwards
-    # stream_fold=True to the native kernel.
+def test_stream_fold_default_on_when_supported(monkeypatch):
+    # With the capability probe True and no env override, the patch defaults
+    # stream_fold ON (Phase 3.1 flip) and forwards stream_fold=True.
     import omlx.patches.qwen35_fa256_attention as patch
 
     base, _ = _install_fake_vlm_base(monkeypatch)
@@ -535,7 +536,7 @@ def test_stream_fold_forwarded_when_supported(monkeypatch):
         calls.append(stream_fold)
         return "steel"
 
-    monkeypatch.setenv("OMLX_FA256_STREAM_FOLD", "1")
+    # OMLX_FA256_STREAM_FOLD is delenv'd by the autouse fixture.
     monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
     monkeypatch.setattr(
         patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
@@ -549,3 +550,41 @@ def test_stream_fold_forwarded_when_supported(monkeypatch):
     q, k, v = _qkv(32, 32)
     base.scaled_dot_product_attention(q, k, v, None, 0.0625, "causal")
     assert calls == [True]
+
+
+def test_stream_fold_env_off_forces_legacy(monkeypatch):
+    # OMLX_FA256_STREAM_FOLD=0 forces the legacy slab path even when the
+    # extension supports streaming.
+    import omlx.patches.qwen35_fa256_attention as patch
+
+    base, _ = _install_fake_vlm_base(monkeypatch)
+    calls = []
+
+    def fake_kernel(
+        q,
+        k,
+        v,
+        scale,
+        causal=True,
+        q_block=32,
+        k_block=8,
+        dispatch_budget=0,
+        stream_fold=False,
+    ):
+        calls.append(stream_fold)
+        return "steel"
+
+    monkeypatch.setenv("OMLX_FA256_STREAM_FOLD", "0")
+    monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
+    monkeypatch.setattr(
+        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
+    )
+    monkeypatch.setattr(
+        patch._fa256_fast, "fa256_supports_stream_fold", lambda: True
+    )
+    monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
+
+    assert patch.apply_qwen35_fa256_attention_patch(min_kv_len=16)
+    q, k, v = _qkv(32, 32)
+    base.scaled_dot_product_attention(q, k, v, None, 0.0625, "causal")
+    assert calls == [False]
