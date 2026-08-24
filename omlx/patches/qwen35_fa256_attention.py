@@ -231,6 +231,16 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
     else:
         dispatch_budget = _auto_dispatch_budget(kernel, q_block, k_block)
 
+    # Phase 3.1 (§B1): stream the chunk fold into a running accumulator instead
+    # of materializing the n_chunks-scaled partial slab. Default OFF until the
+    # benchmark flips it; env-gated like the other OMLX_FA256_* knobs, and only
+    # honored when the rebuilt extension carries the kwarg.
+    stream_fold_env = os.environ.get("OMLX_FA256_STREAM_FOLD", "").strip().lower()
+    stream_fold = (
+        _fa256_fast.fa256_supports_stream_fold()
+        and stream_fold_env in ("1", "true", "yes", "on")
+    )
+
     patched_any = False
 
     try:
@@ -267,6 +277,7 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                         q_block=q_block,
                         k_block=k_block,
                         dispatch_budget=dispatch_budget,
+                        stream_fold=stream_fold,
                     )
                 except Exception:
                     logger.warning(
@@ -323,6 +334,7 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                             q_block=q_block,
                             k_block=k_block,
                             dispatch_budget=dispatch_budget,
+                            stream_fold=stream_fold,
                         )
                     except Exception:
                         logger.warning(
