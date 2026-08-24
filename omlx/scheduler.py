@@ -2968,6 +2968,11 @@ class Scheduler:
             prefill_step_size=self.config.prefill_step_size,
             stream=self._stream,
         )
+        # MTP's draft-acceptance math (_accept_lp_for) reconstructs temp/
+        # top_p/min_p/top_k but has no XTC term, so the emitted distribution
+        # would diverge from the target under XTC. Gate MTP off at
+        # eligibility time rather than model XTC in the acceptance math.
+        bg._omlx_mtp_disabled_xtc = sampling_params.xtc_probability > 0
 
         return bg
 
@@ -3975,6 +3980,30 @@ class Scheduler:
                 cap / 1024**3,
                 round(margin * 100),
                 base_cap / 1024**3,
+            )
+            # Instrumentation for the qwen35 memory-guard investigation
+            # (docs/qwen35-hardening-and-optimization.md Phase 0.1): the
+            # admission bound is dominated near the ceiling by terms that
+            # don't shrink with KV bit-depth, but which term actually binds
+            # is unconfirmed. Log each contributor separately so a rejection
+            # is diagnosable from one log line instead of re-deriving it.
+            tracker = self._prefill_transient_tracker
+            observed_max = (
+                float(tracker.observed_max_bytes) if tracker is not None else 0.0
+            )
+            ane_reservation = (
+                float(getattr(self.memory_monitor, "_ane_prefill_transient_bytes", 0))
+                if self.memory_monitor is not None
+                else 0.0
+            )
+            logger.warning(
+                "[guard:%s] admission terms: current=%.2fGB predicted_transient=%.2fGB "
+                "observed_max_bytes=%.2fGB ane_prefill_transient_bytes=%.2fGB",
+                loop_label,
+                current / 1024**3,
+                min_transient / 1024**3,
+                observed_max / 1024**3,
+                ane_reservation / 1024**3,
             )
             binding_str, advice = describe_ceiling_binding(
                 static=self._memory_static_ceiling_bytes,
