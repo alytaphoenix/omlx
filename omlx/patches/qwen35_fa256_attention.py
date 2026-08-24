@@ -239,14 +239,18 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
         dispatch_budget = _auto_dispatch_budget(kernel, q_block, k_block)
 
     # Phase 3.1 (§B1): stream the chunk fold into a running accumulator instead
-    # of materializing the n_chunks-scaled partial slab. Default OFF until the
-    # benchmark flips it; env-gated like the other OMLX_FA256_* knobs, and only
-    # honored when the rebuilt extension carries the kwarg.
+    # of materializing the n_chunks-scaled partial slab. Default ON where the
+    # rebuilt extension supports it — the Step-3 benchmark measured only
+    # ~2-8% fa256 prefill overhead (bounded fold dispatches) against a ~1.9GB
+    # per-op transient drop that lifts the long-context admission ceiling, and
+    # streaming honors the per-dispatch budget exactly (legacy caps at the
+    # 2GiB slab and can re-expose the #2225 IOGPU preemption at huge kL).
+    # OMLX_FA256_STREAM_FOLD=0 forces the legacy slab path.
     stream_fold_env = os.environ.get("OMLX_FA256_STREAM_FOLD", "").strip().lower()
-    stream_fold = (
-        _fa256_fast.fa256_supports_stream_fold()
-        and stream_fold_env in ("1", "true", "yes", "on")
-    )
+    if stream_fold_env in ("0", "false", "no", "off"):
+        stream_fold = False
+    else:
+        stream_fold = _fa256_fast.fa256_supports_stream_fold()
 
     patched_any = False
 
