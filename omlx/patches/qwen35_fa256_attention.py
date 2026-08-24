@@ -364,10 +364,12 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
         _PATCHED = True
         logger.info(
             "Qwen3.5/3.6 FA-256 steel attention patch applied "
-            "(min_kv_len=%d, q_block=%d, k_block=%d, dispatch_budget=%d)",
+            "(min_kv_len=%d, q_block=%d, k_block=%d, dispatch_budget=%d, "
+            "stream_fold=%s)",
             min_kv_len,
             q_block,
             k_block,
             dispatch_budget,
+            "on" if stream_fold else "off",
         )
     return patched_any
