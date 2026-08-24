@@ -32,6 +32,19 @@ class PrefillTransientTracker:
     # genuinely recurring giant transient still reaches the guard through
     # the last-delta/EWMA terms of _predicted_chunk_transient.
     _OBSERVED_MAX_CLAMP_BYTES = 4 * 1024**3
+    # observed_max_bytes only ever INCREASED before this constant existed:
+    # one pathological-but-legitimate (under the clamp) floor-chunk spike
+    # early in a long-running (hours/days, continuously-loaded model)
+    # session permanently raised the admission floor for the rest of that
+    # session, even if the spike never recurred (§B4). A lower subsequent
+    # floor sample now pulls the max down by this fraction of the gap
+    # toward the new reading, rather than leaving it frozen. Deliberately
+    # slow (close to 1.0): this bound is a safety floor, not a rolling
+    # average -- a single lucky low reading right after a real spike must
+    # not immediately erase the protection that spike earned. A genuinely
+    # higher reading still raises the max instantly (no decay applied when
+    # rising) since a fresh spike is real evidence the moment it's seen.
+    _OBSERVED_MAX_DECAY = 0.98
     # A sample whose per_token exceeds the current EWMA by more than this
     # ratio is treated as measurement noise (a tail/residual prefill chunk,
     # not a genuine cost-per-token regime change) and excluded from the EWMA
@@ -92,7 +105,10 @@ class PrefillTransientTracker:
         (Qwen3.6 measured ~3.0GB at 2048-token chunks vs far less at the
         floor; charging the big-chunk max at admission rejected every
         prompt at a 21GB ceiling). Big-chunk transients stay the throttle's
-        domain via the EWMA/last-delta terms.
+        domain via the EWMA/last-delta terms. A floor sample below the
+        current max decays it (see ``_OBSERVED_MAX_DECAY``) rather than
+        leaving it pinned at its all-time high for the rest of the session;
+        a floor sample above it still raises the max immediately.
 
         A sample whose per-token rate exceeds the current EWMA by more than
         ``_EWMA_OUTLIER_RATIO`` is excluded from the EWMA blend (see that
@@ -115,6 +131,13 @@ class PrefillTransientTracker:
             if transient_bytes <= self._OBSERVED_MAX_CLAMP_BYTES:
                 if transient_bytes > self._observed_max_bytes:
                     self._observed_max_bytes = transient_bytes
+                else:
+                    # Decay toward this lower reading instead of leaving
+                    # the max frozen at its all-time high forever (§B4).
+                    self._observed_max_bytes = int(
+                        self._OBSERVED_MAX_DECAY * self._observed_max_bytes
+                        + (1.0 - self._OBSERVED_MAX_DECAY) * transient_bytes
+                    )
             else:
                 logger.debug(
                     "PrefillTransientTracker(%s): rejected %d-byte outlier "
@@ -183,7 +206,11 @@ class PrefillTransientTracker:
 
     @property
     def observed_max_bytes(self) -> int:
-        """Largest accepted chunk transient this session (0 if none yet)."""
+        """Decaying bound on the largest accepted floor-chunk transient (0
+        if none yet). Rises instantly on a new peak; decays gradually
+        toward lower subsequent readings instead of staying pinned at its
+        all-time high for the rest of the session (see ``update``'s
+        ``floor_sample`` handling and ``_OBSERVED_MAX_DECAY``)."""
         return self._observed_max_bytes
 
     @property
