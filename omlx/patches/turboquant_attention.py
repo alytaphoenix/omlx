@@ -654,7 +654,15 @@ def apply_turboquant_attention_patch() -> bool:
                         real_cache.prefill_query_block_size = old_query_block_size
                     if old_key_chunk_size is not None:
                         real_cache.prefill_key_chunk_size = old_key_chunk_size
-            dequantized_keys, dequantized_values = real_cache.dequantize()
+            # Pass the request's own views, matching prefill_attention/
+            # quantized_attention above -- dequantize() defaults to None,
+            # which dequantizes the ENTIRE resident cache in one shot
+            # instead of just what this call needs (instant OOM at long
+            # context on this fallback path).
+            # See docs/qwen35-hardening-and-optimization.md F4.
+            dequantized_keys, dequantized_values = real_cache.dequantize(
+                keys_state=keys, values_state=values
+            )
             return mx.fast.scaled_dot_product_attention(
                 queries,
                 dequantized_keys.astype(queries.dtype),

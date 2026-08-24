@@ -507,9 +507,11 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
         raise RuntimeError("forced quantized prefill failure")
 
     original_dequantize = TurboQuantKVCache.dequantize
+    dequant_kwargs = {}
 
     def spy_dequantize(self, *args, **kwargs):
         calls["dequantize"] += 1
+        dequant_kwargs.update(kwargs)
         return original_dequantize(self, *args, **kwargs)
 
     monkeypatch.setattr(
@@ -527,6 +529,10 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
 
     assert out.shape == queries.shape
     assert calls == {"quantized": 1, "dequantize": 1}
+    # F4: must pass the request's own views, not dequantize the ENTIRE
+    # resident cache (the default when keys_state/values_state are omitted)
+    # -- see docs/qwen35-hardening-and-optimization.md F4.
+    assert dequant_kwargs == {"keys_state": ks, "values_state": vs}
 
 
 @pytest.mark.parametrize("q_len", [2, 4, 9])
