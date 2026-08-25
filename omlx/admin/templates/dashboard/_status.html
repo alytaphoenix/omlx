@@ -249,6 +249,7 @@
                                                  x-data="{ showTip: false }"
                                                  @mouseenter="showTip = true" @mouseleave="showTip = false">
                                                 <button @click="unloadModel(m.id)"
+                                                        :aria-label="window.t('status.active_models.unload')"
                                                         class="p-1 rounded-md text-neutral-300 hover:text-red-500 hover:bg-red-50 transition-all">
                                                     <i data-lucide="log-out" class="w-3.5 h-3.5"></i>
                                                 </button>

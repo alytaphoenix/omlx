@@ -100,6 +100,27 @@
     const MODELS_SORT_DEFAULT = { by: 'id', order: 'asc' };
     const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
 
+    // Minimal keyboard focus trap for modal dialogs: cycles Tab/Shift+Tab
+    // between the first and last focusable descendant of the dialog panel
+    // the handler is bound to. No Alpine plugin is bundled (only alpine.min.js
+    // core), so this is hand-rolled rather than using x-trap.
+    window.trapModalFocus = function (event) {
+        const container = event.currentTarget;
+        const focusable = container.querySelectorAll(
+            'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        );
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+        }
+    };
+
     function dashboard() {
         return {
             // Theme

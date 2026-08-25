@@ -223,6 +223,7 @@
                                                        @change="saveExternalEndpoint()"
                                                        :disabled="benchRunning"
                                                        class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                                <span class="block text-xs text-neutral-400 mt-1">{{ t('bench.config.external_api_key_storage_note') }}</span>
                                             </div>
                                             <div>
                                                 <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('bench.config.external_model') }}</label>
