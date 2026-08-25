@@ -3411,6 +3411,14 @@ class PagedSSDCacheManager(CacheManager):
             # derived arrays before memoryview() so the buffer protocol never
             # becomes the first MLX eval site on the store-cache worker thread.
             # Race history: #978/#1040/#1106/#1437/#1558.
+            #
+            # Batch-eval all arrays in one command-buffer submission (mirrors
+            # boundary_snapshot_store's pattern) instead of letting each
+            # _extract_tensor_bytes call trigger its own separate eval —
+            # measured 19ms/48-layer state one-by-one; per-array mx.eval calls
+            # below become no-op re-checks once the arrays are materialized.
+            if arrays:
+                mx.eval(*arrays.values())
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)
