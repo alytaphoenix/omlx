@@ -2994,10 +2994,16 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         # draft sampler's filtered rows (q), cumulative accept, residual
         # samples for every position, and the bonus draw, all resolved in
         # ONE host sync (mirrors the greedy path's sync structure).
-        accept_rows = _accept_lp_for(sampler, combined_lp)  # (k+1, V)
+        # Only rows [:k] (the draft positions) feed the acceptance ratio and
+        # residual distribution below; row k (bonus) is drawn separately via
+        # `sampler(combined_lp[k:k+1])`, never through the acceptance
+        # transform. Slice before the transform, not after, so the (already
+        # expensive: top-p/min-p/top-k filter + renormalize) full-vocab pass
+        # in `_accept_lp_for` does k rows of work instead of k+1.
+        accept_rows = _accept_lp_for(sampler, combined_lp[:k])  # (k, V)
         q_rows = mx.stack(state.draft_accept_lps)  # (k, V)
         idx = state.drafts.astype(mx.int32)[:, None]
-        p_at = mx.take_along_axis(accept_rows[:k], idx, axis=-1).squeeze(-1)
+        p_at = mx.take_along_axis(accept_rows, idx, axis=-1).squeeze(-1)
         q_at = mx.take_along_axis(q_rows, idx, axis=-1).squeeze(-1)
         ratio = p_at - q_at  # (k,) log acceptance ratios
         u = mx.random.uniform(shape=(k,))
@@ -3006,7 +3012,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         # Residual distributions max(p - q, 0) per draft position. Only the
         # reject position's sample is used; computing all k keeps the cycle
         # single-sync and costs a few elementwise vocab ops on GPU.
-        p_all = mx.exp(accept_rows[:k])
+        p_all = mx.exp(accept_rows)
         res = mx.maximum(p_all - mx.exp(q_rows), 0.0)
         z = res.sum(axis=-1, keepdims=True)
         res_dist = mx.where(z > 0, res, p_all)
@@ -3097,7 +3103,12 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     # --- commit: queue emits + cache rollback ---
     t0 = time.perf_counter()
     for j in range(m):
-        state.queue.append((int(draft_ids[j]), state.draft_lps[j], "draft"))
+        # Report the verified backbone/target distribution for this cycle
+        # (combined_lp[j]), not the MTP-head's own draft-time distribution
+        # (state.draft_lps[j]) — the latter is what proposed the token, not
+        # what the serving model actually assigned it; reported logprobs must
+        # reflect the model whose acceptance decision let the token through.
+        state.queue.append((int(draft_ids[j]), combined_lp[j], "draft"))
     if m == k:
         state.queue.append((int(emit_last_id), emit_last_lp, "bonus"))
         _clear_rollback(gen_batch.prompt_cache)
