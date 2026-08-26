@@ -1429,7 +1429,7 @@
                                                             : (modelSettings.mtp_enabled
                                                                 ? 'MTP and DFlash 2 cannot both be enabled.'
                                                                 : (modelSettings.vlm_mtp_enabled
-                                                                    ? '{{ t('modal.model_settings.vlm_mtp_conflict') }}'
+                                                                    ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                     : ''))"
                                                 :class="[
                                                     modelSettings.dflash2_enabled ? 'bg-black' : 'bg-neutral-200',
