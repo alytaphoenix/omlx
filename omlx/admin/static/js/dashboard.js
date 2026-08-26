@@ -1130,7 +1130,7 @@
                 return message;
             },
 
-            clusterErrorMessage(detail, fallback = 'Something went wrong') {
+            clusterErrorMessage(detail, fallback = window.t('js.error.something_went_wrong')) {
                 if (!Array.isArray(detail)) {
                     if (detail && typeof detail === 'object') {
                         return detail.msg || detail.message || JSON.stringify(detail);
@@ -2614,8 +2614,7 @@
                 if (this.clusterSshKeyGenerating) return;
                 const overwrite = Boolean(this.clusterSshKey?.available);
                 if (overwrite && !window.confirm(
-                    'Regenerating this key disconnects every paired worker. '
-                    + 'You will need to exchange keys again on every Mac. Continue?'
+                    window.t('cluster.pairing.ssh_key_regenerate_confirm')
                 )) return;
                 this.clusterSshKeyGenerating = true;
                 try {
@@ -2632,16 +2631,16 @@
                         if (overwrite) this.invalidateClusterPeer(true);
                         this.showNotification(
                             overwrite
-                                ? 'SSH key regenerated. Pair every worker again before reconnecting.'
-                                : 'SSH key generated successfully',
+                                ? window.t('cluster.pairing.ssh_key_regenerated')
+                                : window.t('cluster.pairing.ssh_key_generated'),
                             'success'
                         );
                     } else {
                         const error = await response.json();
-                        this.showNotification('SSH key generation failed: ' + (error.detail || 'Unknown error'), 'error');
+                        this.showNotification(window.t('cluster.pairing.ssh_key_generation_failed').replace('{detail}', error.detail || window.t('js.error.unknown')), 'error');
                     }
                 } catch (error) {
-                    this.showNotification('SSH key generation failed: ' + error.message, 'error');
+                    this.showNotification(window.t('cluster.pairing.ssh_key_generation_failed').replace('{detail}', error.message), 'error');
                 } finally {
                     this.clusterSshKeyGenerating = false;
                 }
@@ -2664,10 +2663,10 @@
                         this.clusterExchangeToken = result.exchange_token;
                     } else {
                         const error = await response.json();
-                        this.showNotification('Key exchange token generation failed: ' + (error.detail || 'Unknown error'), 'error');
+                        this.showNotification(window.t('cluster.pairing.exchange_token_failed').replace('{detail}', error.detail || window.t('js.error.unknown')), 'error');
                     }
                 } catch (error) {
-                    this.showNotification('Key exchange token generation failed: ' + error.message, 'error');
+                    this.showNotification(window.t('cluster.pairing.exchange_token_failed').replace('{detail}', error.message), 'error');
                 } finally {
                     this.clusterExchangeTokenLoading = false;
                 }
@@ -2689,7 +2688,7 @@
                     if (response.ok) {
                         this.clusterKeyExchangeResult = await response.json();
                         this.clusterPeerExchangeToken = '';
-                        this.showNotification('SSH keys exchanged successfully', 'success');
+                        this.showNotification(window.t('cluster.pairing.keys_exchanged'), 'success');
                         // Pairing just changed what a probe would find; retry
                         // now rather than waiting out the failure hold.
                         this.resetClusterProbeBackoff();
@@ -2697,10 +2696,10 @@
                         await this.loadClusterSshKey();
                     } else {
                         const error = await response.json();
-                        this.showNotification('Key exchange failed: ' + (error.detail || 'Unknown error'), 'error');
+                        this.showNotification(window.t('cluster.pairing.exchange_failed').replace('{detail}', error.detail || window.t('js.error.unknown')), 'error');
                     }
                 } catch (error) {
-                    this.showNotification('Key exchange failed: ' + error.message, 'error');
+                    this.showNotification(window.t('cluster.pairing.exchange_failed').replace('{detail}', error.message), 'error');
                 } finally {
                     this.clusterKeyExchangeLoading = false;
                 }
@@ -2715,16 +2714,16 @@
                     if (response.ok) {
                         const result = await response.json();
                         if (result.stored) {
-                            this.showNotification('Key fingerprint stored in macOS Keychain', 'success');
+                            this.showNotification(window.t('cluster.pairing.keychain_stored'), 'success');
                         } else {
-                            this.showNotification('Keychain storage unavailable on this system', 'warning');
+                            this.showNotification(window.t('cluster.pairing.keychain_unavailable'), 'warning');
                         }
                     } else {
                         const error = await response.json();
-                        this.showNotification('Keychain storage failed: ' + (error.detail || 'Unknown error'), 'error');
+                        this.showNotification(window.t('cluster.pairing.keychain_failed').replace('{detail}', error.detail || window.t('js.error.unknown')), 'error');
                     }
                 } catch (error) {
-                    this.showNotification('Keychain storage failed: ' + error.message, 'error');
+                    this.showNotification(window.t('cluster.pairing.keychain_failed').replace('{detail}', error.message), 'error');
                 } finally {
                     this.clusterKeychainStoring = false;
                 }
@@ -3876,20 +3875,20 @@
                 const nodes = Math.max(1, this.clusterPlanNodes.length);
                 if (nodes <= 1) {
                     return [
-                        { size: 1, label: 'Pipeline only', supported: true, reason: '' },
+                        { size: 1, label: window.t('cluster.plan.pipeline_only'), supported: true, reason: '' },
                     ];
                 }
                 const support = this.clusterStrategySupport();
                 const choices = [
                     {
                         size: 1,
-                        label: 'Pipeline only',
+                        label: window.t('cluster.plan.pipeline_only'),
                         supported: support.pipeline.supported,
                         reason: support.pipeline.reason,
                     },
                     {
                         size: nodes,
-                        label: `${nodes}-way tensor`,
+                        label: window.t('cluster.plan.way_tensor').replace('{size}', nodes),
                         supported: support.tensor.supported,
                         reason: support.tensor.reason,
                     },
@@ -3916,8 +3915,8 @@
                     .find(choice => !choice.supported);
                 if (unsupported) return unsupported.reason;
                 return Number(this.clusterPlanTensorParallelSize) > 1
-                    ? 'Every detected accelerator works on every token'
-                    : `Each of the ${this.clusterPlanNodes.length} detected accelerators holds different layers`;
+                    ? window.t('cluster.plan.every_accelerator_works')
+                    : window.t('cluster.plan.each_accelerator_holds_layers').replace('{count}', this.clusterPlanNodes.length);
             },
 
             // The catalogue fit is the FEWEST-node plan: a model that fits one
@@ -3988,8 +3987,8 @@
                 if (this.clusterDeactivatingId) {
                     return {
                         key: 'stopping',
-                        label: 'Stopping…',
-                        detail: 'The workers are finishing their current work safely.',
+                        label: window.t('cluster.status.stopping_label'),
+                        detail: window.t('cluster.status.stopping_detail'),
                         tone: 'blue',
                         busy: true,
                     };
@@ -3997,8 +3996,8 @@
                 if (this.clusterActivationLoading) {
                     return {
                         key: 'starting',
-                        label: this.clusterActivationProgress || 'Preparing model…',
-                        detail: `oMLX is starting the model on ${this.clusterQuickNodes().length} devices.`,
+                        label: this.clusterActivationProgress || window.t('cluster.status.starting_label_default'),
+                        detail: window.t('cluster.status.starting_detail').replace('{count}', this.clusterQuickNodes().length),
                         tone: 'blue',
                         busy: true,
                     };
@@ -4007,9 +4006,9 @@
                     return {
                         key: 'preparing',
                         label: this.clusterLinkSetupLoading
-                            ? 'Connecting the workers…'
-                            : 'Preparing the model…',
-                        detail: 'Connection, memory, and model split checks are automatic.',
+                            ? window.t('cluster.status.connecting_label')
+                            : window.t('cluster.status.preparing_label'),
+                        detail: window.t('cluster.status.preparing_detail'),
                         tone: 'blue',
                         busy: true,
                     };
@@ -4020,20 +4019,20 @@
                     );
                     const name = deployedModel
                         ? this.clusterModelDisplayName(deployedModel)
-                        : String(deployment.model || 'The selected model').split('/').pop();
+                        : String(deployment.model || window.t('cluster.status.unnamed_model')).split('/').pop();
                     if (liveJobs.length) {
                         return {
                             key: 'running',
-                            label: `Running on ${this.clusterQuickNodes().length} devices`,
-                            detail: `${name} is loaded and available through oMLX.`,
+                            label: window.t('cluster.status.running_label').replace('{count}', this.clusterQuickNodes().length),
+                            detail: window.t('cluster.status.running_detail').replace('{name}', name),
                             tone: 'green',
                             busy: false,
                         };
                     }
                     return {
                         key: 'stopped',
-                        label: 'Cluster is stopped',
-                        detail: `${name} is configured but its weights are not loaded.`,
+                        label: window.t('cluster.status.stopped_label'),
+                        detail: window.t('cluster.status.stopped_detail').replace('{name}', name),
                         tone: 'amber',
                         busy: false,
                     };
@@ -4041,8 +4040,8 @@
                 if (error) {
                     return {
                         key: 'error',
-                        label: 'Needs attention',
-                        detail: 'oMLX kept the cluster stopped. Open the message below for the fix.',
+                        label: window.t('cluster.status.error_label'),
+                        detail: window.t('cluster.status.error_detail'),
                         tone: 'red',
                         busy: false,
                     };
@@ -4050,8 +4049,8 @@
                 if (!this.clusterPeerSsh.trim()) {
                     return {
                         key: 'finding',
-                        label: 'Finding workers…',
-                        detail: 'Keep every worker awake and connected to the cluster network.',
+                        label: window.t('cluster.status.finding_label'),
+                        detail: window.t('cluster.status.finding_detail'),
                         tone: 'blue',
                         busy: this.clusterDiscoveryLoading,
                     };
@@ -4062,8 +4061,8 @@
                     || !this.clusterPeerProbe) {
                     return {
                         key: 'checking',
-                        label: 'Checking the connection…',
-                        detail: 'oMLX is confirming every worker and the fastest shared links.',
+                        label: window.t('cluster.status.checking_label'),
+                        detail: window.t('cluster.status.checking_detail'),
                         tone: 'blue',
                         busy: true,
                     };
@@ -4081,19 +4080,19 @@
                     if (this.clusterPeerProbe.bootstrap_required) {
                         return {
                             key: 'bootstrap',
-                            label: 'Worker runtime setup needed',
+                            label: window.t('cluster.status.bootstrap_label'),
                             detail: this.clusterConnectionError
                                 || mismatches[0]
-                                || 'This worker is reachable, but its oMLX runtime could not be verified.',
+                                || window.t('cluster.status.bootstrap_detail_fallback'),
                             tone: 'amber',
                             busy: false,
                         };
                     }
                     return {
                         key: 'runtime-mismatch',
-                        label: 'Worker runtime mismatch',
+                        label: window.t('cluster.status.runtime_mismatch_label'),
                         detail: mismatches.join(' · ')
-                            || 'The worker runtime differs from this Mac.',
+                            || window.t('cluster.status.runtime_mismatch_detail_fallback'),
                         tone: 'red',
                         busy: false,
                     };
@@ -4101,8 +4100,8 @@
                 if (this.clusterPeerProbe.runtime_compatible !== true) {
                     return {
                         key: 'runtime-unverified',
-                        label: 'Worker runtime not verified',
-                        detail: 'This worker is reachable, but oMLX could not verify its runtime yet.',
+                        label: window.t('cluster.status.runtime_unverified_label'),
+                        detail: window.t('cluster.status.runtime_unverified_detail'),
                         tone: 'amber',
                         busy: false,
                     };
@@ -4110,8 +4109,8 @@
                 if (this.clusterCatalogueLoading && !selected) {
                     return {
                         key: 'choosing',
-                        label: 'Choosing a model…',
-                        detail: 'oMLX is checking which downloaded models fit this accelerator pool.',
+                        label: window.t('cluster.status.choosing_label'),
+                        detail: window.t('cluster.status.choosing_detail'),
                         tone: 'blue',
                         busy: true,
                     };
@@ -4119,8 +4118,8 @@
                 if (!selected) {
                     return {
                         key: 'model',
-                        label: 'Choose a model',
-                        detail: 'Pick a recommendation or search all downloaded models.',
+                        label: window.t('cluster.status.choose_model_label'),
+                        detail: window.t('cluster.status.choose_model_detail'),
                         tone: 'amber',
                         busy: false,
                     };
@@ -4130,22 +4129,23 @@
                     return {
                         key: 'model',
                         label: selectedFit.failure_kind === 'single_node_only'
-                            ? `${this.clusterFriendlyMacName(
-                                selectedFit.standalone_node_id
-                            )} only`
+                            ? window.t('cluster.status.single_node_only').replace(
+                                '{name}',
+                                this.clusterFriendlyMacName(selectedFit.standalone_node_id)
+                            )
                             : (selectedFit.failure_kind === 'cannot_split'
-                                ? 'Cannot combine these devices'
-                                : 'Choose another model'),
+                                ? window.t('cluster.status.cannot_combine')
+                                : window.t('cluster.status.choose_another')),
                         detail: selectedFit.reason
-                            || 'The selected model cannot run with this cluster configuration.',
+                            || window.t('cluster.status.model_fit_detail_fallback'),
                         tone: 'amber',
                         busy: false,
                     };
                 }
                 return {
                     key: 'ready',
-                    label: 'Ready',
-                    detail: 'Every worker and the selected model passed the setup checks.',
+                    label: window.t('cluster.status.ready_label'),
+                    detail: window.t('cluster.status.ready_detail'),
                     tone: 'green',
                     busy: false,
                 };
@@ -4209,30 +4209,32 @@
             },
 
             clusterPrimaryActionLabel() {
-                if (this.clusterDeactivatingId) return 'Stopping…';
+                if (this.clusterDeactivatingId) return window.t('cluster.status.stopping_label');
                 if (this.clusterActivationLoading) {
-                    return this.clusterActivationProgress || 'Starting on every worker…';
+                    return this.clusterActivationProgress || window.t('cluster.action.starting_default');
                 }
-                if (this.clusterLinkSetupLoading) return 'Connecting the workers…';
-                if (this.clusterAutoconfigureLoading) return 'Preparing the model…';
+                if (this.clusterLinkSetupLoading) return window.t('cluster.action.connecting');
+                if (this.clusterAutoconfigureLoading) return window.t('cluster.action.preparing');
                 if (this.clusterPrimaryDeployment() && this.clusterLiveJobs().length) {
-                    return 'Stop';
+                    return window.t('cluster.action.stop');
                 }
-                if (!this.clusterAllModels().length) return 'Get a model';
+                if (!this.clusterAllModels().length) return window.t('cluster.action.get_a_model');
                 if (!this.clusterPeerSsh.trim()) {
                     return this.clusterDiscoveryLoading
-                        ? 'Finding workers…'
-                        : 'Find workers';
+                        ? window.t('cluster.action.finding_workers')
+                        : window.t('cluster.action.find_workers');
                 }
                 const model = this.clusterSelectedModel();
-                if (!model) return 'Choose a model';
+                if (!model) return window.t('cluster.action.choose_a_model');
                 if (this.clusterCatalogueFit(model.model_path)?.fits === false) {
-                    return 'Choose a cluster-compatible model';
+                    return window.t('cluster.action.choose_compatible_model');
                 }
                 if (this.clusterError || this.clusterAutoconfigureError) {
-                    return `Retry ${this.clusterModelDisplayName(model)} setup`;
+                    return window.t('cluster.action.retry_setup').replace('{model}', this.clusterModelDisplayName(model));
                 }
-                return `Start ${this.clusterModelDisplayName(model)} on ${this.clusterQuickNodes().length} devices`;
+                return window.t('cluster.action.start_on_devices')
+                    .replace('{model}', this.clusterModelDisplayName(model))
+                    .replace('{count}', this.clusterQuickNodes().length);
             },
 
             async runClusterPrimaryAction() {
@@ -5998,15 +6000,15 @@
                 }
                 if (this.clusterLinkSetupLoading) {
                     return this.clusterActivationProgress
-                        || 'Configuring Thunderbolt…';
+                        || window.t('cluster.planner.configuring_thunderbolt');
                 }
                 if (this.clusterActivationLoading) {
-                    return this.clusterActivationProgress || 'Starting cluster…';
+                    return this.clusterActivationProgress || window.t('cluster.planner.starting_cluster');
                 }
                 if (this.clusterAutoconfigureLoading) {
-                    return 'Checking every worker…';
+                    return window.t('cluster.planner.checking_every_worker');
                 }
-                return 'Start Cluster';
+                return window.t('cluster.planner.start_cluster');
             },
 
             async activateClusterProposal(activation) {
