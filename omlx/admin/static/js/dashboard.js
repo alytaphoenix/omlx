@@ -525,6 +525,12 @@
             // Progress detail for the staging phase, read through the job's
             // staging_job_id from the existing /stage/{job_id} endpoint.
             clusterStartJobStaging: null,
+            // B4: the server-computed precondition rows behind the Start
+            // button. Refreshed on the 10 s discovery tick only — every row
+            // embeds SSH-backed evidence — never on the 2 s runtime poll.
+            clusterReadiness: null,
+            clusterReadinessLoading: false,
+            _clusterReadinessFetchedAt: 0,
             // What automatic tuning proposed after measuring the fabric. The
             // signed placement still wins when the proposal moves layers.
             clusterPlanChanges: null,
@@ -1549,8 +1555,134 @@
                 await Promise.all([
                     this.discoverClusterPeers(),
                     this.loadClusterJoinStatus(),
+                    // B4: precondition rows ride the slow tick. The server
+                    // caches the answer for 10 s, so this poll and B2's job
+                    // poll can never stampede SSH.
+                    this.loadClusterReadiness(),
                 ]);
                 await this.initializeClusterSetup({ preview: false });
+            },
+
+            // B4: one row per Start precondition, with live evidence and a
+            // fix. The server computes these; the panel only renders them.
+            async loadClusterReadiness() {
+                if (this.clusterReadinessLoading) return;
+                const hosts = [
+                    '127.0.0.1',
+                    ...this.clusterWorkerPeers()
+                        .map(peer => String(peer?.ssh || '').trim()),
+                ].filter(Boolean);
+                const model = this.clusterSelectedModel()?.model_path || '';
+                this.clusterReadinessLoading = true;
+                try {
+                    const query = new URLSearchParams({ hosts: hosts.join(',') });
+                    if (model) query.set('model', model);
+                    const response = await fetch(
+                        `/admin/api/cluster/readiness?${query}`
+                    );
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    // A failed poll keeps the previous rows; their age makes
+                    // the staleness visible instead of blanking the panel.
+                    if (!response.ok) return;
+                    this.clusterReadiness = await response.json();
+                    this._clusterReadinessFetchedAt = Date.now();
+                } catch (error) {
+                    // Keep the last evidence; the age renders it stale-gray.
+                } finally {
+                    this.clusterReadinessLoading = false;
+                }
+            },
+
+            clusterReadinessRowLabel(id) {
+                return {
+                    ssh: 'Workers reachable',
+                    fabric: 'Fabric link',
+                    staging: 'Model staged',
+                    budget: 'Memory budget',
+                    strategy: 'Parallelism strategy',
+                }[id] || id;
+            },
+
+            clusterReadinessRowAgeSeconds(row) {
+                const base = Number(row?.evidence_age_s || 0);
+                const fetched = this._clusterReadinessFetchedAt || Date.now();
+                return Math.max(
+                    0, Math.round(base + (Date.now() - fetched) / 1000)
+                );
+            },
+
+            clusterReadinessRowAge(row) {
+                return `${this.clusterReadinessRowAgeSeconds(row)} s ago`;
+            },
+
+            // Design A.6's live-data rule: evidence older than 30 s renders
+            // stale-gray rather than pretending to be current.
+            clusterReadinessRowStale(row) {
+                return this.clusterReadinessRowAgeSeconds(row) > 30;
+            },
+
+            clusterReadinessFixLabel(row) {
+                return {
+                    reverify: 'Re-verify',
+                    doctor: 'Run Fabric Doctor',
+                    stage_details: 'Staging details',
+                    role_editor: 'Edit roles',
+                }[row?.fix?.kind] || 'Fix';
+            },
+
+            // Fix affordances dispatch to actions that already exist: the
+            // peer probe, the Fabric Doctor, staging details, the role
+            // editor. B4 adds no new repair machinery.
+            async applyClusterReadinessFix(row) {
+                const kind = row?.fix?.kind;
+                if (kind === 'reverify') {
+                    await Promise.all(
+                        this.clusterWorkerPeers()
+                            .map(peer => String(peer?.ssh || '').trim())
+                            .filter(Boolean)
+                            .map(async ssh => {
+                                try {
+                                    await fetch('/admin/api/cluster/peer-probe', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ ssh }),
+                                    });
+                                } catch (error) {
+                                    // The next readiness poll reports the outcome.
+                                }
+                            })
+                    );
+                    await this.loadClusterReadiness();
+                    return;
+                }
+                if (kind === 'doctor') {
+                    await this.runFabricDoctor();
+                    return;
+                }
+                if (kind === 'stage_details') {
+                    const jobId = row?.fix?.job_id;
+                    if (jobId) {
+                        try {
+                            const response = await fetch(
+                                `/admin/api/cluster/stage/${encodeURIComponent(jobId)}`
+                            );
+                            if (response.ok) {
+                                this.clusterStagingResult = await response.json();
+                            }
+                        } catch (error) {
+                            // Fall through to the planner card below.
+                        }
+                    }
+                    this.clusterShowSetupDetails = true;
+                    return;
+                }
+                if (kind === 'role_editor') {
+                    // The role and memory controls live on the planner card.
+                    this.clusterShowSetupDetails = true;
+                }
             },
 
             // Monotonic merge: the ?since= cursor means the server only ever

@@ -130,6 +130,40 @@
             </ul>
         </details>
 
+        <!-- B4 surface 1: per-node status strip. State is named in text with
+             color as a secondary cue only — never color-only (design B.4).
+             The incident badge (surface 2, fed by B1's server-owned feed)
+             rides on the strip header so outage evidence and node state are
+             read in one place. -->
+        <div x-show="clusterReadiness" x-cloak
+             data-cluster-status-strip
+             class="mb-6 rounded-xl border border-neutral-200 bg-white overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2.5 border-b border-neutral-100">
+                <i data-lucide="list-checks" class="w-4 h-4 flex-shrink-0 text-neutral-500"></i>
+                <span class="text-sm font-semibold text-neutral-900">Cluster nodes</span>
+                <span class="text-[10px] uppercase tracking-wider font-semibold"
+                      :class="clusterReadiness?.ready ? 'text-green-700' : 'text-amber-700'"
+                      x-text="clusterReadiness?.ready ? 'ready to start' : 'not ready'"></span>
+                <span x-show="clusterActiveIncidents().length" x-cloak
+                      class="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-bold">
+                    <i data-lucide="bell-ring" class="w-3 h-3"></i>
+                    <span x-text="`${clusterActiveIncidents().length} incident${clusterActiveIncidents().length === 1 ? '' : 's'}`"></span>
+                </span>
+            </div>
+            <ul class="divide-y divide-neutral-100">
+                <template x-for="node in (clusterReadiness?.nodes || [])" :key="node.host">
+                    <li class="flex items-center gap-2.5 px-4 py-2 text-xs">
+                        <span class="font-mono text-neutral-700 truncate" x-text="node.host"></span>
+                        <!-- The state word itself, not only a dot. -->
+                        <span class="uppercase tracking-wider text-[10px] font-semibold"
+                              :class="node.state === 'reachable' ? 'text-green-700' : 'text-red-700'"
+                              x-text="node.state"></span>
+                        <span class="text-neutral-400 truncate" x-text="node.detail"></span>
+                    </li>
+                </template>
+            </ul>
+        </div>
+
         <!-- C3: Fabric Doctor — the ladder checks in order, stopping at the
              first red rung. Minimal check · state · evidence · fix rows;
              B4 owns the full panel layout later. -->
@@ -1998,6 +2032,53 @@
                                 </template>
                             </div>
 
+                            <!-- B4 surface 3: the precondition panel. When
+                                 Start is not green this renders in place of
+                                 the silent dead zone — one row per thing that
+                                 must be true, each with live evidence, its
+                                 age, and a fix that dispatches to an existing
+                                 action. State names are text; color is
+                                 secondary (never color-only, design B.4). -->
+                            <div x-show="clusterReadiness && !clusterReadiness.ready" x-cloak
+                                 data-cluster-preconditions
+                                 class="mt-3 rounded-xl border border-neutral-200 bg-white overflow-hidden">
+                                <div class="px-3 py-2 border-b border-neutral-100 text-[10px] uppercase tracking-wider font-semibold text-neutral-500">
+                                    Why can't I start?
+                                </div>
+                                <ul class="divide-y divide-neutral-100">
+                                    <template x-for="row in (clusterReadiness?.rows || [])" :key="row.id">
+                                        <li class="flex items-start gap-2.5 px-3 py-2 text-xs">
+                                            <span class="mt-0.5 w-12 shrink-0 uppercase tracking-wider text-[10px] font-bold"
+                                                  :class="{
+                                                      'text-green-700': row.state === 'pass',
+                                                      'text-amber-700': row.state === 'warn',
+                                                      'text-red-700': row.state === 'fail'
+                                                  }"
+                                                  x-text="row.state"></span>
+                                            <div class="min-w-0 flex-1">
+                                                <div class="font-medium text-neutral-800"
+                                                     x-text="clusterReadinessRowLabel(row.id)"></div>
+                                                <div class="mt-0.5 break-words"
+                                                     :class="clusterReadinessRowStale(row) ? 'text-neutral-400' : 'text-neutral-600'"
+                                                     x-text="row.evidence"></div>
+                                                <div class="mt-0.5 text-[10px]"
+                                                     :class="clusterReadinessRowStale(row) ? 'text-neutral-400 italic' : 'text-neutral-400'"
+                                                     x-text="clusterReadinessRowStale(row)
+                                                         ? `${clusterReadinessRowAge(row)} — stale`
+                                                         : clusterReadinessRowAge(row)"></div>
+                                            </div>
+                                            <button x-show="row.fix" type="button"
+                                                    @click="applyClusterReadinessFix(row)"
+                                                    class="shrink-0 px-2 py-1 text-[10px] font-medium text-neutral-700 border border-neutral-200 rounded-md hover:bg-neutral-100"
+                                                    x-text="clusterReadinessFixLabel(row)"></button>
+                                        </li>
+                                    </template>
+                                </ul>
+                            </div>
+
+                            <!-- The prose blocker stays alongside the panel
+                                 for one release (B4 backward-compat note):
+                                 the rows are additive, not a replacement yet. -->
                             <div x-show="clusterAutoconfigureError" x-cloak
                                  class="mt-3 px-3 py-2 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700"
                                  x-text="clusterAutoconfigureError"></div>

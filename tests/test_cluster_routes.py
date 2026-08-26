@@ -3064,3 +3064,190 @@ def test_legacy_deployments_post_is_refused_while_a_start_job_runs(
     )
     assert response.status_code == 409
     assert running["job_id"] in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# B4: GET /readiness — the precondition rows behind the Start button.
+
+
+GIB = 1024**3
+
+
+@pytest.fixture()
+def _fresh_readiness_cache():
+    routes._READINESS_CACHE.clear()
+    yield
+    routes._READINESS_CACHE.clear()
+
+
+def _install_readiness_fakes(monkeypatch, calls):
+    """Every SSH-backed sub-step counted, every answer healthy."""
+
+    def fake_probe(host, **kwargs):
+        calls["probe"] = calls.get("probe", 0) + 1
+        return {"status": {"node": {}, "runtime": {}}}
+
+    def fake_fabric(hosts, **kwargs):
+        calls["fabric"] = calls.get("fabric", 0) + 1
+        return {
+            "ok": True,
+            "backend": "jaccl",
+            "blocker": "",
+            "link": {"ok": True, "kind": "rdma", "reason": ""},
+            "hosts": [
+                {"host": host, "ips": [f"172.16.99.{index + 1}"]}
+                for index, host in enumerate(hosts)
+            ],
+        }
+
+    def fake_layout(model_path):
+        return SimpleNamespace(
+            total_weight_bytes=17 * GIB,
+            supports_pipeline=True,
+            supports_tensor_parallel=True,
+            source="safetensors",
+        )
+
+    async def fake_budget(node_id, ssh, **kwargs):
+        calls["budget"] = calls.get("budget", 0) + 1
+        return {
+            "node_id": node_id,
+            "ssh": ssh,
+            "capacity_bytes": 76 * GIB,
+            "reserve_bytes": 6 * GIB,
+            "usable_bytes": 70 * GIB,
+            "role": "headless",
+            "capacity_source": "admission_ceiling",
+            "summary": "70 GiB for the cluster",
+            "breakdown": {"binding": "role_reserve"},
+        }
+
+    def fake_plan(layout, budgets, **kwargs):
+        return SimpleNamespace(assignments=[SimpleNamespace(node_id=b.node_id) for b in budgets])
+
+    def fake_stage_manifest(model_path, assignments, hosts_by_node, **kwargs):
+        calls["stage"] = calls.get("stage", 0) + 1
+        return {
+            "ready": True,
+            "nodes": [
+                {"node_id": node_id, "ready": True, "missing_bytes": 0}
+                for node_id in hosts_by_node
+            ],
+            "total_missing_bytes": 0,
+        }
+
+    def fake_strategies(model, node_count):
+        return {
+            "tensor": {"supported": True, "reason": ""},
+            "pipeline": {"supported": True, "reason": ""},
+        }
+
+    monkeypatch.setattr(routes, "probe_remote_host", fake_probe)
+    monkeypatch.setattr(routes, "_resolve_fabric", fake_fabric)
+    monkeypatch.setattr(routes, "inspect_safetensors_layout", fake_layout)
+    monkeypatch.setattr(routes, "_node_budget_evidence", fake_budget)
+    monkeypatch.setattr(routes, "plan_unequal_pipeline", fake_plan)
+    monkeypatch.setattr(routes, "stage_manifest", fake_stage_manifest)
+    monkeypatch.setattr(routes, "_strategies_payload", fake_strategies)
+
+
+def test_readiness_returns_the_five_documented_rows(
+    monkeypatch, _fresh_readiness_cache
+):
+    calls = {}
+    _install_readiness_fakes(monkeypatch, calls)
+    client = _client()
+
+    response = client.get(
+        "/admin/api/cluster/readiness",
+        params={"hosts": "127.0.0.1,worker@studio.local", "model": "/tmp/model"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ready"] is True
+    assert [row["id"] for row in payload["rows"]] == [
+        "ssh", "fabric", "staging", "budget", "strategy",
+    ]
+    for row in payload["rows"]:
+        assert row["state"] in {"pass", "warn", "fail"}
+        assert row["evidence"]
+        assert isinstance(row["evidence_age_s"], (int, float))
+        assert "fix" in row
+    # Surface 1: the per-node strip names each state in text.
+    assert [node["state"] for node in payload["nodes"]] == [
+        "reachable", "reachable",
+    ]
+
+
+def test_readiness_failure_shapes_flip_only_their_rows(
+    monkeypatch, _fresh_readiness_cache
+):
+    calls = {}
+    _install_readiness_fakes(monkeypatch, calls)
+
+    def refused(host, **kwargs):
+        raise routes.DistributedLaunchError("connection refused")
+
+    monkeypatch.setattr(routes, "probe_remote_host", refused)
+    client = _client()
+
+    payload = client.get(
+        "/admin/api/cluster/readiness",
+        params={"hosts": "127.0.0.1,worker@studio.local", "model": "/tmp/model"},
+    ).json()
+
+    assert payload["ready"] is False
+    states = {row["id"]: row["state"] for row in payload["rows"]}
+    assert states["ssh"] == "fail"
+    assert states["fabric"] == "pass"
+    ssh_row = next(row for row in payload["rows"] if row["id"] == "ssh")
+    assert "connection refused" in ssh_row["evidence"]
+    assert ssh_row["fix"] == {"kind": "reverify"}
+
+
+def test_readiness_cache_prevents_an_ssh_stampede_inside_ten_seconds(
+    monkeypatch, _fresh_readiness_cache
+):
+    calls = {}
+    _install_readiness_fakes(monkeypatch, calls)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(routes, "_readiness_clock", lambda: clock["now"])
+    client = _client()
+    params = {"hosts": "127.0.0.1,worker@studio.local", "model": "/tmp/model"}
+
+    first = client.get("/admin/api/cluster/readiness", params=params).json()
+    clock["now"] = 105.0
+    second = client.get("/admin/api/cluster/readiness", params=params).json()
+
+    # One SSH-backed evidence pass serves both requests inside the TTL —
+    # exactly what keeps B2's job poll from stampeding the workers.
+    assert calls["probe"] == 1
+    assert calls["fabric"] == 1
+    assert calls["stage"] == 1
+    # The served copy confesses its age instead of pretending freshness.
+    assert first["age_s"] == 0.0
+    assert second["age_s"] == 5.0
+    assert all(row["evidence_age_s"] == 5.0 for row in second["rows"])
+
+    clock["now"] = 110.5
+    client.get("/admin/api/cluster/readiness", params=params).json()
+    assert calls["probe"] == 2
+    assert calls["fabric"] == 2
+    assert calls["stage"] == 2
+
+
+def test_readiness_rejects_an_invalid_ssh_target_before_probing(
+    monkeypatch, _fresh_readiness_cache
+):
+    calls = {}
+    _install_readiness_fakes(monkeypatch, calls)
+    client = _client()
+
+    response = client.get(
+        "/admin/api/cluster/readiness",
+        params={"hosts": "127.0.0.1,-oProxyCommand=evil"},
+    )
+
+    assert response.status_code == 400
+    assert calls.get("probe") is None
