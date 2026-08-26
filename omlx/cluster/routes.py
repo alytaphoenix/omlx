@@ -4369,32 +4369,59 @@ async def cluster_deployments():
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-# The memory guard names the rank and node it refused, and the launcher
-# carries that line back verbatim: ``rank 1 (node): InsufficientMemoryError``.
-_MEMORY_FAILURE_RANK = re.compile(
-    r"rank (\d+) \(([^)]+)\):\s*InsufficientMemoryError"
-)
+# RankFailure.error_type values (see cluster/launch.py, set from
+# type(exc).__name__ where a rank marker is written) that mean "this rank
+# failed for lack of memory, evicting a competing local model might let a
+# retry succeed." An allow-list rather than a single comparison: extend this
+# set, not the matching logic, when a new memory-shaped failure type needs
+# the same recovery. See docs/cluster-competing-model-eviction-redesign.md.
+_MEMORY_FAILURE_TYPES = frozenset({"InsufficientMemoryError"})
+
+
+def _auto_evict_enabled() -> bool:
+    """Whether ClusterSettings.auto_evict_competing_local_models is on.
+
+    Fails closed (False) on any error reading settings — notably,
+    get_settings() itself raises when init_settings() was never called
+    (worker-only installs, some test apps). That must never propagate out
+    of the DistributedLaunchError handler this gates and replace the
+    intended 503 with an unrelated 500 (see
+    docs/cluster-competing-model-eviction-redesign.md §4 addendum — a real
+    bug caught while implementing this, not a hypothetical).
+    """
+    try:
+        from omlx.settings import get_settings
+
+        return get_settings().cluster.auto_evict_competing_local_models
+    except Exception:  # noqa: BLE001 - fail closed, never mask the failure
+        return False
 
 
 def _memory_squeezed_hosts(
-    deployment: ClusterDeployment, detail: str
+    deployment: ClusterDeployment, exc: DistributedLaunchError
 ) -> list[ClusterHost]:
-    """Hosts implicated in a memory-attributable activation failure."""
+    """Hosts implicated in a memory-attributable activation failure.
 
-    if "InsufficientMemoryError" not in detail:
+    Reads `exc.rank_failures` — real fields populated from each rank's own
+    marker — instead of parsing the formatted error string. A failure with
+    no rank_failures at all, or none whose error_type is in
+    _MEMORY_FAILURE_TYPES, returns an empty list: this deliberately does NOT
+    fall back to "evict everywhere," unlike the mechanism this replaces —
+    guessing blast radius on a destructive action is the same class of
+    fragility as the regex it replaces.
+    """
+    memory_failures = [
+        f for f in exc.rank_failures if f.error_type in _MEMORY_FAILURE_TYPES
+    ]
+    if not memory_failures:
         return []
     by_node_id = {host.node_id: host for host in deployment.hosts}
     implicated: dict[str, ClusterHost] = {}
-    for match in _MEMORY_FAILURE_RANK.finditer(detail):
-        rank, node_id = int(match.group(1)), match.group(2)
-        host = by_node_id.get(node_id)
-        if host is None and 0 <= rank < len(deployment.hosts):
-            host = deployment.hosts[rank]
+    for failure in memory_failures:
+        host = by_node_id.get(failure.node_id)
         if host is not None:
             implicated[host.node_id] = host
-    # A memory-shaped failure that names no rank still deserves recovery on
-    # every node rather than none.
-    return list(implicated.values()) or list(deployment.hosts)
+    return list(implicated.values())
 
 
 async def _evict_local_models_on_host(
@@ -4437,7 +4464,7 @@ async def _evict_local_models_on_host(
 
 
 async def _evict_competing_local_models(
-    deployment: ClusterDeployment | None, detail: str
+    deployment: ClusterDeployment | None, exc: DistributedLaunchError
 ) -> str:
     """After a memory-attributed launch failure, free the implicated Macs.
 
@@ -4448,11 +4475,15 @@ async def _evict_competing_local_models(
     against the memory the plan was admitted for. This never raises and never
     replaces the original failure — it appends what was freed so the operator
     knows a retry is now worth making. Pinned models are left loaded.
+
+    Only called when ClusterSettings.auto_evict_competing_local_models is
+    enabled — see the call site in activate_cluster_deployment.
     """
 
+    detail = str(exc)
     if deployment is None:
         return detail
-    hosts = _memory_squeezed_hosts(deployment, detail)
+    hosts = _memory_squeezed_hosts(deployment, exc)
     if not hosts:
         return detail
     reason = (
@@ -4466,8 +4497,8 @@ async def _evict_competing_local_models(
     for host in hosts:
         try:
             outcome = await _evict_local_models_on_host(host, reason)
-        except Exception as exc:  # noqa: BLE001 - recovery must not mask
-            problems.append(f"{host.node_id}: {exc}")
+        except Exception as exc2:  # noqa: BLE001 - recovery must not mask
+            problems.append(f"{host.node_id}: {exc2}")
             continue
         freed.extend(
             f"{mid} on {host.node_id}" for mid in outcome.get("evicted") or []
@@ -4507,14 +4538,16 @@ async def _evict_competing_local_models(
             "No competing local models were loaded on the implicated node(s)."
         )
     if freed or pending or pinned:
-        _record_cluster_incident(
+        await asyncio.to_thread(
+            _record_cluster_incident,
             Severity.WARN,
             "activation_memory_recovery",
             " ".join(notes),
             deployment_id=deployment.deployment_id,
         )
     if problems:
-        _record_cluster_incident(
+        await asyncio.to_thread(
+            _record_cluster_incident,
             Severity.WARN,
             "activation_memory_recovery_failed",
             "Local-model eviction after the memory failure did not complete: "
@@ -4792,17 +4825,23 @@ async def _activate(request: ClusterDeploymentRequest) -> dict[str, Any]:
             detail,
             deployment_id=deployment.deployment_id if deployment else None,
         )
-        try:
-            detail = await _evict_competing_local_models(deployment, detail)
-        except Exception:  # noqa: BLE001 - recovery must never mask the failure
-            await asyncio.to_thread(
-                _record_cluster_incident,
-                Severity.WARN,
-                "activation_memory_recovery_failed",
-                "Local-model eviction after the memory failure crashed; the "
-                "implicated nodes may still hold a competing model.",
-                deployment_id=deployment.deployment_id if deployment else None,
-            )
+        # Opt-in (ClusterSettings.auto_evict_competing_local_models, off by
+        # default) — a server-initiated unload of a model the user loaded
+        # locally on a peer Mac is a product decision the user turns on, not
+        # a default behavior. See
+        # docs/cluster-competing-model-eviction-redesign.md.
+        if _auto_evict_enabled():
+            try:
+                detail = await _evict_competing_local_models(deployment, exc)
+            except Exception:  # noqa: BLE001 - recovery must never mask the failure
+                await asyncio.to_thread(
+                    _record_cluster_incident,
+                    Severity.WARN,
+                    "activation_memory_recovery_failed",
+                    "Local-model eviction after the memory failure crashed; "
+                    "the implicated nodes may still hold a competing model.",
+                    deployment_id=deployment.deployment_id if deployment else None,
+                )
         raise HTTPException(status_code=503, detail=detail) from exc
     except ModelNotFoundError as exc:
         await asyncio.to_thread(
