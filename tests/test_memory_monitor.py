@@ -366,6 +366,68 @@ class TestEstimatePrefillPeakBytes:
         assert peak == expected_sdpa + expected_kv
         assert expected_sdpa > 8 * 2048 * 256 * 2
 
+    def test_tiled_prefill_tile_override_bounds_transient(self):
+        """B3/3.2: once TurboQuant's bounded-tile route is registered on
+        this instance, the guard must charge the tile transient (query_block
+        x kv_tile), not the full O(L^2) unfused score matrix."""
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        m.register_tiled_prefill_tile(query_block=256, kv_tile=16384, min_kv_len=8192)
+        query_tokens, kv_len = 2048, 32768
+        actual = m._estimate_sdpa_activation_bytes(query_tokens, kv_len)
+        out = self._expected_output_sdpa(8, query_tokens, 256)
+        expected_tile_scores = 8 * 256 * 16384 * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
+        assert actual == out + expected_tile_scores
+        # Sanity: must be far cheaper than the untiled fallback would charge.
+        assert actual < self._expected_fallback_sdpa(8, query_tokens, kv_len, 256)
+
+    def test_tiled_prefill_tile_override_caps_query_at_query_block(self):
+        """The kernel itself tiles the query axis (TurboQuant blocks queries
+        at 256 regardless of the chunk's true query_tokens) -- charging the
+        raw query_tokens here would silently re-introduce an O(query_tokens)
+        over-charge on large chunks and defeat the point of registering the
+        tile at all."""
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        m.register_tiled_prefill_tile(query_block=256, kv_tile=16384, min_kv_len=8192)
+        small = m._estimate_sdpa_activation_bytes(256, 65536)
+        large = m._estimate_sdpa_activation_bytes(8192, 65536)
+        out_small = self._expected_output_sdpa(8, 256, 256)
+        out_large = self._expected_output_sdpa(8, 8192, 256)
+        tile_scores = 8 * 256 * 16384 * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
+        assert small == out_small + tile_scores
+        assert large == out_large + tile_scores
+
+    def test_tiled_prefill_tile_override_respects_min_kv_len_gate(self):
+        """Below the kernel's own route-gate threshold, the real call takes
+        the unfused fallback -- charging the cheap tile estimate there would
+        under-count admission for a call that never actually tiles."""
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        m.register_tiled_prefill_tile(query_block=256, kv_tile=16384, min_kv_len=8192)
+        actual = m._estimate_sdpa_activation_bytes(2048, 4096)
+        assert actual == self._expected_fallback_sdpa(8, 2048, 4096, 256)
+
+    def test_clear_tiled_prefill_tile_restores_fallback(self):
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        m.register_tiled_prefill_tile(query_block=256, kv_tile=16384, min_kv_len=8192)
+        m.clear_tiled_prefill_tile()
+        actual = m._estimate_sdpa_activation_bytes(2048, 32768)
+        assert actual == self._expected_fallback_sdpa(8, 2048, 32768, 256)
+
+    def test_tiled_prefill_tile_override_is_per_instance_not_global(self):
+        """Core safety property (§B3/3.2 design consult): registering the
+        tile on one model's monitor must NOT leak into a second, concurrently
+        -resident model's monitor sharing the same head_dim -- engine_pool.py
+        keeps two models resident during a swap, and a global registration
+        would silently under-charge the OTHER model's genuinely-unfused
+        prefill, an admission under-count (OOM risk), not just a missed
+        optimization."""
+        turboquant_model = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        turboquant_model.register_tiled_prefill_tile(
+            query_block=256, kv_tile=16384, min_kv_len=8192
+        )
+        other_model = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        actual = other_model._estimate_sdpa_activation_bytes(2048, 32768)
+        assert actual == self._expected_fallback_sdpa(8, 2048, 32768, 256)
+
     def test_sdpa_fallback_scores_track_compute_dtype(self):
         # The unfused score matrix is materialized at the model's compute
         # dtype, not fp32 and not the (possibly fractional TurboQuant) KV width.
