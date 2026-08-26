@@ -118,6 +118,7 @@ from .transport import (
     resolve_link_addresses,
     verify_link_reachability,
 )
+from .vpn import detect_vpn, full_tunnel_warning
 from .worker_bundle import (
     build_cuda_join_command,
     cuda_bootstrap_program,
@@ -372,6 +373,37 @@ def _record_cluster_incident(
         )
     except Exception:  # noqa: BLE001 - logging must never outrank the failure
         return
+
+
+# A full-tunnel VPN is a standing condition, not an event: one INFO incident
+# the first time each host shows it, not one per autoconfigure poll. In-memory
+# is enough — a server restart re-announcing a still-hungry VPN is correct.
+_VPN_FULL_TUNNEL_SEEN: set[str] = set()
+_VPN_FULL_TUNNEL_LOCK = threading.Lock()
+
+
+def _note_full_tunnel_vpns(fabric: dict[str, Any]) -> None:
+    """Record the C4 pre-warning for each newly seen full-tunnel VPN host.
+
+    Detection only warns and steers address selection; the incident exists so
+    the condition survives page reloads next to the banner. Severity is INFO
+    because the selection below is expected to route around the tunnel.
+    """
+
+    for entry in fabric.get("hosts") or ():
+        vpn = entry.get("vpn") or {}
+        if not vpn.get("full_tunnel"):
+            continue
+        host = str(entry.get("host") or "")
+        with _VPN_FULL_TUNNEL_LOCK:
+            if host in _VPN_FULL_TUNNEL_SEEN:
+                continue
+            _VPN_FULL_TUNNEL_SEEN.add(host)
+        _record_cluster_incident(
+            Severity.INFO,
+            "vpn_full_tunnel",
+            full_tunnel_warning(host, str(vpn.get("client") or "")),
+        )
 
 
 class ClusterPlanNodeRequest(BaseModel):
@@ -937,6 +969,12 @@ def _resolve_fabric(
     """
 
     interfaces = {host: probe_host_interfaces(host) for host in hosts}
+    # VPN posture rides along on the reading already in hand. It is a warning
+    # and a selection hint only — a clean addressing read costs no extra SSH,
+    # and nothing here promotes the link past what the probes below prove.
+    vpn_profiles = {
+        host: detect_vpn(host, interfaces=interfaces[host]) for host in hosts
+    }
     verify = verifier or verify_link_reachability
     verified_links: dict[
         tuple[tuple[str, str, str], ...], tuple[bool, str]
@@ -1023,6 +1061,7 @@ def _resolve_fabric(
                 "ips": [link.source.address] if link.source else [],
                 "interface": link.source.interface if link.source else "",
                 "rdma": list(matrix.rows[index]) if backend != "ring" else [],
+                "vpn": vpn_profiles[host].to_dict(),
             }
             for index, (host, link) in enumerate(zip(hosts, links))
         ],
@@ -1285,6 +1324,9 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 warnings.append(f"Address discovery failed: {fabric_error}")
     activation_hosts = [host.model_dump() for host in ordered_hosts]
     if fabric is not None:
+        # B1 consumer of the C4 detection: the pre-warning must survive page
+        # reloads, so the first sighting per host becomes an INFO incident.
+        _note_full_tunnel_vpns(fabric)
         backend, backend_reason = fabric["backend"], fabric["backend_reason"]
         if fabric["ok"]:
             for host, discovered in zip(activation_hosts, fabric["hosts"]):

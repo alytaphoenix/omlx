@@ -235,6 +235,10 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # C2-C5) that read the ladder state and gate on fabric verification.
         ("readiness.py", "is_fabric_verified"),
         ("readiness.py", "link_ladder_state"),
+        # VPN full-tunnel remedy copy (VPN detection, C4), exposed ahead of
+        # the Fabric Doctor UI panel that will surface it alongside the
+        # pre-warning banner already wired into _note_full_tunnel_vpns.
+        ("vpn.py", "exclusion_instruction"),
     }
 
     sources = {

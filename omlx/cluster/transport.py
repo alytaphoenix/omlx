@@ -15,7 +15,7 @@ import shlex
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
@@ -934,9 +934,32 @@ def configure_link(hosts: list[str] | tuple[str, ...]) -> LinkStatus:
         raise LinkSetupError(str(exc)) from exc
 
     # Reuse the subnet already present on either endpoint. Otherwise choose a
-    # private point-to-point range. Rank order makes retries deterministic.
+    # collision-checked private range, preferring one a full-tunnel VPN is
+    # likely to exclude. Rank order makes retries deterministic.
     existing = next((value for value in current_ips.values() if value), None)
-    network = ipaddress.ip_network(f"{existing or '10.0.1.1'}/24", strict=False)
+    if existing:
+        network = ipaddress.ip_network(f"{existing}/24", strict=False)
+    else:
+        # Local import: vpn.py imports this module for its probing plumbing.
+        # Its reads only enrich this selection — every route a utun claims is
+        # hostile, and a range a VPN provably excludes ranks first. The bound
+        # connect in assess_link below stays the authority on the result.
+        from .vpn import detect_vpn, hostile_networks
+
+        probed: dict[str, HostInterfaces] = {}
+        for host in hosts:
+            with suppress(RuntimeError, OSError, subprocess.SubprocessError):
+                probed[host] = probe_host_interfaces(host)
+        preferred = tuple(
+            excluded
+            for host in hosts
+            for excluded in detect_vpn(
+                host, interfaces=probed.get(host)
+            ).exclusion_networks
+        )
+        network = choose_fabric_subnet(
+            hostile_networks(hosts, interfaces=probed), preferred=preferred
+        )
     for rank, host in enumerate(hosts):
         if current_ips[host]:
             continue
@@ -1156,6 +1179,82 @@ _UNROUTABLE_NETWORKS = (
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("169.254.0.0/16"),
 )
+
+# Point-to-point fabric subnet candidates, in preference order. 172.16.0.0/12
+# leads because corporate full-tunnel VPNs (e.g. Cloudflare WARP) commonly
+# *exclude* it from the tunnel, so a fabric addressed here survives a VPN that
+# would otherwise swallow a 10.x link — the real incident that motivated this:
+# an auto-assigned 10.0.1.x link was silently eaten by WARP while ping/SSH over
+# the LAN kept working. 192.168.0.0/16 is deliberately absent (usual home LAN).
+# Each candidate is a /24; the two hosts take .1 and .2.
+_FABRIC_SUBNET_CANDIDATES = tuple(
+    ipaddress.ip_network(f"172.16.{block}.0/24") for block in range(99, 116)
+) + tuple(ipaddress.ip_network(f"10.{block}.99.0/24") for block in range(90, 100))
+
+
+def choose_fabric_subnet(
+    occupied: Iterable[ipaddress.IPv4Network],
+    *,
+    candidates: Sequence[ipaddress.IPv4Network] = _FABRIC_SUBNET_CANDIDATES,
+    preferred: Sequence[ipaddress.IPv4Network] = (),
+) -> ipaddress.IPv4Network:
+    """Pick a point-to-point fabric /24 that collides with nothing in use.
+
+    ``occupied`` is every network the two Macs already carry or route (their
+    interface addresses, and ideally their routing tables). A candidate that
+    overlaps any of them is skipped. The preference order puts VPN-excludable
+    ranges first so the fabric survives a full-tunnel VPN; the empirical
+    reachability check after addressing (``assess_link``) remains the authority
+    on whether the chosen link actually carries traffic.
+
+    ``preferred`` are ranges a detected VPN provably excludes from its tunnel
+    (``vpn.VPNProfile.exclusions``): candidates contained in one rank before
+    the rest of the static order — the incident's 172.16.99.x trick,
+    systematized. A wrong exclusion read cannot poison the choice, because a
+    preferred candidate still has to pass the same collision check, and an
+    empty ``preferred`` leaves today's order untouched.
+    """
+
+    occupied = tuple(occupied)
+    ordered = tuple(candidates)
+    if preferred:
+        preferred = tuple(preferred)
+
+        def excluded(candidate: ipaddress.IPv4Network) -> bool:
+            return any(candidate.subnet_of(net) for net in preferred)
+
+        ordered = tuple(
+            candidate for candidate in ordered if excluded(candidate)
+        ) + tuple(candidate for candidate in ordered if not excluded(candidate))
+    for candidate in ordered:
+        if not any(candidate.overlaps(net) for net in occupied):
+            return candidate
+    raise LinkSetupError(
+        "Could not find a free private subnet for the Thunderbolt link — every "
+        "candidate range already overlaps a network in use on one of the Macs."
+    )
+
+
+def _occupied_networks(
+    hosts: Iterable[str],
+) -> tuple[ipaddress.IPv4Network, ...]:
+    """Every routable network the given hosts already carry on any interface.
+
+    Used to keep an auto-chosen fabric subnet from colliding with a real LAN or
+    VPN range on either Mac. Probe failures are non-fatal: a subnet we cannot
+    prove free is still better than the old hardcoded default.
+    """
+
+    nets: set[ipaddress.IPv4Network] = set()
+    for host in hosts:
+        try:
+            interfaces = probe_host_interfaces(host)
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            continue
+        for addr in interfaces.addresses:
+            with suppress(ValueError):
+                nets.add(addr.network)
+    return tuple(nets)
 
 # Which shared link to prefer when hosts have several. RDMA over Thunderbolt
 # beats plain Thunderbolt beats whatever else routes.
