@@ -256,25 +256,64 @@ class DistributedBatchedEngine(BatchedEngine):
         )
 
     def _validate_model_settings(self) -> None:
+        """Reject single-node-only feature patches this deployment cannot run.
+
+        These settings gate monkey-patches that ``omlx.patches`` applies
+        in-process to the local engine stack (``omlx/utils/model_loading.py``
+        et al.). A distributed deployment never runs that process: each rank
+        is a private, pinned ``mlx_lm.server`` subprocess
+        (``omlx/cluster/inference_worker.py``) that does not import
+        ``omlx.patches`` at all, so any of these flags would silently have no
+        effect on the ranks actually doing the work.
+
+        ``mtp_enabled`` is the one exception, and only for a pure
+        tensor-parallel deployment (``tensor_parallel_size == world_size``,
+        i.e. no pipeline stages): the worker process opts into the same MTP
+        patch stack before loading its shard (see
+        ``inference_worker.run_worker``), and pure TP already runs mlx-lm's
+        stock synchronized sampler with identical logits on every rank, which
+        is the invariant MTP's replicated draft/verify cycle rides. A
+        pipeline-parallel deployment keeps the rejection: worker ranks there
+        do not compute full logits and cannot independently verify a draft
+        the way this pass assumes.
+        """
         settings = self._model_settings
         if settings is None:
             return
+        pure_tensor_parallel = (
+            self.deployment.tensor_parallel_size == self.deployment.world_size
+        )
         incompatible = [
             name
             for name in (
                 "dflash_enabled",
                 "specprefill_enabled",
-                "mtp_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
             )
             if bool(getattr(settings, name, False))
         ]
+        mtp_requested = bool(getattr(settings, "mtp_enabled", False))
+        if mtp_requested and not pure_tensor_parallel:
+            incompatible.append("mtp_enabled")
         if incompatible:
-            raise ValueError(
+            detail = (
                 "distributed inference cannot be combined with "
                 + ", ".join(incompatible)
+                + ": these gate patches to the local single-node engine "
+                "stack (omlx.patches), applied in-process before mlx_lm.load; "
+                "each distributed rank runs a private stock mlx_lm.server "
+                "subprocess that never imports that stack, so the setting "
+                "would have no effect there."
             )
+            if "mtp_enabled" in incompatible:
+                detail += (
+                    " mtp_enabled is supported for pure tensor-parallel "
+                    "deployments (tensor_parallel_size == world_size); this "
+                    "deployment is pipeline-parallel, where worker ranks lack "
+                    "the full logits MTP's draft verification needs."
+                )
+            raise ValueError(detail)
 
     async def stop(self) -> None:
         client, self._client = self._client, None

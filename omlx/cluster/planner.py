@@ -528,6 +528,28 @@ def _tensor_layer_index(name: str) -> int | None:
     return None
 
 
+def _is_mtp_head_tensor(name: str) -> bool:
+    """Whether ``name`` belongs to a native MTP head, not the decoder stack.
+
+    MTP heads (Qwen3.5/3.6's ``mtp.layers.0.*``, DeepSeek-V4/GLM's
+    ``model.layers.<num_hidden_layers>.*``) are attached by
+    ``omlx.patches.mlx_lm_mtp`` as a module separate from the transformer
+    decoder stack, and mlx-lm's native TP ``.shard()`` never visits it (it
+    walks the model's own known layer list, which does not include an
+    attribute our patch added) — so it is always replicated on every rank,
+    never sharded. Its tensor names, though, collide with the decoder-layer
+    naming pattern one of two ways depending on architecture: Qwen-style
+    head layers are locally numbered from 0, landing on real decoder layer 0
+    (inflating that layer's per-rank budget and, under TP, silently dividing
+    replicated head bytes by the TP degree); DeepSeek/GLM-style heads sit at
+    a phantom layer index >= ``num_hidden_layers``. Both must be excluded
+    from ``layer_weight_bytes`` bucketing and instead counted separately as
+    a replicated ``fixed_weight_bytes`` addend — see ``inspect_safetensors_layout``.
+    """
+
+    return ".mtp." in name or name.startswith("mtp.")
+
+
 def _text_only_excluded_tensor(name: str) -> bool:
     """A tensor a text-only distributed deployment of a VLM never loads.
 
@@ -543,7 +565,7 @@ def _text_only_excluded_tensor(name: str) -> bool:
 
     if name.startswith(_VLM_VISION_PREFIXES):
         return True
-    return ".mtp." in name or name.startswith("mtp.")
+    return _is_mtp_head_tensor(name)
 
 
 def _activation_bytes_per_token(model_path: Path) -> int:
@@ -1130,9 +1152,30 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     # vision tower and MTP heads it will not load from the layer/fixed sizing.
     from omlx.model_discovery import _has_vision_subconfig
 
-    text_only_vlm = _has_vision_subconfig(_model_config(root))
+    model_config = _model_config(root)
+    text_only_vlm = _has_vision_subconfig(model_config)
+    # DeepSeek-V4/GLM-style checkpoints store their MTP head on disk as
+    # ordinary "model.layers.<n>.*" tensors at index >= num_hidden_layers
+    # (sanitize renames them to "mtp.*" only after mlx_lm.load() reads the
+    # file, too late for this header-only inspection to see) -- so unlike
+    # Qwen3.5/3.6/gemma4/nemotron_h, which already save MTP weights on disk
+    # under an "mtp."-prefixed name matching _is_mtp_head_tensor, these two
+    # architectures are only identifiable by layer index. declared_depth
+    # doubles as that boundary.
+    declared_depth = _config_int(model_config, "num_hidden_layers", 0)
 
     fixed_bytes = 0
+    # MTP head tensors are validated and counted like any other tensor, but
+    # tracked apart from layer_sizes/fixed_bytes so a non-VLM MTP checkpoint's
+    # head bytes are never divided by the per-layer TP split (Qwen-style
+    # local layer-0 numbering collides with the real decoder layer 0) or
+    # silently dropped as a phantom deep layer (DeepSeek/GLM-style numbering
+    # past num_hidden_layers). Folded into fixed_bytes -- replicated on every
+    # rank, matching how the head is actually loaded (mlx-lm's native TP
+    # .shard() never visits it, see _is_mtp_head_tensor) -- once every tensor
+    # has been walked, so this is exact from the safetensors headers, not a
+    # guess.
+    mtp_bytes = 0
     layer_sizes: dict[int, int] = {}
     tensor_names: set[str] = set()
     tensor_count = 0
@@ -1167,7 +1210,25 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             # vision/MTP families a text-only VLM deployment never loads.
             if text_only_vlm and _text_only_excluded_tensor(name):
                 continue
+            if _is_mtp_head_tensor(name):
+                mtp_bytes += tensor_bytes
+                tensor_count += 1
+                continue
             layer_index = _tensor_layer_index(name)
+            if (
+                layer_index is not None
+                and declared_depth > 0
+                and layer_index >= declared_depth
+            ):
+                # DeepSeek-V4/GLM-style on-disk MTP head: an ordinary-looking
+                # "model.layers.<n>.*" tensor whose index sits past the
+                # declared decoder depth (see the declared_depth comment
+                # above). Not visible to _is_mtp_head_tensor before sanitize
+                # renames it, so the layer-index boundary is the only signal
+                # available from headers alone.
+                mtp_bytes += tensor_bytes
+                tensor_count += 1
+                continue
             if layer_index is None:
                 fixed_bytes += tensor_bytes
             else:
@@ -1187,14 +1248,12 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         raise PlanningError(
             "could not identify transformer layers in safetensors names"
         )
-    # Checkpoints may carry layers past the declared depth: DeepSeek/GLM-style
-    # multi-token-prediction heads live at index num_hidden_layers and up, and
-    # the runtime model never instantiates them. Counting them as decoder
-    # layers put a stage boundary over weights that do not exist at runtime,
-    # and the last stage failed activation with end_layer beyond the model.
-    declared_depth = _config_int(
-        _model_config(root), "num_hidden_layers", 0
-    )
+    # Belt-and-suspenders fallback: the loop above already routes MTP-head
+    # tensors past declared_depth into mtp_bytes by index, so layer_sizes
+    # should never actually reach here with an index >= declared_depth.
+    # Left in place in case some other, non-MTP checkpoint shape trips it —
+    # dropping those (instead of misattributing a stage boundary to weights
+    # that do not exist at runtime) is what this originally guarded against.
     if declared_depth > 0 and max(layer_sizes) >= declared_depth:
         trimmed = {
             index: size
@@ -1213,6 +1272,14 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         raise PlanningError(
             "safetensors layer indices must be contiguous and start at zero"
         )
+    # Replicated on every rank (mlx-lm's native TP .shard() never visits the
+    # MTP head), so it belongs in fixed_weight_bytes, not divided across a
+    # layer's per-rank TP split. Added unconditionally, even when this
+    # checkpoint's deployment will run with mtp_enabled=False: it only widens
+    # the approved budget, and _validate_measured_weight_bytes
+    # (inference_worker.py) fails closed on measured > approved, never on
+    # slack headroom.
+    fixed_bytes += mtp_bytes
     return ModelLayout(
         source=str(root.resolve()),
         fixed_weight_bytes=fixed_bytes,
