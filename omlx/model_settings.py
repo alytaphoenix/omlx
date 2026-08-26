@@ -163,6 +163,12 @@ class ModelSettings:
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
+        dflash2_enabled: Enable DFlash 2 speculative decoding (independent engine, does
+            not use the dflash-mlx package — see omlx/engine/dflash2.py). Mutually
+            exclusive with dflash_enabled, mtp_enabled, and vlm_mtp_enabled.
+        dflash2_draft_model: Path/repo for the DFlash 2 draft checkpoint (e.g.
+            z-lab/Qwen3.8-27B-DFlash2). Block size is read from the checkpoint's
+            dflash_config.block_size; there is no override setting.
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
@@ -288,6 +294,13 @@ class ModelSettings:
     dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
+    # DFlash 2 (independent engine — see omlx/engine/dflash2.py). Does not use
+    # the dflash-mlx package, so none of the dflash_* runtime-tuning /
+    # prefix-cache knobs above apply; block size is read from the draft
+    # checkpoint's dflash_config.block_size.
+    dflash2_enabled: bool = False
+    dflash2_draft_model: Optional[str] = None  # Path/repo for DFlash 2 draft checkpoint
+
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
     # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
@@ -349,12 +362,29 @@ class ModelSettings:
                 "mtp_enabled and dflash_enabled cannot both be True; choose one "
                 "speculative-decoding path per model"
             )
+        # DFlash 2 is a second, independent speculative-decoding path (see
+        # omlx/engine/dflash2.py) — same "one speculative path per model"
+        # rule as dflash_enabled/mtp_enabled above. No legacy settings.json
+        # can already contain dflash2_enabled=True, so unlike vlm_mtp's
+        # resolve_vlm_mtp_conflicts() there is no load-time conflict
+        # resolver needed here; raising is safe.
+        if self.dflash_enabled and self.dflash2_enabled:
+            raise ValueError(
+                "dflash_enabled and dflash2_enabled cannot both be True; choose one "
+                "DFlash version"
+            )
+        if self.mtp_enabled and self.dflash2_enabled:
+            raise ValueError(
+                "mtp_enabled and dflash2_enabled cannot both be True; choose one "
+                "speculative-decoding path per model"
+            )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path
         # or with TurboQuant (which mutates the same cache objects).
         if self.vlm_mtp_enabled:
             conflicts = [
                 ("dflash_enabled", self.dflash_enabled),
+                ("dflash2_enabled", self.dflash2_enabled),
                 ("specprefill_enabled", self.specprefill_enabled),
                 ("mtp_enabled", self.mtp_enabled),
                 ("turboquant_kv_enabled", self.turboquant_kv_enabled),

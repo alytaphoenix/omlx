@@ -2047,6 +2047,28 @@ class TestUnresolvableSchedulerWarning:
         ]
         assert warnings == []
 
+    def test_no_warning_for_dflash2_with_failed_guard(self, enforcer, caplog):
+        """DFlash2Engine never has a scheduler or a _fallback_engine attr at
+        all (it has no fallback mode) -- landing in the unresolved-scheduler
+        branch means its _prefill_guard failed to construct at load time,
+        which start() already logs. This must not also fire the
+        "could not resolve scheduler" wrapper-chain warning."""
+
+        class DFlash2Engine:
+            _loaded = True
+            _prefill_guard = None
+
+        entry = _make_entry("model-dflash2", engine=DFlash2Engine())
+        enforcer._engine_pool._entries = {"model-dflash2": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
+
 
 class TestStoreCacheCapWalk:
     """Tests for _walk_store_cache_caps — store-cache gate adjustment (#1383)."""

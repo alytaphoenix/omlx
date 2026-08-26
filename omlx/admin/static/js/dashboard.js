@@ -95,6 +95,8 @@
         'dflash_draft_sink_size',
         'dflash_block_size',
         'dflash_verify_mode',
+        'dflash2_enabled',
+        'dflash2_draft_model',
         'mtp_enabled',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
@@ -119,6 +121,10 @@
     const DFLASH_DRAFTER_CONFIG_MODEL_TYPES = new Set([
         'muse_glimmer_assistant',
     ]);
+    // DFlash 2 checkpoints are suffixed "-DFlash2" (e.g.
+    // z-lab/Qwen3.8-27B-DFlash2), which the DFlash 1 "-DFlash" name
+    // heuristic below does not match (no separator after "dflash").
+    const DFLASH2_NAME_RE = /(^|[-_/\s])dflash2($|[-_/\s])/i;
     const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
@@ -8020,6 +8026,10 @@
                 return /(^|[-_/\s])dflash[0-9]*($|[-_/\s])/i.test(this.draftModelSearchText(model));
             },
 
+            isDflash2DraftModel(model) {
+                return DFLASH2_NAME_RE.test(this.draftModelSearchText(model));
+            },
+
             isVlmMtpDraftModel(model) {
                 const configType = String(model?.config_model_type || '').toLowerCase();
                 if (configType) {
@@ -8030,6 +8040,7 @@
 
             isSpecPrefillDraftModel(model) {
                 return !this.isDflashDraftModel(model)
+                    && !this.isDflash2DraftModel(model)
                     && !this.isVlmMtpDraftModel(model);
             },
 
@@ -8047,6 +8058,10 @@
 
             dflashDraftModelCandidates() {
                 return this.draftModelCandidates((model) => this.isDflashDraftModel(model));
+            },
+
+            dflash2DraftModelCandidates() {
+                return this.draftModelCandidates((model) => this.isDflash2DraftModel(model));
             },
 
             vlmMtpDraftModelCandidates() {
@@ -8199,6 +8214,8 @@
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
+                    dflash2_enabled: s.dflash2_enabled || false,
+                    dflash2_draft_model: s.dflash2_draft_model || '',
                     mtp_enabled: s.mtp_enabled || false,
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
@@ -9413,6 +9430,10 @@
                                 dflash_verify_mode: this.modelSettings.dflash_enabled
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
+                                dflash2_enabled: !!this.modelSettings.dflash2_enabled,
+                                dflash2_draft_model: this.modelSettings.dflash2_enabled
+                                    ? (this.modelSettings.dflash2_draft_model || null)
+                                    : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
@@ -9477,6 +9498,8 @@
                                     dflash_draft_sink_size: null,
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
+                                    dflash2_enabled: false,
+                                    dflash2_draft_model: null,
                                     mtp_enabled: false,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
@@ -9620,6 +9643,8 @@
                         this.modelSettings.dflash_draft_sink_size = 0;
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
+                        this.modelSettings.dflash2_enabled = false;
+                        this.modelSettings.dflash2_draft_model = null;
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {

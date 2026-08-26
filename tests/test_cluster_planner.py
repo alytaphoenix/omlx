@@ -884,5 +884,3 @@ def test_qwen3_8_27b_shaped_config_produces_the_confirmed_48_16_split():
     tup = _kv_bytes_per_token_by_layer(config, 64)
     assert sum(1 for v in tup if v) == 16
     assert sum(1 for v in tup if not v) == 48
-
-

@@ -1806,16 +1806,26 @@ class EnginePool:
     async def _unload_other_dflash_engines(self, model_id: str) -> None:
         """Unload other idle DFlash engines before starting a new one.
 
-        dflash-mlx installs target hooks on shared Python classes and owns a
-        process-global runtime cache manager, so multiple loaded DFlash engines
-        can leak state across model switches.
+        DFlashEngine (dflash-mlx) installs target hooks on shared Python
+        classes and owns a process-global runtime cache manager, so multiple
+        loaded DFlashEngine instances can leak state across model switches.
+
+        DFlash2Engine doesn't use dflash-mlx, but the same reasoning applies
+        for a different reason: it stores per-target-model hook state
+        (``model._hidden_states``) directly on the loaded target model
+        instance, and while a request that needs GDN-state capture is
+        in-flight it monkey-patches ``GatedDeltaNet.__call__`` process-wide
+        (guarded by a module-level RLock — safe, but effectively serializes
+        such requests across every loaded DFlash2Engine). Both engine types
+        are single-stream — one in-flight request per loaded instance — so
+        treat them the same way here.
         """
         victims: list[str] = []
         blocked: list[str] = []
         for mid, e in self._entries.items():
             if mid == model_id or e.engine is None:
                 continue
-            if type(e.engine).__name__ != "DFlashEngine":
+            if type(e.engine).__name__ not in ("DFlashEngine", "DFlash2Engine"):
                 continue
             if e.is_loading or e.in_use > 0:
                 blocked.append(mid)
@@ -2600,6 +2610,38 @@ class EnginePool:
                             f"Falling back to default engine."
                         )
 
+                dflash2_enabled = getattr(model_settings, "dflash2_enabled", False)
+                dflash2_draft = getattr(model_settings, "dflash2_draft_model", None)
+                if (
+                    engine is None
+                    and dflash2_enabled
+                    and dflash2_draft
+                    and self._entry_is_diffusion_model(entry)
+                ):
+                    logger.warning(
+                        "DFlash 2 is not supported for diffusion models; "
+                        "loading %s with its native VLM engine",
+                        model_id,
+                    )
+                elif engine is None and dflash2_enabled and dflash2_draft:
+                    try:
+                        from .engine.dflash2 import DFlash2Engine
+
+                        engine = DFlash2Engine(
+                            model_name=entry.model_path,
+                            draft_model_path=dflash2_draft,
+                            model_settings=model_settings,
+                            scheduler_config=self._scheduler_config,
+                        )
+                        logger.info(
+                            f"DFlash 2 enabled for {model_id}, draft={dflash2_draft}"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"DFlash 2 init failed for {model_id}: {e}. "
+                            f"Falling back to default engine."
+                        )
+
             # Per-model trust_remote_code (security opt-in, issue #926).
             # When unset, defaults to False -- repos with custom modeling_*.py
             # will fail to load until the user explicitly toggles this on
@@ -2625,9 +2667,21 @@ class EnginePool:
                 if deployment is not None:
                     from .engine.distributed import DistributedBatchedEngine
 
+                    # mtp_enabled/mtp_num_draft_tokens are threaded onto the
+                    # deployment the same late way trust_remote_code is: the
+                    # ClusterDeployment plan is built (and persisted) before
+                    # the per-request model_settings is known, so launch.py's
+                    # argv builder needs these copied over here. Safe to copy
+                    # unconditionally even for a pipeline-parallel plan --
+                    # DistributedBatchedEngine._validate_model_settings raises
+                    # before the rank processes are ever launched.
                     deployment = replace(
                         deployment,
                         trust_remote_code=trc,
+                        mtp_enabled=bool(getattr(model_settings, "mtp_enabled", False)),
+                        mtp_num_draft_tokens=getattr(
+                            model_settings, "mtp_num_draft_tokens", None
+                        ),
                     )
                     engine = DistributedBatchedEngine(
                         deployment,
@@ -2681,8 +2735,9 @@ class EnginePool:
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
 
-            _is_dflash_engine = (
-                engine is not None and type(engine).__name__ == "DFlashEngine"
+            _is_dflash_engine = engine is not None and type(engine).__name__ in (
+                "DFlashEngine",
+                "DFlash2Engine",
             )
             if _is_dflash_engine:
                 await self._unload_other_dflash_engines(model_id)
