@@ -268,6 +268,12 @@
             // 409s instead of silently clobbering a newer one. See
             // docs/dashboard-model-config-sync.md.
             modelSettingsRevision: null,
+            // Set when a visibility re-check (§B3/Phase 3) finds the server's
+            // settings_revision has moved while the form has unsaved edits.
+            // Advisory only — the save-time revision check (§B1) is what
+            // actually prevents a clobber; this banner just tells the user
+            // before they get to a 409.
+            modelSettingsStaleBanner: false,
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -1010,12 +1016,21 @@
                     if (document.hidden) {
                         this.stopStatsRefresh();
                         this.stopClusterRefresh();
-                    } else if (this.mainTab === 'status') {
-                        this.loadStats();
-                        this.startStatsRefresh();
-                    } else if (this.mainTab === 'cluster') {
-                        this.refreshClusterExperience();
-                        this.startClusterRefresh();
+                    } else {
+                        if (this.mainTab === 'status') {
+                            this.loadStats();
+                            this.startStatsRefresh();
+                        } else if (this.mainTab === 'cluster') {
+                            this.refreshClusterExperience();
+                            this.startClusterRefresh();
+                        }
+                        // Independent of mainTab: the settings modal can be
+                        // open over any tab. See docs/dashboard-model-config-sync.md
+                        // §B3/Phase 3 — this is advisory only, the save-time
+                        // revision check is what actually prevents a clobber.
+                        if (this.showModelSettingsModal) {
+                            this.checkModelSettingsFreshness();
+                        }
                     }
                 });
             },
@@ -8348,6 +8363,11 @@
                         // revision in sync or the next Save would 409
                         // against a change this same page just made.
                         this.modelSettingsRevision = settings.settings_revision ?? null;
+                        // This persisted successfully — the form now IS the
+                        // saved state, so the dirty-check baseline must move
+                        // too, or closing right after this raises a false
+                        // "discard unsaved changes?" confirm (§A4/§1.3).
+                        this._modelSettingsSnapshot = JSON.stringify(this.modelSettings);
                         if (this.selectedModel) {
                             this.selectedModel.settings = { ...settings };
                         }
@@ -8844,6 +8864,10 @@
                     if (data.settings) {
                         this.modelSettingsRevision = data.settings.settings_revision ?? null;
                     }
+                    // Same reasoning as applyProfileToForm above: this
+                    // persisted, so the dirty-check baseline must track it
+                    // (§A4/§1.3).
+                    this._modelSettingsSnapshot = JSON.stringify(this.modelSettings);
                     this.aneTuning.applied = true;
                 } catch (error) {
                     this.aneTuning.error = error.message || String(error);
@@ -8972,6 +8996,58 @@
                 }
             },
 
+            // Re-checks this model's settings_revision on the server when the
+            // browser tab regains visibility while the settings modal is
+            // open (§B3/Phase 3 of docs/dashboard-model-config-sync.md).
+            // Advisory only: the save-time revision check (§B1) already
+            // guarantees no clobber even if this never ran. A clean form is
+            // rebuilt silently; a dirty form gets the banner instead — never
+            // silently merge into edits the user hasn't saved yet.
+            async checkModelSettingsFreshness() {
+                if (!this.showModelSettingsModal || !this.selectedModel) return;
+                const modelId = this.selectedModel.id;
+                const seq = this._modelSettingsSeq;
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/settings`);
+                    if (seq !== this._modelSettingsSeq || !this.showModelSettingsModal) return;
+                    if (resp.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    const fresh = data.settings;
+                    if (!fresh || (fresh.settings_revision ?? null) === this.modelSettingsRevision) {
+                        return;
+                    }
+                    const formIsClean = this._modelSettingsSnapshot !== null
+                        && JSON.stringify(this.modelSettings) === this._modelSettingsSnapshot;
+                    if (formIsClean) {
+                        this.selectedModel.settings = fresh;
+                        this.modelSettingsRevision = fresh.settings_revision ?? null;
+                        this.modelSettings = this.buildModelSettingsState(this.selectedModel, fresh);
+                        this.computeDrift();
+                        this._modelSettingsSnapshot = JSON.stringify(this.modelSettings);
+                        this.modelSettingsStaleBanner = false;
+                    } else {
+                        this.modelSettingsStaleBanner = true;
+                    }
+                } catch (_) { /* advisory only — next visibility change retries */ }
+            },
+
+            // The stale banner's "Reload settings" action — same discard
+            // semantics as closeModelSettingsModal, since this replaces the
+            // form's contents wholesale.
+            async reloadModelSettingsFromServer() {
+                if (this._modelSettingsSnapshot !== null
+                    && JSON.stringify(this.modelSettings) !== this._modelSettingsSnapshot) {
+                    if (!confirm(window.t('modal.model_settings.discard_confirm'))) return;
+                }
+                if (!this.selectedModel) return;
+                await this.openModelSettings(this.selectedModel);
+                this.modelSettingsStaleBanner = false;
+            },
+
             /// Close the Model Settings modal, confirming first if the form
             /// has unsaved edits vs. what it opened with. Route every close
             /// path (backdrop, header X, footer Cancel, Escape) through this
@@ -8983,10 +9059,19 @@
                     if (!confirm(window.t('modal.model_settings.discard_confirm'))) return;
                 }
                 this.showModelSettingsModal = false;
+                this.modelSettingsStaleBanner = false;
             },
 
             async importMtplxSidecar() {
                 if (!this.selectedModel || this.importingMtplx) return;
+                // The reopen below rebuilds `modelSettings` from the server,
+                // silently discarding any unsaved edits — same dirty-check
+                // as closeModelSettingsModal, since this is effectively a
+                // forced reload of the form (§A4/§1.3).
+                if (this._modelSettingsSnapshot !== null
+                    && JSON.stringify(this.modelSettings) !== this._modelSettingsSnapshot) {
+                    if (!confirm(window.t('modal.model_settings.discard_confirm'))) return;
+                }
                 this.importingMtplx = true;
                 try {
                     const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/import-mtplx`, {
@@ -9347,6 +9432,7 @@
                         await this.loadModels();
                         const data = await response.json();
                         this.showModelSettingsModal = false;
+                        this.modelSettingsStaleBanner = false;
                         if (data.requires_reload) {
                             if (data.auto_reloaded) {
                                 alert(window.t('js.info.model_settings_auto_reloaded'));
@@ -9395,6 +9481,11 @@
                     this.modelSettingsRevision = current.settings_revision ?? null;
                     this.modelSettings = this.buildModelSettingsState(this.selectedModel, current);
                     this.computeDrift();
+                    // This IS the saved state now — same reasoning as
+                    // applyProfileToForm/applyANETuningRecommendation
+                    // (§A4/§1.3).
+                    this._modelSettingsSnapshot = JSON.stringify(this.modelSettings);
+                    this.modelSettingsStaleBanner = false;
                     return;
                 }
                 // Deliberate, informed overwrite — resend against the
