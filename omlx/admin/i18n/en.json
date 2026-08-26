@@ -702,6 +702,8 @@
   "modal.model_settings.acceleration_label": "Acceleration",
   "modal.model_settings.experimental_label": "Experimental Features",
   "modal.model_settings.discard_confirm": "Discard unsaved changes to this model's settings?",
+  "modal.model_settings.stale_banner": "Settings changed on the server since this form was opened.",
+  "modal.model_settings.stale_banner_reload": "Reload settings",
   "modal.model_settings.profile_merge_notice": "Saving will add these new fields to your active profile.",
   "modal.model_settings.cancel": "Cancel",
   "modal.model_settings.save": "Save",

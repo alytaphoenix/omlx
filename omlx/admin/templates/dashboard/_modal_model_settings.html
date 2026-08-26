@@ -34,6 +34,20 @@
                     </button>
                 </div>
 
+                <!-- §B3/Phase 3 of docs/dashboard-model-config-sync.md: the
+                     server's settings_revision moved while this form has
+                     unsaved edits. Advisory — save-time revision check
+                     already prevents a clobber even without this. -->
+                <div x-show="modelSettingsStaleBanner" x-cloak data-model-settings-stale-bar
+                     class="mb-6 flex items-center gap-3 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                    <i data-lucide="alert-triangle" class="w-4 h-4 flex-shrink-0"></i>
+                    <span class="text-xs text-amber-800 min-w-0">{{ t('modal.model_settings.stale_banner') }}</span>
+                    <button type="button" @click="reloadModelSettingsFromServer()"
+                            class="ml-auto px-3 py-1.5 text-xs font-semibold text-white bg-amber-600 rounded-lg hover:bg-amber-700 flex-shrink-0">
+                        {{ t('modal.model_settings.stale_banner_reload') }}
+                    </button>
+                </div>
+
                 <!-- Profiles / Templates / Presets section -->
                 <div class="mb-6 p-4 bg-neutral-50 rounded-xl border border-neutral-200"
                      x-show="!modelSettings.is_diffusion_model" x-cloak
