@@ -2283,3 +2283,195 @@ def test_peer_health_transition_records_one_incident(tmp_path, monkeypatch):
     fresh = "/admin/api/cluster/peer-health?hosts=studio.local&deployment_id=d2"
     assert client.get(fresh).json()["healthy"] is False
     assert len(store.list()) == 1
+
+
+# --- Fabric Doctor job lifecycle (C3) -------------------------------------
+
+
+def _fake_doctor_report(hosts=("127.0.0.1", "studio.local")):
+    from omlx.cluster.doctor import DoctorFinding, DoctorReport
+
+    return DoctorReport(
+        hosts=tuple(hosts),
+        findings=(
+            DoctorFinding(
+                check_id="link_presence", state="pass", evidence="en3 up"
+            ),
+            DoctorFinding(
+                check_id="jaccl_probe",
+                state="pass",
+                evidence="two-rank JACCL handshake passed in 1.10s",
+            ),
+        ),
+        verdict="Fabric verified — every check passed.",
+        started_at=1.0,
+        finished_at=2.0,
+    )
+
+
+def _wait_for_doctor_phase(client, job_id, phases=("completed", "failed")):
+    import time as _time
+
+    for _ in range(100):
+        snapshot = client.get(f"/admin/api/cluster/doctor/{job_id}").json()
+        if snapshot.get("phase") in phases:
+            return snapshot
+        _time.sleep(0.05)
+    raise AssertionError(f"doctor job {job_id} never finished: {snapshot}")
+
+
+def test_doctor_job_lifecycle_records_incident(tmp_path, monkeypatch):
+    store = _incident_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes, "run_fabric_doctor", lambda hosts, **_: _fake_doctor_report(hosts)
+    )
+    client = _client()
+
+    response = client.post(
+        "/admin/api/cluster/doctor",
+        json={"hosts": ["127.0.0.1", "studio.local"]},
+    )
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    assert job_id
+
+    snapshot = _wait_for_doctor_phase(client, job_id)
+    assert snapshot["phase"] == "completed"
+    assert snapshot["verdict"] == "Fabric verified — every check passed."
+    assert [item["check_id"] for item in snapshot["findings"]] == [
+        "link_presence",
+        "jaccl_probe",
+    ]
+    assert snapshot["findings"][0]["state"] == "pass"
+
+    recorded = store.list()
+    assert len(recorded) == 1
+    incident = recorded[0]
+    assert incident.state_code == "fabric_doctor"
+    assert incident.severity == "info"
+    assert incident.job_id == job_id
+    assert incident.message == "Fabric verified — every check passed."
+
+
+def test_doctor_red_run_records_error_incident(tmp_path, monkeypatch):
+    from omlx.cluster.doctor import DoctorFinding, DoctorReport
+
+    store = _incident_store(tmp_path, monkeypatch)
+    report = DoctorReport(
+        hosts=("127.0.0.1", "studio.local"),
+        findings=(
+            DoctorFinding(
+                check_id="subnet_collision",
+                state="fail",
+                evidence="WARP routes 10.0.0.0/8 through utun4",
+                diagnosis="the fabric subnet is captured by a VPN tunnel route",
+            ),
+            DoctorFinding(
+                check_id="jaccl_probe",
+                state="skipped",
+                evidence="skipped — subnet_collision failed first",
+            ),
+        ),
+        verdict=(
+            "Fabric Doctor stopped at subnet_collision: the fabric subnet "
+            "is captured by a VPN tunnel route"
+        ),
+    )
+    monkeypatch.setattr(routes, "run_fabric_doctor", lambda hosts, **_: report)
+    client = _client()
+
+    job_id = client.post(
+        "/admin/api/cluster/doctor",
+        json={"hosts": ["127.0.0.1", "studio.local"]},
+    ).json()["job_id"]
+    snapshot = _wait_for_doctor_phase(client, job_id)
+
+    assert snapshot["phase"] == "completed"
+    assert snapshot["verdict"].startswith(
+        "Fabric Doctor stopped at subnet_collision"
+    )
+    recorded = store.list()
+    assert len(recorded) == 1
+    assert recorded[0].severity == "error"
+    assert recorded[0].job_id == job_id
+
+
+def test_doctor_crash_marks_job_failed_with_incident(tmp_path, monkeypatch):
+    store = _incident_store(tmp_path, monkeypatch)
+
+    def explode(hosts, **_):
+        raise RuntimeError("probe machinery fell over")
+
+    monkeypatch.setattr(routes, "run_fabric_doctor", explode)
+    client = _client()
+
+    job_id = client.post(
+        "/admin/api/cluster/doctor",
+        json={"hosts": ["127.0.0.1", "studio.local"]},
+    ).json()["job_id"]
+    snapshot = _wait_for_doctor_phase(client, job_id)
+
+    assert snapshot["phase"] == "failed"
+    assert "probe machinery fell over" in snapshot["error"]
+    recorded = store.list()
+    assert len(recorded) == 1
+    assert recorded[0].state_code == "fabric_doctor_failed"
+    assert recorded[0].severity == "error"
+
+
+def test_doctor_rejects_bad_hosts_and_counts(monkeypatch):
+    client = _client()
+    assert (
+        client.post(
+            "/admin/api/cluster/doctor", json={"hosts": ["only-one"]}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            "/admin/api/cluster/doctor",
+            json={"hosts": ["ok.local", "-oProxyCommand=evil"]},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.get("/admin/api/cluster/doctor/not-a-job-id").status_code == 404
+    )
+    assert (
+        client.get(f"/admin/api/cluster/doctor/{'0' * 24}").status_code == 404
+    )
+
+
+def test_doctor_report_lands_in_diagnostics(tmp_path, monkeypatch):
+    _incident_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes, "run_fabric_doctor", lambda hosts, **_: _fake_doctor_report(hosts)
+    )
+    monkeypatch.setattr(routes, "collect_cluster_status", lambda **_: _status())
+    monkeypatch.setattr(
+        routes, "read_runtime_markers", lambda: {"jobs": [], "warnings": []}
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", None)
+    monkeypatch.setattr(
+        routes,
+        "get_cluster_registry",
+        lambda: SimpleNamespace(
+            list=lambda: (),
+            to_dict=lambda: {"schema_version": 1, "deployments": []},
+        ),
+    )
+    client = _client()
+
+    job_id = client.post(
+        "/admin/api/cluster/doctor",
+        json={"hosts": ["127.0.0.1", "studio.local"]},
+    ).json()["job_id"]
+    _wait_for_doctor_phase(client, job_id)
+
+    bundle = client.get("/admin/api/cluster/diagnostics").json()
+    reports = [
+        job for job in bundle["fabric_doctor"] if job["job_id"] == job_id
+    ]
+    assert len(reports) == 1
+    assert reports[0]["phase"] == "completed"
+    assert reports[0]["verdict"] == "Fabric verified — every check passed."
