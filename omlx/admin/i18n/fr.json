@@ -360,8 +360,6 @@
   "modal.model_settings.reasoning_parser": "Analyseur de raisonnement",
   "modal.model_settings.model_type_auto": "Détection automatique",
   "modal.model_settings.max_context_window": "Fenêtre de contexte",
-  "modal.model_settings.auto_context": "Auto",
-  "modal.model_settings.auto_context_tokens": "tokens",
   "modal.model_settings.auto_context_hint": "Définir sur la plus grande fenêtre de contexte qui tient dans la mémoire disponible de ce Mac",
   "modal.model_settings.max_tokens": "Tokens max",
   "modal.model_settings.temperature": "Température",
@@ -651,14 +649,5 @@
   "js.success.download_started": "Téléchargement démarré : {repo_id}",
   "js.success.settings_saved": "Paramètres enregistrés avec succès",
   "settings.mcp.expose_tools": "Exposer les outils MCP du backend aux clients",
-  "settings.mcp.expose_tools_hint": "Fusionne les outils MCP du backend dans les réponses. Désactivez si votre client possède ses propres serveurs MCP.",
-  "chat.confirm_delete_message": "This will delete this message and every message after it in this chat. Continue?",
-  "js.error.save_claude_code_settings_failed": "Failed to save Claude Code settings",
-  "js.error.save_integration_settings_failed": "Failed to save integration settings",
-  "models.downloader.ms_checking": "Checking ModelScope availability…",
-  "modal.model_settings.discard_confirm": "Discard unsaved changes to this model's settings?",
-  "modal.model_settings.profile_merge_notice": "Saving will add these new fields to your active profile.",
-  "logs.auto_refresh_toggle_label": "Auto-refresh:",
-  "js.error.model_settings_conflict": "Settings for this model changed on the server since you opened this form.",
-  "js.confirm.model_settings_conflict_choice": "Click OK to load the latest settings (your unsaved edits will be lost), or Cancel to overwrite the server with your current changes."
+  "settings.mcp.expose_tools_hint": "Fusionne les outils MCP du backend dans les réponses. Désactivez si votre client possède ses propres serveurs MCP."
 }
