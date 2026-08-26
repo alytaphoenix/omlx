@@ -1360,12 +1360,15 @@ public:
   // The producer command buffer is released mid-dispatch once packing has
   // completed; tell the guard so it does not double-release on unwind.
   void producer_released() { producer_buffer_ = nullptr; }
+<<<<<<< HEAD
   // Transfer one ticket only after its detached evaluation thread exists.
   // Keeping ownership per ticket lets a later thread-constructor failure
   // cancel the tickets that have not acquired a worker yet without racing
   // workers that are already running.
   void transfer_ticket0() noexcept { model0_.reset(); }
   void transfer_ticket1() noexcept { model1_.reset(); }
+=======
+>>>>>>> fix/ane-c1-dispatch-exception-safety
   void disarm() { armed_ = false; }
   ~AneDispatchGuard() {
     if (!armed_) {
@@ -2754,6 +2757,9 @@ public:
 
     auto model0 = model0_;
     auto model1 = model1_;
+    // The evaluation threads below take ownership of the tickets; the qmm
+    // get_kernel window that could orphan them is now behind us.
+    ane_guard.disarm();
     std::thread([model0, ticket0, profiling, profile_category, launch] {
       const uint64_t start = profiling ? profile_now_ns() : 0;
       model0->execute(ticket0);
