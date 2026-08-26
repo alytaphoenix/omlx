@@ -107,19 +107,40 @@ _ROUTE_TILED = "tiled"
 # kv_len for safer memory, and nothing surfaced the route decision before
 # (issue #2283 took an A/B repro to diagnose), so this stays at INFO rather
 # than DEBUG.
-_LAST_ROUTE_DECISION: str | None = None
+_LAST_ROUTE_DECISION_NO_CACHE: str | None = None
 
 
-def _note_route(decision: str, detail) -> None:
+def _note_route(cache, decision: str, detail) -> None:
     """``detail`` may be a plain string or a zero-arg callable. This runs on
     every head-dim-256 prefill SDPA call (thousands per long-context
     request), and the vast majority hit the decision == last-decision
     no-op below -- callers with a formatted (f-string) detail should pass a
-    lambda so the string is only built on an actual transition."""
-    global _LAST_ROUTE_DECISION
-    if decision == _LAST_ROUTE_DECISION:
-        return
-    _LAST_ROUTE_DECISION = decision
+    lambda so the string is only built on an actual transition.
+
+    The last-logged decision is stashed on ``cache`` (mirroring the
+    ``_sdpa256_q_sub_ceiling`` hysteresis floor in ``_should_route``) rather
+    than a single module-global: the model passes one cache per layer, so a
+    module-global was shared across all 16 full-attention layers (and every
+    concurrent request) at once, and interleaved calls from different
+    layers/requests made the transition log flap on every call instead of
+    only on real transitions. Falls back to a module-global only when
+    ``cache`` is None -- a real, persistent case (a guard-off server with no
+    headroom provider wired up routes every call this way, issue #2283),
+    where per-call spam is exactly what the dedup exists to prevent and
+    there is no per-request identity available to key on instead.
+    See docs/qwen35-hardening-and-optimization.md E5."""
+    global _LAST_ROUTE_DECISION_NO_CACHE
+    if cache is not None:
+        try:
+            if decision == getattr(cache, "_sdpa256_last_route", None):
+                return
+            cache._sdpa256_last_route = decision
+        except Exception:
+            pass
+    else:
+        if decision == _LAST_ROUTE_DECISION_NO_CACHE:
+            return
+        _LAST_ROUTE_DECISION_NO_CACHE = decision
     if callable(detail):
         detail = detail()
     logger.info(
@@ -168,7 +189,7 @@ def _parse_qsplit_env() -> bool:
 
 
 def _route_decision(
-    queries, keys, q_sub_ceiling: int | None = None
+    queries, keys, cache=None, q_sub_ceiling: int | None = None
 ) -> tuple[str, int]:
     """Decide unfused / q-split / tiled for a shape-matched prefill call.
 
@@ -197,13 +218,14 @@ def _route_decision(
     again this request."""
     if _FORCE_TILED is not None:
         if _FORCE_TILED:
-            _note_route(_ROUTE_TILED, "forced by OMLX_SDPA256_TILED=1")
+            _note_route(cache, _ROUTE_TILED, "forced by OMLX_SDPA256_TILED=1")
             return _ROUTE_TILED, 0
-        _note_route(_ROUTE_UNFUSED, "forced by OMLX_SDPA256_TILED=0")
+        _note_route(cache, _ROUTE_UNFUSED, "forced by OMLX_SDPA256_TILED=0")
         return _ROUTE_UNFUSED, 0
     try:
         if q_sub_ceiling == 0:
             _note_route(
+                cache,
                 _ROUTE_TILED,
                 "held at tiled by this request's hysteresis floor",
             )
@@ -211,6 +233,7 @@ def _route_decision(
         provider = _HEADROOM_PROVIDER() if _HEADROOM_PROVIDER is not None else None
         if provider is None:
             _note_route(
+                cache,
                 _ROUTE_TILED,
                 "no guard headroom provider registered "
                 "(engine without a scheduler, or scheduler gone)",
@@ -223,6 +246,7 @@ def _route_decision(
         headroom = provider(kv_len)
         if headroom is None or headroom < 0:
             _note_route(
+                cache,
                 _ROUTE_TILED,
                 "memory ceiling not available (enforcer state not yet "
                 "propagated)",
@@ -233,6 +257,7 @@ def _route_decision(
         )
         if transient <= headroom and q_sub_ceiling is None:
             _note_route(
+                cache,
                 _ROUTE_UNFUSED,
                 lambda: f"full call ~{transient / 2**20:.0f}MiB fits "
                 f"~{headroom / 2**20:.0f}MiB headroom at kv_len={kv_len}",
@@ -248,6 +273,7 @@ def _route_decision(
             if q_sub >= _QSPLIT_MIN_Q:
                 q_sub = min(q_sub, q_len)
                 _note_route(
+                    cache,
                     _ROUTE_QSPLIT,
                     lambda: f"q_sub={q_sub} of q_len={q_len} fits "
                     f"~{headroom / 2**20:.0f}MiB headroom at kv_len={kv_len} "
@@ -255,6 +281,7 @@ def _route_decision(
                 )
                 return _ROUTE_QSPLIT, q_sub
         _note_route(
+            cache,
             _ROUTE_TILED,
             lambda: f"unfused transient ~{transient / 2**20:.0f}MiB exceeds "
             f"~{headroom / 2**20:.0f}MiB headroom at kv_len={kv_len} even "
@@ -263,7 +290,7 @@ def _route_decision(
         return _ROUTE_TILED, 0
     except Exception:
         logger.debug("sdpa256 headroom probe failed", exc_info=True)
-        _note_route(_ROUTE_TILED, "guard headroom probe failed")
+        _note_route(cache, _ROUTE_TILED, "guard headroom probe failed")
         return _ROUTE_TILED, 0  # headroom info unavailable -> memory-safe default
 
 
@@ -421,11 +448,17 @@ def _should_route(queries, keys, cache, mask, sinks) -> tuple[str, int]:
         # not just the route label: capping only the label and letting
         # q_sub float back up to q_len when headroom looks momentarily
         # generous was verified live to reproduce the identical full-size
-        # transient labeled qsplit instead of unfused. Stashed on ``cache``
-        # since that is the one object stable across every chunk/layer of a
-        # single request but never shared across requests.
+        # transient labeled qsplit instead of unfused. Stashed on ``cache``,
+        # which is per-layer, not shared across the request's 16
+        # full-attention layers -- each layer's ratchet is independently
+        # self-consistent (kv_len is still monotone per-layer), just not a
+        # single request-wide floor (docs/qwen35-hardening-and-optimization.md
+        # E5). ``cache._sdpa256_q_sub_ceiling = 0`` (tiled) is a latch that's
+        # never cleared once set, which is intentional, not a leak: memory
+        # pressure that forced tiled doesn't spontaneously relax within a
+        # request, and the cache (hence the latch) dies with the request.
         ceiling = getattr(cache, "_sdpa256_q_sub_ceiling", None)
-        route, q_sub = _route_decision(queries, keys, q_sub_ceiling=ceiling)
+        route, q_sub = _route_decision(queries, keys, cache, q_sub_ceiling=ceiling)
         if cache is not None:
             try:
                 if route == _ROUTE_TILED:
