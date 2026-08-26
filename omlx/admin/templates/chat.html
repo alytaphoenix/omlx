@@ -1004,8 +1004,9 @@
             <p class="text-sm text-fg-tertiary mb-4">{{ t('chat.api_key_prompt') }}</p>
             <input type="password" x-model="apiKeyInput" @keydown.enter="saveApiKey"
                 placeholder="{{ t('chat.api_key_placeholder') }}"
-                class="w-full px-4 py-3 border border-line rounded-xl mb-4 focus:outline-none focus:border-line-strong"
+                class="w-full px-4 py-3 border border-line rounded-xl mb-1 focus:outline-none focus:border-line-strong"
                 style="background: var(--bg-primary); color: var(--text-primary);">
+            <p class="text-xs text-fg-tertiary mb-4">{{ t('chat.api_key_storage_note') }}</p>
             <button @click="saveApiKey"
                 class="w-full bg-accent text-accent-fg px-6 py-3 rounded-xl font-medium transition-all hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
                 :disabled="!apiKeyInput.trim()">
@@ -1720,9 +1721,15 @@
             <template x-for="dot in timelineDots" :key="dot.index">
                 <div class="absolute left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-auto cursor-pointer"
                     :style="'top:' + dot.topPx + 'px;width:9px;height:9px;display:flex;align-items:center;justify-content:center;border-radius:50%;'"
+                    role="button" tabindex="0"
+                    :aria-label="window.t('chat.timeline.jump_to_message') + ': ' + (getTextContent(messages[dot.index]?.content)?.slice(0, 60) || '')"
                     @mouseenter="showDotTooltip($event, messages[dot.index], dot.index)"
                     @mouseleave="hideDotTooltip()"
-                    @click="scrollToMessage(dot.index)">
+                    @focus="showDotTooltip($event, messages[dot.index], dot.index)"
+                    @blur="hideDotTooltip()"
+                    @click="scrollToMessage(dot.index)"
+                    @keydown.enter="scrollToMessage(dot.index)"
+                    @keydown.space.prevent="scrollToMessage(dot.index)">
                     <span class="timeline-dot"
                         :class="timelineActive === dot.index ? 'timeline-dot-active' : ''"></span>
                 </div>

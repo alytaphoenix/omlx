@@ -42,6 +42,9 @@
                                     <button type="button"
                                             @click="if (!accExternalEnabled) accEnableThinking = !accEnableThinking"
                                             :disabled="accExternalEnabled"
+                                            role="switch"
+                                            :aria-checked="accEnableThinking ? 'true' : 'false'"
+                                            aria-label="{{ t('acc_bench.config.thinking') }}"
                                             :class="[accEnableThinking ? 'bg-black' : 'bg-neutral-200', accExternalEnabled ? 'opacity-40 cursor-not-allowed' : '']"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="accEnableThinking ? 'translate-x-5' : 'translate-x-0'"
@@ -87,6 +90,9 @@
                                         <div class="flex items-center gap-3">
                                             <button type="button"
                                                     @click="accSamplingProfile = accSamplingProfile === 'model_settings' ? 'deterministic' : 'model_settings'"
+                                                    role="switch"
+                                                    :aria-checked="accSamplingProfile === 'model_settings' ? 'true' : 'false'"
+                                                    aria-label="{{ t('acc_bench.config.sampling') }}"
                                                     :class="accSamplingProfile === 'model_settings' ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="accSamplingProfile === 'model_settings' ? 'translate-x-5' : 'translate-x-0'"
@@ -174,6 +180,10 @@
                                             <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
                                                 <template x-for="b in group.benchmarks" :key="b.key">
                                                     <div @click="accBenchmarks[b.key] = !accBenchmarks[b.key]"
+                                                         role="checkbox" tabindex="0"
+                                                         :aria-checked="accBenchmarks[b.key] ? 'true' : 'false'"
+                                                         @keydown.enter="if ($event.target === $el) accBenchmarks[b.key] = !accBenchmarks[b.key]"
+                                                         @keydown.space.prevent="if ($event.target === $el) accBenchmarks[b.key] = !accBenchmarks[b.key]"
                                                          class="relative rounded-xl border-2 p-4 cursor-pointer transition-all select-none"
                                                          :class="accBenchmarks[b.key]
                                                              ? 'border-neutral-900 bg-neutral-900 text-white shadow-md'
