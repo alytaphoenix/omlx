@@ -621,6 +621,15 @@
             showClearSsdCacheConfirm: false,
             showClearHotCacheConfirm: false,
             _statsRefreshTimer: null,
+            // Anti-race guard for loadStats() (§B11) — was never initialized
+            // here, so `++this._statsReqSeq` started from `++undefined` =
+            // NaN on the very first call, and NaN !== NaN is always true in
+            // JS: every single loadStats() call bailed out of updating
+            // `this.stats` unconditionally, forever, on every page load.
+            // Session/all-time stats and the Active Models panel were stuck
+            // at their hardcoded zero/empty initial shape no matter how
+            // long you waited or what was actually happening server-side.
+            _statsReqSeq: 0,
 
             // Log viewer state
             logContent: '',
