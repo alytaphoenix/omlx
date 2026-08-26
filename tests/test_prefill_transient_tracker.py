@@ -131,7 +131,12 @@ class TestObservedMax:
         t.update(32, 100_000_000, floor_sample=True)
         t.update(32, 700_000_000, floor_sample=True)
         t.update(32, 300_000_000, floor_sample=True)
-        assert t.observed_max_bytes == 700_000_000
+        # 300M is below the 700M peak, so it decays the max slightly toward
+        # 300M rather than either leaving it frozen at exactly 700M or
+        # snapping straight down to 300M (see TestObservedMaxDecay for the
+        # decay mechanics in isolation).
+        assert 300_000_000 < t.observed_max_bytes < 700_000_000
+        assert t.observed_max_bytes == int(0.98 * 700_000_000 + 0.02 * 300_000_000)
 
     def test_non_floor_samples_never_enter_max(self):
         # Qwen3.6 regression: a 3GB transient from an unthrottled
@@ -173,6 +178,65 @@ class TestObservedMax:
         ewma = 0.3 * 200.0 + 0.7 * 100.0
         assert abs(t.bytes_per_token - ewma) < 0.01
         assert t.predict(2000, safety_factor=1.0) == int(ewma * 2000)
+
+
+class TestObservedMaxDecay:
+    """§B4: observed_max_bytes used to only ever increase, so one
+    pathological-but-under-clamp floor-chunk spike early in a long-running
+    session permanently raised the admission floor forever, even if it
+    never recurred. A lower subsequent floor sample must now decay the
+    max instead of leaving it frozen."""
+
+    def test_lower_sample_decays_max_instead_of_freezing(self):
+        t = PrefillTransientTracker("m")
+        t.update(32, 100_000_000, floor_sample=True)  # first, excluded
+        t.update(32, 1_000_000_000, floor_sample=True)  # spike -> max=1e9
+        assert t.observed_max_bytes == 1_000_000_000
+        t.update(32, 100_000_000, floor_sample=True)  # spike never recurs
+        # Decays toward 100M by (1 - decay) of the gap, doesn't snap to it
+        # and doesn't stay frozen at 1e9.
+        expected = int(0.98 * 1_000_000_000 + 0.02 * 100_000_000)
+        assert t.observed_max_bytes == expected
+        assert 100_000_000 < t.observed_max_bytes < 1_000_000_000
+
+    def test_sustained_lower_readings_eventually_erode_a_stale_spike(self):
+        """The actual bug this fixes: a session that runs for a very long
+        time (hours/days on one continuously-loaded model) after one early
+        spike must eventually recover a realistic admission floor instead
+        of staying pinned at the spike's value forever."""
+        t = PrefillTransientTracker("m")
+        t.update(32, 100_000_000, floor_sample=True)  # first, excluded
+        t.update(32, 1_000_000_000, floor_sample=True)  # spike -> max=1e9
+        for _ in range(400):
+            t.update(32, 100_000_000, floor_sample=True)
+        # Never snaps exactly to the floor (this is a decaying safety
+        # bound, not a plain rolling value) but gets close after enough
+        # sustained lower evidence.
+        assert t.observed_max_bytes > 100_000_000
+        assert t.observed_max_bytes < 105_000_000
+
+    def test_new_higher_sample_still_raises_instantly_no_decay_lag(self):
+        """A genuine fresh spike must still gate admission the moment it's
+        seen -- decay must only ever pull the max DOWN toward lower
+        readings, never dampen or delay a rise."""
+        t = PrefillTransientTracker("m")
+        t.update(32, 100_000_000, floor_sample=True)  # first, excluded
+        t.update(32, 200_000_000, floor_sample=True)
+        t.update(32, 100_000_000, floor_sample=True)  # decays a bit
+        decayed = t.observed_max_bytes
+        assert decayed < 200_000_000
+        t.update(32, 900_000_000, floor_sample=True)  # fresh spike
+        assert t.observed_max_bytes == 900_000_000
+
+    def test_decay_does_not_apply_to_clamp_rejected_outliers(self):
+        """An above-clamp reading is excluded entirely (existing
+        behavior) -- it must not decay the max toward itself either,
+        since it was never accepted as a real observation."""
+        t = PrefillTransientTracker("m")
+        t.update(32, 100_000_000, floor_sample=True)  # first, excluded
+        t.update(32, 500_000_000, floor_sample=True)  # max = 500M
+        t.update(32, 5 * 1024**3, floor_sample=True)  # above 4GiB clamp
+        assert t.observed_max_bytes == 500_000_000
 
 
 class TestReset:
