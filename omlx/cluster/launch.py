@@ -1148,11 +1148,19 @@ class AdmissionCeilingProbe:
     answer and the slower in-process computation produced the ceiling, and
     ``fast_probe_error`` carries the last error the fast path saw so the
     caller can record it (design rule: fallbacks confess).
+
+    ``breakdown`` carries the peer's ``ceiling_breakdown()`` components
+    (``static``/``dynamic``/``metal_cap``/``hard_limit``) when the peer is new
+    enough to report them (B5); ``None`` means an older peer or a malformed
+    reply, and the caller renders the ceiling alone rather than guessing.
+    Appended last with a default so existing positional constructions keep
+    working.
     """
 
     ceiling_bytes: int
     fast_probe_ok: bool = True
     fast_probe_error: str = ""
+    breakdown: dict[str, int] | None = None
 
 
 def probe_remote_admission_ceiling(
@@ -1204,18 +1212,28 @@ def probe_remote_admission_ceiling(
         ports = tuple(dict.fromkeys((local_port, 9000)))
     # The script's JSON keeps `admission_ceiling_bytes` top-level so an older
     # coordinator parsing this reply still finds the number; the fast-probe
-    # confession fields ride alongside it.
+    # confession fields ride alongside it. `breakdown` (B5) carries the
+    # ceiling_breakdown() components behind the ceiling: the fast path reads
+    # them from the same /health reply (an older peer's /health omits the key
+    # and breakdown stays null — the coordinator then renders the ceiling
+    # alone), the slow path computes them alongside the ceiling it already
+    # needed.
     script = (
         "import json,urllib.request\n"
         "ceiling=0\n"
+        "breakdown=None\n"
         "fast_error=''\n"
         f"for port in {ports!r}:\n"
         "    try:\n"
         "        with urllib.request.urlopen("
         "'http://127.0.0.1:%d/health'%port,timeout=2) as response:\n"
         "            health=json.load(response)\n"
-        "        ceiling=int(health.get('engine_pool',{}).get('final_ceiling',0))\n"
+        "        pool=health.get('engine_pool') or {}\n"
+        "        ceiling=int(pool.get('final_ceiling',0))\n"
         "        if ceiling>0:\n"
+        "            components=pool.get('ceiling_breakdown')\n"
+        "            if isinstance(components,dict):\n"
+        "                breakdown=components\n"
         "            break\n"
         "        fast_error='port %d answered without a ceiling'%port\n"
         "    except Exception as exc:\n"
@@ -1223,9 +1241,11 @@ def probe_remote_admission_ceiling(
         "fast_ok=ceiling>0\n"
         "if ceiling<=0:\n"
         "    from omlx.cluster.memory_guard import ceiling_breakdown\n"
-        "    ceiling=int(ceiling_breakdown().get('hard_limit',0))\n"
+        "    breakdown=ceiling_breakdown()\n"
+        "    ceiling=int(breakdown.get('hard_limit',0))\n"
         "print(json.dumps({'admission_ceiling_bytes':ceiling,"
-        "'fast_probe_ok':fast_ok,'fast_probe_error':fast_error}))"
+        "'fast_probe_ok':fast_ok,'fast_probe_error':fast_error,"
+        "'breakdown':breakdown}))"
     )
 
     def _read(executable: str) -> subprocess.CompletedProcess[str]:
@@ -1296,12 +1316,25 @@ def probe_remote_admission_ceiling(
         raise DistributedLaunchError(
             f"{ssh_target} did not report an oMLX memory ceiling"
         )
+    # The breakdown is advisory (B5): a missing key is an older peer and a
+    # malformed one is a reply-shape surprise — both degrade to the
+    # ceiling-only path the probe has always offered, never to an exception.
+    raw_breakdown = payload.get("breakdown")
+    breakdown: dict[str, int] | None = None
+    if isinstance(raw_breakdown, dict):
+        try:
+            breakdown = {
+                str(key): int(value) for key, value in raw_breakdown.items()
+            }
+        except (TypeError, ValueError):
+            breakdown = None
     return AdmissionCeilingProbe(
         ceiling_bytes=ceiling,
         # Missing fields default to a clean fast path: the script is ours,
         # so absence means an unexpected reply shape, not a probed failure.
         fast_probe_ok=bool(payload.get("fast_probe_ok", True)),
         fast_probe_error=str(payload.get("fast_probe_error") or ""),
+        breakdown=breakdown,
     )
 
 

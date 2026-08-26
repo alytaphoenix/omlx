@@ -29,6 +29,7 @@ from ..model_discovery import estimate_text_only_model_size
 from .autoconfigure import (
     STRATEGIES,
     build_rdma_matrix,
+    candidate_tensor_parallel_sizes,
     choose_backend,
     choose_parallelism,
     describe_preflight,
@@ -91,7 +92,7 @@ from .planner import (
     remote_model_layout,
     synthetic_model_layout,
 )
-from .probe import collect_cluster_status
+from .probe import _system_memory_bytes, collect_cluster_status
 from .registry import get_cluster_registry
 from .runtime import read_runtime_markers
 from .staging import (
@@ -399,6 +400,11 @@ _PEER_ADMIN_PORTS: dict[str, int] = {}
 _PEER_ADMIN_PORTS_LOCK = threading.Lock()
 # One WARN per dead advertised port, not one per dashboard poll.
 _CEILING_FALLBACK_SEEN: set[tuple[str, int]] = set()
+# The physical RAM each peer last reported in its ClusterStatus, deposited by
+# the same capability probes that teach the admin port (B5). /node-budgets
+# uses it as the top line of the memory-budget arithmetic; a peer that has
+# not been probed yet simply renders without the physical line.
+_PEER_PHYSICAL_BYTES: dict[str, int] = {}
 
 
 def _peer_key(ssh_target: str) -> str:
@@ -408,11 +414,13 @@ def _peer_key(ssh_target: str) -> str:
 
 
 def _note_peer_admin_port(probe_result: Any) -> None:
-    """Remember the admin port a capability probe just saw a peer advertise.
+    """Remember what a capability probe just saw a peer advertise.
 
-    Best-effort by design: a probe payload without the field (older peer,
-    hardware-inventory fallback) simply teaches nothing, and the fast path
-    keeps its legacy port guesses for that peer.
+    Deposits the advertised admin port (C5) and the peer's physical RAM (B5,
+    the top line of the memory-budget arithmetic). Best-effort by design: a
+    probe payload without either field (older peer, hardware-inventory
+    fallback) simply teaches nothing — the fast path keeps its legacy port
+    guesses and the budget row renders without the physical line.
     """
 
     if not isinstance(probe_result, dict):
@@ -423,20 +431,34 @@ def _note_peer_admin_port(probe_result: Any) -> None:
     node = status.get("node")
     if not isinstance(node, dict):
         return
+    ssh_target = str(probe_result.get("ssh") or "")
+    if not ssh_target:
+        return
     try:
         port = int(node.get("admin_port") or 0)
     except (TypeError, ValueError):
-        return
-    ssh_target = str(probe_result.get("ssh") or "")
-    if port <= 0 or not ssh_target:
+        port = 0
+    try:
+        physical = int(node.get("physical_memory_bytes") or 0)
+    except (TypeError, ValueError):
+        physical = 0
+    if port <= 0 and physical <= 0:
         return
     with _PEER_ADMIN_PORTS_LOCK:
-        _PEER_ADMIN_PORTS[_peer_key(ssh_target)] = port
+        if port > 0:
+            _PEER_ADMIN_PORTS[_peer_key(ssh_target)] = port
+        if physical > 0:
+            _PEER_PHYSICAL_BYTES[_peer_key(ssh_target)] = physical
 
 
 def _advertised_admin_port(ssh_target: str) -> int:
     with _PEER_ADMIN_PORTS_LOCK:
         return _PEER_ADMIN_PORTS.get(_peer_key(ssh_target), 0)
+
+
+def _peer_physical_bytes(ssh_target: str) -> int:
+    with _PEER_ADMIN_PORTS_LOCK:
+        return _PEER_PHYSICAL_BYTES.get(_peer_key(ssh_target), 0)
 
 
 # Drift is a standing condition too: one WARN per (subnet, kind), not one per
@@ -956,6 +978,108 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
         "launched_signature": _placement_signature(launched),
         "ranks": ranks,
     }
+
+
+def _strategy_support(model: Any, node_count: int) -> dict[str, dict[str, Any]]:
+    """Which parallelism modes planning would accept for this model, and why not.
+
+    A mode is ``supported`` exactly when an explicit request for it would not
+    raise ``PlanningError`` in ``_create_cluster_plan``/``choose_parallelism``
+    for this model and node count, so the dashboard can disable a radio at
+    plan time instead of offering a click that 400s (B5, failure #10).
+
+    **Parallelism authority (B5 decision):** plan-time gating reads
+    ``ModelLayout.supports_tensor_parallel`` / ``supports_pipeline`` — the
+    config-cheap flags computed once when the model profile is built — plus
+    the same divisor arithmetic ``choose_parallelism`` refuses with
+    (``candidate_tensor_parallel_sizes``). It deliberately does NOT consult
+    ``pipeline_compat.pipeline_assignment_is_honored()``: that answers a
+    different, narrower question (does the *installed runtime hook* consume an
+    unequal layer assignment), imports mlx_lm model modules, and stays the
+    load-time enforcement inside the worker path. The ``PlanningError`` paths
+    remain the API backstop for non-GUI callers — this gate is UX, not the
+    safety boundary. (B4's ``preconditions.py``, once it exists, inherits
+    this note.)
+    """
+
+    supported = {"supported": True, "reason": ""}
+    if (
+        node_count > 1
+        and model.source != "synthetic"
+        and not model.supports_pipeline
+    ):
+        pipeline = {
+            "supported": False,
+            "reason": (
+                "Pipeline parallelism is not possible for this model: the "
+                "architecture does not implement the MLX-LM pipeline forward "
+                "path."
+            ),
+        }
+    else:
+        pipeline = dict(supported)
+    tensor_candidates = [
+        size
+        for size in candidate_tensor_parallel_sizes(model, node_count)
+        if size > 1
+    ]
+    if tensor_candidates:
+        tensor = dict(supported)
+    elif node_count < 2:
+        tensor = {
+            "supported": False,
+            "reason": "Tensor parallelism needs at least two Macs.",
+        }
+    elif model.source == "synthetic":
+        tensor = {
+            "supported": False,
+            "reason": (
+                "Planning by size only: tensor parallelism needs the "
+                "downloaded model's architecture to know whether its heads "
+                "divide evenly."
+            ),
+        }
+    elif not model.supports_tensor_parallel:
+        tensor = {
+            "supported": False,
+            "reason": (
+                "Tensor parallelism is not possible for this model: the "
+                "architecture does not implement sharding in MLX-LM."
+            ),
+        }
+    else:
+        tensor = {
+            "supported": False,
+            "reason": (
+                f"No split divides {node_count} Macs across every "
+                "architecture-specific attention/Mamba head group "
+                f"{list(model.tensor_parallel_divisors)}."
+            ),
+        }
+    return {
+        "auto": {
+            "supported": tensor["supported"] or pipeline["supported"],
+            "reason": (
+                ""
+                if tensor["supported"] or pipeline["supported"]
+                else "Neither tensor nor pipeline parallelism can run this model."
+            ),
+        },
+        "tensor": tensor,
+        "pipeline": pipeline,
+    }
+
+
+def _strategies_payload(model: Any, node_count: int) -> dict[str, dict[str, Any]]:
+    """The static strategy descriptions merged with this plan's live gating.
+
+    A per-response copy: the module-level ``STRATEGIES`` labels never carry a
+    ``supported`` verdict of their own, and older dashboard code that only
+    reads ``label``/``summary``/``detail`` keeps working unchanged.
+    """
+
+    support = _strategy_support(model, node_count)
+    return {key: {**STRATEGIES.get(key, {}), **support[key]} for key in support}
 
 
 def _create_cluster_plan(request: ClusterPlanRequest):
@@ -1659,7 +1783,10 @@ async def _autoconfigure(request: ClusterAutoconfigureRequest) -> dict[str, Any]
         },
         "performance_probe": performance_probe,
         "staging": staging,
-        "strategies": STRATEGIES,
+        # Each strategy's description plus whether this model can run it and
+        # why not (B5): the dashboard disables an unsupported radio with the
+        # reason inline instead of letting the click 400.
+        "strategies": _strategies_payload(model, len(nodes)),
         "preflight": _redact_diagnostic(preflight_summary),
         # Structured as well as summarised: an issue that carries a command is
         # a fix the user can paste, and a sentence hides it.
@@ -3158,7 +3285,11 @@ async def cluster_plan(request: ClusterPlanRequest):
     # The signature travels back with the plan so activation can prove it is
     # launching the thing that was shown here, and not a re-plan built from a
     # payload that quietly dropped the reserve, the cap or the role.
-    return _plan_with_signature(plan.to_dict())
+    # `strategies` (B5) rides alongside — the signature hashes only the
+    # placement rows, so this additive key cannot invalidate an approval.
+    return _plan_with_signature(plan.to_dict()) | {
+        "strategies": _strategies_payload(plan.model, len(request.nodes)),
+    }
 
 
 def _deployment_id(model_path: Path, plan_hash: str) -> str:
@@ -3507,8 +3638,11 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
     async def _for(host: Any) -> dict[str, Any]:
         capacity_bytes = 0
         capacity_source: str | None = None
+        ceiling_components: dict[str, int] | None = None
+        physical_bytes = 0
         if not _local_ssh_target(host.ssh):
             admin_port = _advertised_admin_port(host.ssh)
+            physical_bytes = _peer_physical_bytes(host.ssh)
             probe = await asyncio.to_thread(
                 probe_remote_admission_ceiling,
                 host.ssh,
@@ -3521,6 +3655,7 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
             )
             capacity_bytes = probe.ceiling_bytes
             capacity_source = "admission_ceiling"
+            ceiling_components = probe.breakdown
             if not probe.fast_probe_ok and admin_port > 0:
                 # The peer's own advertised port did not answer: the ceiling
                 # above came from the slower in-process computation. Confess
@@ -3541,6 +3676,11 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
                             else ""
                         ),
                     )
+        else:
+            ceiling_components = await asyncio.to_thread(
+                _local_ceiling_components
+            )
+            physical_bytes = _system_memory_bytes()
         budget = await asyncio.to_thread(
             suggest_budget,
             role=request.roles.get(host.node_id, "headless"),
@@ -3548,7 +3688,16 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
             capacity_bytes=capacity_bytes,
             capacity_source=capacity_source,
         )
-        return {"node_id": host.node_id, "ssh": host.ssh, **budget.to_dict()}
+        return {
+            "node_id": host.node_id,
+            "ssh": host.ssh,
+            **budget.to_dict(),
+            "breakdown": _budget_breakdown(
+                physical_bytes=physical_bytes,
+                components=ceiling_components,
+                budget=budget,
+            ),
+        }
 
     try:
         nodes = list(await asyncio.gather(*(_for(host) for host in hosts)))
@@ -3558,6 +3707,69 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
             detail=f"Could not measure every Mac's usable model memory: {exc}",
         ) from exc
     return {"nodes": nodes}
+
+
+def _local_ceiling_components() -> dict[str, int] | None:
+    """This Mac's live ceiling_breakdown(), or None where the guard is absent.
+
+    Kept separate from ``node_role._enforcer_ceiling_bytes`` (which still
+    sources the capacity number through ``suggest_budget``, untouched): the
+    components here only *explain* that capacity — they never change it, per
+    B5's "no arithmetic invariants change" rule.
+    """
+
+    try:
+        from .memory_guard import ceiling_breakdown
+
+        return {key: int(value) for key, value in ceiling_breakdown().items()}
+    except Exception:  # noqa: BLE001 - the explanation is optional, the number is not
+        return None
+
+
+def _budget_breakdown(
+    *,
+    physical_bytes: int,
+    components: dict[str, int] | None,
+    budget: Any,
+) -> dict[str, Any]:
+    """The arithmetic behind one node's budget, naming what actually binds.
+
+    ``binding`` is the constraint whose relaxation would gain the most usable
+    memory: the role's reserve always competes, and a ceiling component
+    (``dynamic`` → live pressure from other applications, ``metal_cap`` → the
+    GPU allocation cap) competes only when it is the strict minimum of the
+    ceiling — i.e. when it, not the static tier reserve, set ``hard_limit``.
+    With no components (an older peer), the role reserve is the only visible
+    constraint and the ceiling renders alone.
+    """
+
+    breakdown: dict[str, Any] = {
+        "physical_bytes": max(0, int(physical_bytes or 0)),
+        "role": budget.role,
+        "reserve_bytes": int(budget.reserve_bytes),
+        "usable_bytes": int(budget.usable_bytes),
+    }
+    gains: dict[str, int] = {"role_reserve": max(0, int(budget.reserve_bytes))}
+    if components:
+        for key in ("static", "dynamic", "metal_cap", "hard_limit"):
+            breakdown[key] = int(components.get(key) or 0)
+        positive = {
+            key: breakdown[key]
+            for key in ("static", "dynamic", "metal_cap")
+            if breakdown[key] > 0
+        }
+        for key, label in (
+            ("dynamic", "dynamic_pressure"),
+            ("metal_cap", "metal_cap"),
+        ):
+            value = positive.get(key)
+            if value is None:
+                continue
+            others = [v for k, v in positive.items() if k != key]
+            if others and value < min(others):
+                gains[label] = min(others) - value
+    breakdown["binding"] = max(gains, key=gains.__getitem__)
+    return breakdown
 
 
 def _local_ssh_target(value: str) -> bool:

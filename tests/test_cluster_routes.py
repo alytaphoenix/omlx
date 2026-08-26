@@ -689,6 +689,161 @@ def test_cluster_node_budgets_confess_a_dead_advertised_port(
     )
 
 
+def test_cluster_node_budgets_break_down_a_workstation_48gb_node(monkeypatch):
+    """B5: the memory row's arithmetic arrives whole, naming what binds.
+
+    A 48 GiB Mac someone works on: the live ceiling shaves a few GiB
+    (dynamic pressure), but the Workstation reserve (32 GiB) is by far the
+    largest deduction — so `role_reserve` must be named as the binding
+    constraint, and every component must ride along for the row to render
+    physical − ceiling − reserve = usable.
+    """
+
+    from omlx.cluster.launch import AdmissionCeilingProbe
+
+    gib = 1024**3
+    components = {
+        "static": 46 * gib,
+        "dynamic": 44 * gib,
+        "metal_cap": 48 * gib,
+        "hard_limit": 44 * gib,
+    }
+    monkeypatch.setattr(
+        routes, "_PEER_PHYSICAL_BYTES", {"studio.local": 48 * gib}
+    )
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_admission_ceiling",
+        lambda ssh, *, python_executable, admin_port: AdmissionCeilingProbe(
+            44 * gib, breakdown=dict(components)
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [{"node_id": "studio", "ssh": "studio.local"}],
+            "roles": {"studio": "workstation"},
+        },
+    )
+
+    assert response.status_code == 200
+    node = response.json()["nodes"][0]
+    assert node["capacity_bytes"] == 44 * gib
+    breakdown = node["breakdown"]
+    assert breakdown["physical_bytes"] == 48 * gib
+    for key, value in components.items():
+        assert breakdown[key] == value
+    assert breakdown["role"] == "workstation"
+    # Workstation reserve: max(32 GiB floor, 50% of the 44 GiB ceiling).
+    assert breakdown["reserve_bytes"] == 32 * gib
+    assert breakdown["usable_bytes"] == 12 * gib
+    # The reserve costs 32 GiB; relaxing dynamic pressure would gain 2 GiB.
+    assert breakdown["binding"] == "role_reserve"
+    # The plain budget keys are unchanged for older dashboard code.
+    assert node["reserve_bytes"] == 32 * gib
+    assert node["usable_bytes"] == 12 * gib
+
+
+def test_cluster_node_budgets_name_dynamic_pressure_when_it_binds(monkeypatch):
+    """A headless Mac under load: other apps' pressure outweighs the reserve."""
+
+    from omlx.cluster.launch import AdmissionCeilingProbe
+
+    gib = 1024**3
+    monkeypatch.setattr(routes, "_PEER_PHYSICAL_BYTES", {})
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_admission_ceiling",
+        lambda ssh, *, python_executable, admin_port: AdmissionCeilingProbe(
+            60 * gib,
+            breakdown={
+                "static": 120 * gib,
+                "dynamic": 60 * gib,
+                "metal_cap": 107 * gib,
+                "hard_limit": 60 * gib,
+            },
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [{"node_id": "studio", "ssh": "studio.local"}],
+            "roles": {"studio": "headless"},
+        },
+    )
+
+    assert response.status_code == 200
+    breakdown = response.json()["nodes"][0]["breakdown"]
+    # Headless reserve is 6 GiB (10%); dynamic pressure withholds 47 GiB
+    # relative to the next ceiling — the larger gain names the binding.
+    assert breakdown["binding"] == "dynamic_pressure"
+
+
+def test_cluster_node_budgets_survive_a_peer_without_a_breakdown(monkeypatch):
+    """B5 version skew: an older peer degrades to the ceiling-only row."""
+
+    from omlx.cluster.launch import AdmissionCeilingProbe
+
+    gib = 1024**3
+    monkeypatch.setattr(routes, "_PEER_PHYSICAL_BYTES", {})
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_admission_ceiling",
+        lambda ssh, *, python_executable, admin_port: AdmissionCeilingProbe(
+            100 * gib
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [{"node_id": "studio", "ssh": "studio.local"}],
+            "roles": {"studio": "workstation"},
+        },
+    )
+
+    assert response.status_code == 200
+    node = response.json()["nodes"][0]
+    assert node["capacity_bytes"] == 100 * gib
+    breakdown = node["breakdown"]
+    # No ceiling components at all — the row renders the ceiling and the
+    # reserve, and the only visible constraint is the role's.
+    assert "static" not in breakdown
+    assert "hard_limit" not in breakdown
+    assert breakdown["role"] == "workstation"
+    assert breakdown["reserve_bytes"] == 50 * gib
+    assert breakdown["usable_bytes"] == 50 * gib
+    assert breakdown["binding"] == "role_reserve"
+
+
+def test_peer_probe_results_teach_the_physical_memory(monkeypatch):
+    """B5: capability probes deposit physical RAM beside the admin port."""
+
+    monkeypatch.setattr(routes, "_PEER_ADMIN_PORTS", {})
+    monkeypatch.setattr(routes, "_PEER_PHYSICAL_BYTES", {})
+    routes._note_peer_admin_port(
+        {
+            "ok": True,
+            "ssh": "user@Studio.local",
+            "status": {
+                "node": {
+                    "admin_port": 8123,
+                    "physical_memory_bytes": 128 * 1024**3,
+                }
+            },
+        }
+    )
+    assert routes._peer_physical_bytes("studio.local") == 128 * 1024**3
+    # A payload without the field (older peer) teaches nothing and keeps
+    # the previous reading.
+    routes._note_peer_admin_port(
+        {"ok": True, "ssh": "studio.local", "status": {"node": {}}}
+    )
+    assert routes._peer_physical_bytes("studio.local") == 128 * 1024**3
+
+
 def test_fabric_drift_is_detected_and_confessed_once(monkeypatch, tmp_path):
     """C5 watchdog: drifted ifconfig addressing becomes one WARN, not spam."""
 
@@ -892,6 +1047,79 @@ def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch
         4 * short_plan["cluster"]["kv_cache_bytes"]
     )
     assert long_plan["placement_signature"] != short_plan["placement_signature"]
+
+
+def _vlm_layout(path):
+    """A VLM-shaped layout: shards across Macs, but cannot pipeline (#2819)."""
+
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    return ModelLayout(
+        source=str(path),
+        fixed_weight_bytes=1 * gib,
+        layer_weight_bytes=(2 * gib,) * 8,
+        tensor_parallel_heads=32,
+        supports_tensor_parallel=True,
+        supports_pipeline=False,
+    )
+
+
+def test_cluster_plan_reports_which_strategies_this_model_supports(monkeypatch):
+    """B5: /plan carries the per-mode verdicts the radio buttons gate on."""
+
+    monkeypatch.setattr(routes, "inspect_safetensors_layout", _vlm_layout)
+
+    response = _client().post(
+        "/admin/api/cluster/plan",
+        json={
+            "model_path": "/models/vlm",
+            "tensor_parallel_size": 2,
+            "nodes": [
+                {"node_id": "local", "capacity_bytes": 64 * 1024**3},
+                {"node_id": "studio", "capacity_bytes": 64 * 1024**3},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    strategies = response.json()["strategies"]
+    assert strategies["tensor"]["supported"] is True
+    assert strategies["pipeline"]["supported"] is False
+    assert "pipeline forward path" in strategies["pipeline"]["reason"]
+    # The verdict rides beside the existing descriptions, not instead of them.
+    assert strategies["pipeline"]["label"]
+    assert strategies["auto"]["supported"] is True
+
+
+def test_autoconfigure_reports_pipeline_unsupported_for_a_vlm(monkeypatch):
+    """B5: the one-click proposal names the modes this model cannot run."""
+
+    monkeypatch.setattr(routes, "inspect_safetensors_layout", _vlm_layout)
+
+    response = _client().post(
+        "/admin/api/cluster/autoconfigure",
+        json={
+            "model_path": "/models/vlm",
+            "nodes": [
+                {"node_id": "local", "capacity_bytes": 64 * 1024**3},
+                {"node_id": "studio", "capacity_bytes": 64 * 1024**3},
+            ],
+            "detect_transports": False,
+            "preflight": False,
+            "auto_tune": False,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    strategies = body["strategies"]
+    assert strategies["pipeline"]["supported"] is False
+    assert "pipeline forward path" in strategies["pipeline"]["reason"]
+    assert strategies["tensor"]["supported"] is True
+    assert strategies["tensor"]["reason"] == ""
+    # Automatic picked the only workable split: one tensor stage.
+    assert body["tensor_parallel_size"] == 2
 
 
 def test_selected_context_is_the_runtime_kv_ceiling():

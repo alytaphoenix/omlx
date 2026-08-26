@@ -564,6 +564,99 @@ def test_remote_memory_probe_confesses_a_dead_fast_path():
     assert "Connection refused" in probe.fast_probe_error
 
 
+def test_remote_memory_probe_parses_the_ceiling_breakdown():
+    """B5: the script's breakdown payload arrives typed, ceiling untouched."""
+
+    gib = 1024**3
+    components = {
+        "static": 46 * gib,
+        "dynamic": 44 * gib,
+        "metal_cap": 48 * gib,
+        "hard_limit": 44 * gib,
+    }
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {
+                    "admission_ceiling_bytes": 44 * gib,
+                    "fast_probe_ok": True,
+                    "fast_probe_error": "",
+                    "breakdown": components,
+                }
+            ),
+            stderr="",
+        )
+
+    probe = launch.probe_remote_admission_ceiling(
+        "user@studio.local",
+        python_executable="/opt/omlx/bin/python",
+        admin_port=8123,
+        runner=runner,
+    )
+
+    assert probe.ceiling_bytes == 44 * gib
+    assert probe.breakdown == components
+    script = calls[0][-1]
+    # The fast path reads the components from the same /health reply it
+    # already fetches; the slow path computes them beside the ceiling. The
+    # compat key stays top-level either way.
+    assert "ceiling_breakdown" in script
+    assert "admission_ceiling_bytes" in script
+    assert "breakdown" in script
+
+
+def test_remote_memory_probe_missing_breakdown_degrades_to_ceiling_only():
+    """B5: an older peer without the breakdown key stays a working probe."""
+
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({"admission_ceiling_bytes": 213 * 1024**3}),
+            stderr="",
+        )
+
+    probe = launch.probe_remote_admission_ceiling(
+        "user@studio.local",
+        python_executable="/opt/omlx/bin/python",
+        runner=runner,
+    )
+
+    assert probe.ceiling_bytes == 213 * 1024**3
+    assert probe.breakdown is None
+
+
+def test_remote_memory_probe_discards_a_malformed_breakdown():
+    """A breakdown that is not a dict of ints degrades, never raises."""
+
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {
+                    "admission_ceiling_bytes": 64 * 1024**3,
+                    "breakdown": {"static": "not-a-number"},
+                }
+            ),
+            stderr="",
+        )
+
+    probe = launch.probe_remote_admission_ceiling(
+        "user@studio.local",
+        python_executable="/opt/omlx/bin/python",
+        runner=runner,
+    )
+
+    assert probe.ceiling_bytes == 64 * 1024**3
+    assert probe.breakdown is None
+
+
 def test_preflight_refuses_a_stage_above_the_live_rank_ceiling():
     deployment = _deployment()
 

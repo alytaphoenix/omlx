@@ -3610,9 +3610,98 @@
                 ) || null;
             },
 
-            clusterTensorParallelOptions() {
+            // Which parallelism modes this model can actually run (B5).
+            // Server verdicts win: /autoconfigure and /plan return a
+            // `strategies` map computed from the model profile's
+            // supports_tensor_parallel / supports_pipeline flags. Before any
+            // server response arrives, the catalogue fit's own flags fill in;
+            // with nothing known, both modes stay offered and the server's
+            // PlanningError remains the backstop.
+            clusterStrategySupport() {
+                const entry = (value, fallbackReason) => ({
+                    supported: value?.supported !== false,
+                    reason: value?.reason || fallbackReason || '',
+                });
+                const served = this.clusterAutoconfigure?.strategies
+                    || this.clusterPlan?.strategies;
+                if (served?.tensor || served?.pipeline) {
+                    return {
+                        tensor: entry(served.tensor),
+                        pipeline: entry(served.pipeline),
+                    };
+                }
+                const fit = this.clusterCatalogueFit(
+                    this.clusterPlanModelPath.trim()
+                );
+                if (fit) {
+                    return {
+                        tensor: entry(
+                            { supported: fit.supports_tensor_parallel !== false },
+                            'This architecture does not implement sharding in MLX-LM.',
+                        ),
+                        pipeline: entry(
+                            { supported: fit.supports_pipeline !== false },
+                            'This architecture has no MLX-LM pipeline forward path.',
+                        ),
+                    };
+                }
+                return {
+                    tensor: { supported: true, reason: '' },
+                    pipeline: { supported: true, reason: '' },
+                };
+            },
+
+            // Every mode the radio group renders, supported or not: an
+            // unsupported mode stays visible but disabled, with the server's
+            // reason inline (B5) — never a live option that 400s after the
+            // click. If nothing is reported supported (contradictory or stale
+            // data), degrade to offering both rather than a dead control.
+            clusterParallelismChoices() {
                 const nodes = Math.max(1, this.clusterPlanNodes.length);
-                return nodes > 1 ? [1, nodes] : [1];
+                if (nodes <= 1) {
+                    return [
+                        { size: 1, label: 'Pipeline only', supported: true, reason: '' },
+                    ];
+                }
+                const support = this.clusterStrategySupport();
+                const choices = [
+                    {
+                        size: 1,
+                        label: 'Pipeline only',
+                        supported: support.pipeline.supported,
+                        reason: support.pipeline.reason,
+                    },
+                    {
+                        size: nodes,
+                        label: `${nodes}-way tensor`,
+                        supported: support.tensor.supported,
+                        reason: support.tensor.reason,
+                    },
+                ];
+                if (!choices.some(choice => choice.supported)) {
+                    return choices.map(choice => (
+                        { ...choice, supported: true, reason: '' }
+                    ));
+                }
+                return choices;
+            },
+
+            clusterTensorParallelOptions() {
+                return this.clusterParallelismChoices()
+                    .filter(choice => choice.supported)
+                    .map(choice => choice.size);
+            },
+
+            // The helper line beside the radios: the disabled mode's reason
+            // when one is disabled, otherwise the usual explanation of the
+            // selected mode.
+            clusterParallelismHint() {
+                const unsupported = this.clusterParallelismChoices()
+                    .find(choice => !choice.supported);
+                if (unsupported) return unsupported.reason;
+                return Number(this.clusterPlanTensorParallelSize) > 1
+                    ? 'Every detected accelerator works on every token'
+                    : `Each of the ${this.clusterPlanNodes.length} detected accelerators holds different layers`;
             },
 
             // The catalogue fit is the FEWEST-node plan: a model that fits one
@@ -3638,37 +3727,23 @@
             },
 
             normalizeClusterTensorParallelSize() {
-                const options = this.clusterTensorParallelOptions();
-                const current = Number(this.clusterPlanTensorParallelSize);
-                // Snap an out-of-range value to the largest available degree
-                // (tensor parallelism) rather than 1 (pipeline) — several
+                // Guard against the status poll transiently reporting a single
+                // node: resetting to 1 there silently threw away a user's
+                // multi-way tensor choice every ~10s. Only correct a value the
+                // supported modes no longer include, and snap to the largest
+                // degree (tensor) rather than 1 (pipeline) — several
                 // architectures (VLMs) support tensor but not the MLX-LM
                 // pipeline forward path, so 1 would make the only valid plan
-                // fail. This must also fire when the cluster genuinely shrank
-                // to one node (options === [1]); leaving a stale multi-way
-                // size there sends /plan a world size that cannot divide. The
-                // transient-poll wipe this used to cause is prevented
-                // upstream: the poll skips resync mid-activation and only
-                // rebuilds the node set when it actually changed.
-                if (!options.includes(current)) {
-                    this.clusterPlanTensorParallelSize =
-                        options[options.length - 1];
-                    this.invalidateClusterPlan();
-                }
-                // tp=1 on a multi-node cluster means pipeline. For a model whose
-                // architecture cannot pipeline the only valid multi-node plan is
-                // full tensor; leaving 1 here guarantees a 400 from /plan on
-                // every preview.
-                const fit = this.clusterCatalogueFit(
-                    this.clusterPlanModelPath.trim()
-                );
-                if (
-                    options.length > 1
-                    && Number(this.clusterPlanTensorParallelSize) === 1
-                    && fit?.fits === true
-                    && fit.supports_pipeline === false
-                    && fit.supports_tensor_parallel === true
-                ) {
+                // fail. The old second pass that re-derived "cannot pipeline"
+                // from catalogue-fit flags here ([#2819] guesswork) is gone:
+                // clusterParallelismChoices() already excludes an unsupported
+                // mode from the live options using the server's `strategies`
+                // verdict, so the generic snap below covers it.
+                const choices = this.clusterParallelismChoices();
+                if (choices.length <= 1) return;
+                const options = this.clusterTensorParallelOptions();
+                const current = Number(this.clusterPlanTensorParallelSize);
+                if (options.length && !options.includes(current)) {
                     this.clusterPlanTensorParallelSize =
                         options[options.length - 1];
                     this.invalidateClusterPlan();
@@ -6043,6 +6118,84 @@
                 return (this.clusterNodeRoles.find(r => r.key === key) || {}).summary || '';
             },
 
+            clusterRoleLabel(key) {
+                return (this.clusterNodeRoles.find(r => r.key === key) || {}).label
+                    || String(key || 'headless');
+            },
+
+            // The memory row's arithmetic (B5): physical, minus what the live
+            // ceiling already rules out, minus the role's reserve, equals what
+            // the planner may assign. Every number comes from the server's
+            // /node-budgets breakdown — nothing is derived client-side.
+            clusterBudgetBreakdownLine(node) {
+                const b = node?.budget_breakdown;
+                if (!b) return '';
+                const gib = value =>
+                    `${(Number(value || 0) / 1024 ** 3).toFixed(1)} GiB`;
+                const hard = Number(b.hard_limit || 0);
+                const physical = Number(b.physical_bytes || 0);
+                const parts = [];
+                if (physical > 0) {
+                    parts.push(`${gib(physical)} physical`);
+                    if (hard > 0 && physical > hard) {
+                        // Name the component that set the ceiling. `dynamic`
+                        // is reclaimable-based, not an app-by-app account, so
+                        // the copy says "right now" rather than pretending to
+                        // a per-app ledger.
+                        let why = 'kept back by the memory-guard tier';
+                        if (Number(b.metal_cap || 0) > 0
+                            && hard === Number(b.metal_cap)) {
+                            why = 'beyond what the GPU can address';
+                        }
+                        if (Number(b.dynamic || 0) > 0
+                            && hard === Number(b.dynamic)) {
+                            why = 'in use by other apps right now';
+                        }
+                        parts.push(`− ${gib(physical - hard)} ${why}`);
+                    }
+                } else if (hard > 0) {
+                    // Older peer or unknown physical: start from the measured
+                    // ceiling instead of inventing a physical number.
+                    parts.push(`${gib(hard)} safe ceiling`);
+                } else {
+                    parts.push(`${gib(node.capacity_bytes || 0)} measured ceiling`);
+                }
+                if (Number(b.reserve_bytes || 0) > 0) {
+                    parts.push(
+                        `− ${gib(b.reserve_bytes)} held back `
+                        + `(${this.clusterRoleLabel(b.role)})`
+                    );
+                }
+                parts.push(`= ${gib(b.usable_bytes)} for the cluster`);
+                return parts.join(' ');
+            },
+
+            clusterBudgetBindingLabel(node) {
+                const b = node?.budget_breakdown;
+                if (!b) return '';
+                return {
+                    role_reserve:
+                        `${this.clusterRoleLabel(b.role)} reserve is the binding limit`,
+                    dynamic_pressure:
+                        'Other apps’ memory use is the binding limit right now',
+                    metal_cap:
+                        'The GPU allocation cap is the binding limit',
+                }[b.binding] || '';
+            },
+
+            // Evidence age: the breakdown is a live reading, and a stale one
+            // must say so rather than impersonate the present.
+            clusterBudgetEvidenceAge(node) {
+                const at = Number(node?.budget_measured_at || 0);
+                if (!at) return '';
+                const seconds = Math.max(
+                    0, Math.round((Date.now() - at) / 1000)
+                );
+                if (seconds < 60) return `measured ${seconds}s ago`;
+                const minutes = Math.round(seconds / 60);
+                return `measured ${minutes} min ago`;
+            },
+
             // Ask each Mac what it can actually offer. Installed RAM overstates
             // a MacBook by ~20 GiB because the GPU cannot address it all, and a
             // plan built on that number is refused at load.
@@ -6080,6 +6233,12 @@
                             n => String(n.node_id || '').trim() === measured.node_id
                         );
                         if (!node || !measured.capacity_bytes) return;
+                        // The arithmetic behind the number (B5). Stored on
+                        // every poll — including drift-guarded ones — because
+                        // it explains the row without changing any plan input,
+                        // and its age is part of the evidence.
+                        node.budget_breakdown = measured.breakdown || null;
+                        node.budget_measured_at = Date.now();
                         const capacityGiB = Number(
                             (measured.capacity_bytes / gib).toFixed(2)
                         );

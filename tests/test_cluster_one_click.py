@@ -1884,6 +1884,12 @@ def test_three_mac_cluster_builds_three_rank_hosts_and_valid_tp_choices():
             "clusterWorkerPeers",
             "clusterClusterHostsPayload",
             "clusterTensorParallelOptions",
+            # B5: the options derive from the per-mode support verdicts; with
+            # no server strategies and no catalogue fit, both modes stay
+            # offered exactly as before.
+            "clusterParallelismChoices",
+            "clusterStrategySupport",
+            "clusterCatalogueFit",
         ),
         """
 component.clusterSelectedPeers = [
