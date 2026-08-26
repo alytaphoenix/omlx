@@ -5,11 +5,26 @@ import base64
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omlx.cluster import routes
 from omlx.cluster.enrollment import ClusterEnrollmentStore
+from omlx.cluster.start_job import reset_start_job_store
+
+
+@pytest.fixture(autouse=True)
+def _fresh_start_jobs():
+    """The B2 job store is a process-wide singleton; keep tests independent.
+
+    A leaked non-terminal job would 409 every later activation test, so the
+    store is reset around each test in this module.
+    """
+
+    reset_start_job_store()
+    yield
+    reset_start_job_store()
 from omlx.cluster.models import (
     ClusterStatus,
     RDMACapability,
@@ -2648,3 +2663,176 @@ def test_doctor_report_lands_in_diagnostics(tmp_path, monkeypatch):
     assert len(reports) == 1
     assert reports[0]["phase"] == "completed"
     assert reports[0]["verdict"] == "Fabric verified — every check passed."
+
+
+def _start_job_body(model_path):
+    """The autoconfigure request shape POST /start-jobs accepts (B2)."""
+
+    return {
+        "model_path": str(model_path),
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {"node_id": "large", "ssh": "127.0.0.1", "ips": ["192.168.5.1"]},
+            {"node_id": "small", "ssh": "studio.local", "ips": ["192.168.5.2"]},
+        ],
+    }
+
+
+def test_start_job_post_returns_202_with_the_job_record(tmp_path, monkeypatch):
+    scheduled = []
+    monkeypatch.setattr(
+        routes,
+        "_schedule_start_job",
+        lambda job_id, request: scheduled.append(job_id),
+    )
+
+    client = _client()
+    response = client.post(
+        "/admin/api/cluster/start-jobs",
+        json=_start_job_body(tmp_path / "model"),
+    )
+
+    assert response.status_code == 202
+    job = response.json()
+    assert job["job_id"]
+    assert job["phase"] == "queued"
+    assert job["attempt"] == 1
+    assert job["model_path"] == str(tmp_path / "model")
+    assert job["hosts"] == ["127.0.0.1", "studio.local"]
+    assert job["staging_job_id"] is None
+    assert job["superseded_by"] is None
+    assert job["result"] is None
+    assert scheduled == [job["job_id"]]
+
+    fetched = client.get(f"/admin/api/cluster/start-jobs/{job['job_id']}")
+    assert fetched.status_code == 200
+    assert fetched.json()["job_id"] == job["job_id"]
+
+    listed = client.get("/admin/api/cluster/start-jobs")
+    assert listed.status_code == 200
+    assert listed.json()["jobs"][0]["job_id"] == job["job_id"]
+
+    missing = client.get("/admin/api/cluster/start-jobs/" + "f" * 24)
+    assert missing.status_code == 404
+
+
+def test_start_job_post_refuses_a_second_job_for_the_same_model(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        routes, "_schedule_start_job", lambda job_id, request: None
+    )
+    client = _client()
+    body = _start_job_body(tmp_path / "model")
+
+    first = client.post("/admin/api/cluster/start-jobs", json=body)
+    assert first.status_code == 202
+
+    second = client.post("/admin/api/cluster/start-jobs", json=body)
+    assert second.status_code == 409
+    assert first.json()["job_id"] in second.json()["detail"]
+
+    # A different model is a different job; the refusal is per model.
+    other = client.post(
+        "/admin/api/cluster/start-jobs",
+        json=_start_job_body(tmp_path / "other-model"),
+    )
+    assert other.status_code == 202
+
+
+def test_start_job_post_refuses_while_a_manual_activation_runs(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        routes, "_schedule_start_job", lambda job_id, request: None
+    )
+    monkeypatch.setattr(routes, "_SYNC_ACTIVATIONS_IN_FLIGHT", 1)
+
+    response = _client().post(
+        "/admin/api/cluster/start-jobs",
+        json=_start_job_body(tmp_path / "model"),
+    )
+    assert response.status_code == 409
+    assert "manual activation" in response.json()["detail"]
+
+
+def test_start_job_supersedes_the_previous_failed_attempt(
+    tmp_path, monkeypatch
+):
+    from omlx.cluster.incidents import Severity, configure_cluster_incidents
+    from omlx.cluster.start_job import get_start_job_store
+
+    incident_store = configure_cluster_incidents(tmp_path)
+    monkeypatch.setattr(
+        routes, "_schedule_start_job", lambda job_id, request: None
+    )
+    client = _client()
+    body = _start_job_body(tmp_path / "model")
+
+    first = client.post("/admin/api/cluster/start-jobs", json=body).json()
+    failure = incident_store.record(
+        Severity.ERROR,
+        "coordinator",
+        "start_activation_failed",
+        "canary failed",
+        job_id=first["job_id"],
+    )
+    get_start_job_store().update(
+        first["job_id"], phase="failed", error="canary failed"
+    )
+
+    second = client.post("/admin/api/cluster/start-jobs", json=body)
+    assert second.status_code == 202
+    second_job = second.json()
+    assert second_job["attempt"] == 2
+
+    old = client.get(
+        f"/admin/api/cluster/start-jobs/{first['job_id']}"
+    ).json()
+    assert old["superseded_by"] == second_job["job_id"]
+
+    # The earlier attempt's incident is flagged, never deleted, and the
+    # replacement announced itself in the feed.
+    by_id = {item.id: item for item in incident_store.list()}
+    assert by_id[failure.id].superseded_by is not None
+    assert any(
+        item.state_code == "start_job_superseded"
+        and item.job_id == second_job["job_id"]
+        for item in incident_store.list()
+    )
+
+
+def test_legacy_deployments_post_is_refused_while_a_start_job_runs(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        routes, "_schedule_start_job", lambda job_id, request: None
+    )
+    client = _client()
+    running = client.post(
+        "/admin/api/cluster/start-jobs",
+        json=_start_job_body(tmp_path / "model"),
+    ).json()
+
+    # The guard fires before any planning, so a shape-valid body suffices.
+    response = client.post(
+        "/admin/api/cluster/deployments",
+        json={
+            "model_path": str(tmp_path / "model"),
+            "backend": "ring",
+            "nodes": [
+                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+            ],
+            "hosts": [
+                {"node_id": "large", "ssh": "127.0.0.1", "ips": ["192.168.5.1"]},
+                {"node_id": "small", "ssh": "studio.local", "ips": ["192.168.5.2"]},
+            ],
+            "approved_placement": "0" * 32,
+        },
+    )
+    assert response.status_code == 409
+    assert running["job_id"] in response.json()["detail"]

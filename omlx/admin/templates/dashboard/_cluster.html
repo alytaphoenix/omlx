@@ -1961,11 +1961,9 @@
                                         :disabled="clusterLinkSetupLoading || clusterAutoconfigureLoading || clusterActivationLoading"
                                         class="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 whitespace-nowrap shrink-0">
                                     <i data-lucide="power" class="w-3.5 h-3.5"></i>
-                                    <span x-text="clusterLinkSetupLoading
-                                        ? (clusterActivationProgress || 'Configuring Thunderbolt…')
-                                        : (clusterActivationLoading
-                                            ? (clusterActivationProgress || 'Starting cluster…')
-                                            : (clusterAutoconfigureLoading ? 'Checking every worker…' : 'Start Cluster'))"></span>
+                                    <!-- B2: the label renders the server-owned
+                                         job's phase, so it survives reloads. -->
+                                    <span x-text="clusterStartButtonLabel()"></span>
                                 </button>
                             </div>
 
