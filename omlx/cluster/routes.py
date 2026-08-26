@@ -120,7 +120,7 @@ from .transport import (
     resolve_link_addresses,
     verify_link_reachability,
 )
-from .vpn import detect_vpn, full_tunnel_warning
+from .vpn import detect_vpn, full_tunnel_warning, hostile_networks
 from .worker_bundle import (
     build_cuda_join_command,
     cuda_bootstrap_program,
@@ -382,6 +382,145 @@ def _record_cluster_incident(
 # is enough — a server restart re-announcing a still-hungry VPN is correct.
 _VPN_FULL_TUNNEL_SEEN: set[str] = set()
 _VPN_FULL_TUNNEL_LOCK = threading.Lock()
+
+# The freshest admin port each peer advertised in its ClusterStatus (C5).
+# There is no server-side peer registry yet (Section A's PairedPeer will own
+# this field); until then, every capability probe that flows through this
+# module deposits the advertised port here so /node-budgets can aim the fast
+# ceiling probe at the peer's real server instead of guessing. In-memory is
+# correct: a restart simply re-learns the port from the next probe.
+_PEER_ADMIN_PORTS: dict[str, int] = {}
+_PEER_ADMIN_PORTS_LOCK = threading.Lock()
+# One WARN per dead advertised port, not one per dashboard poll.
+_CEILING_FALLBACK_SEEN: set[tuple[str, int]] = set()
+
+
+def _peer_key(ssh_target: str) -> str:
+    """One cache key for ``studio.local`` and ``user@studio.local`` alike."""
+
+    return ssh_target.strip().rsplit("@", 1)[-1].lower()
+
+
+def _note_peer_admin_port(probe_result: Any) -> None:
+    """Remember the admin port a capability probe just saw a peer advertise.
+
+    Best-effort by design: a probe payload without the field (older peer,
+    hardware-inventory fallback) simply teaches nothing, and the fast path
+    keeps its legacy port guesses for that peer.
+    """
+
+    if not isinstance(probe_result, dict):
+        return
+    status = probe_result.get("status")
+    if not isinstance(status, dict):
+        return
+    node = status.get("node")
+    if not isinstance(node, dict):
+        return
+    try:
+        port = int(node.get("admin_port") or 0)
+    except (TypeError, ValueError):
+        return
+    ssh_target = str(probe_result.get("ssh") or "")
+    if port <= 0 or not ssh_target:
+        return
+    with _PEER_ADMIN_PORTS_LOCK:
+        _PEER_ADMIN_PORTS[_peer_key(ssh_target)] = port
+
+
+def _advertised_admin_port(ssh_target: str) -> int:
+    with _PEER_ADMIN_PORTS_LOCK:
+        return _PEER_ADMIN_PORTS.get(_peer_key(ssh_target), 0)
+
+
+# Drift is a standing condition too: one WARN per (subnet, kind), not one per
+# fabric read. A restart re-announcing still-drifted addressing is correct.
+_FABRIC_DRIFT_SEEN: set[tuple[str, str]] = set()
+_FABRIC_DRIFT_LOCK = threading.Lock()
+
+
+def _detect_fabric_drift(
+    hosts: list[str], interfaces: dict[str, Any]
+) -> dict[str, Any] | None:
+    """C5's drift watchdog, run where fresh interface readings are in hand.
+
+    Returns the ``DriftFinding`` as plain data (plus the intent's
+    ``addressing``) for the caller to act on, or None when there is no
+    recorded intent for this pair, the store is unconfigured, or live
+    addressing still matches the record. Poll-driven by design — no
+    wake/network-change watcher exists or is wanted; one dashboard tick is
+    when anyone can act on drift anyway.
+    """
+
+    from .fabric_intent import detect_drift, get_fabric_intent
+
+    try:
+        store = get_fabric_intent()
+    except RuntimeError:
+        return None
+    intent = store.current()
+    if intent is None or frozenset(intent.hosts) != frozenset(hosts):
+        return None
+    try:
+        intent_network = ipaddress.ip_network(intent.subnet)
+    except ValueError:
+        return None
+    try:
+        hostile = hostile_networks(hosts, interfaces=interfaces)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        hostile = ()
+    # The intent's own subnet sits on an interface, so the raw hostile set
+    # always contains it; that is not a collision with itself (the same
+    # ``own_networks`` filter configure_link applies).
+    collision_set = tuple(
+        net
+        for net in hostile
+        if net.version != intent_network.version
+        or not net.subnet_of(intent_network)
+    )
+
+    def collides(candidate: ipaddress.IPv4Network) -> bool:
+        return any(
+            candidate.version == net.version and candidate.overlaps(net)
+            for net in collision_set
+        )
+
+    finding = detect_drift(intent, interfaces.values(), collides=collides)
+    if finding is None:
+        return None
+    return {
+        "kind": finding.kind,
+        "live": finding.live,
+        "expected": finding.expected,
+        "auto_restore": finding.auto_restore,
+        "incident": finding.incident,
+        "addressing": intent.addressing,
+    }
+
+
+def _note_fabric_drift(fabric: dict[str, Any]) -> None:
+    """Act on a drift finding: confess the ones that need consent (C5).
+
+    ``auto_restore`` findings (networksetup-recorded intent, collision check
+    still passing) are deliberately not incidents and not acted on here: the
+    service configuration persists, and the next link setup re-asserts the
+    recorded intent via ``configure_link``'s tier 2 without any new consent.
+    Everything else becomes one deduped WARN inviting a consented Fabric
+    Doctor re-address — never a silent privileged action.
+    """
+
+    drift = fabric.get("drift")
+    if not isinstance(drift, dict) or drift.get("auto_restore"):
+        return
+    message = str(drift.get("incident") or "")
+    if not message:
+        return
+    key = (str(drift.get("expected") or ""), str(drift.get("kind") or ""))
+    with _FABRIC_DRIFT_LOCK:
+        if key in _FABRIC_DRIFT_SEEN:
+            return
+        _FABRIC_DRIFT_SEEN.add(key)
+    _record_cluster_incident(Severity.WARN, "fabric_drift", message)
 
 
 def _note_full_tunnel_vpns(fabric: dict[str, Any]) -> None:
@@ -1055,6 +1194,10 @@ def _resolve_fabric(
         "backend_reason": reason,
         "blocker": blocker,
         "fell_back": fell_back,
+        # C5 drift watchdog: the recorded fabric intent compared against the
+        # interface reading already in hand. Data only — the autoconfigure
+        # caller decides between silence, restore, and a WARN incident.
+        "drift": _detect_fabric_drift(hosts, interfaces),
         "link": (unresolved or links[0]).to_dict(),
         "rdma": rdma,
         "hosts": [
@@ -1200,6 +1343,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 peer_statuses[host.node_id] = await asyncio.to_thread(
                     probe_remote_host, host.ssh
                 )
+                _note_peer_admin_port(peer_statuses[host.node_id])
             except (DistributedLaunchError, OSError, ValueError):
                 peer_statuses[host.node_id] = None
     issues = preflight_issues(
@@ -1329,6 +1473,10 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         # B1 consumer of the C4 detection: the pre-warning must survive page
         # reloads, so the first sighting per host becomes an INFO incident.
         _note_full_tunnel_vpns(fabric)
+        # B1 consumer of the C5 watchdog: drifted addressing that needs a
+        # consented re-address becomes one WARN; auto-restorable drift stays
+        # silent (configure_link tier 2 re-asserts it on the next setup).
+        _note_fabric_drift(fabric)
         backend, backend_reason = fabric["backend"], fabric["backend_reason"]
         if fabric["ok"]:
             for host, discovered in zip(activation_hosts, fabric["hosts"]):
@@ -2590,11 +2738,16 @@ async def cluster_peer_probe(request: ClusterPeerProbeRequest):
     """Probe a trusted known_hosts peer without changing either Mac."""
 
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             probe_remote_host,
             request.ssh,
             route_to=request.route_to,
         )
+        # The freshest status this coordinator holds for the peer: remember
+        # the admin port it advertised so the fast ceiling probe (C5) can
+        # target the real server.
+        _note_peer_admin_port(result)
+        return result
     except DistributedLaunchError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
@@ -3092,7 +3245,8 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
         capacity_bytes = 0
         capacity_source: str | None = None
         if not _local_ssh_target(host.ssh):
-            capacity_bytes = await asyncio.to_thread(
+            admin_port = _advertised_admin_port(host.ssh)
+            probe = await asyncio.to_thread(
                 probe_remote_admission_ceiling,
                 host.ssh,
                 # No fallback to sys.executable: inside the packaged app that
@@ -3100,8 +3254,30 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
                 # import oMLX, so every poll 503'd (#2680). Unknown means the
                 # probe discovers the peer's own interpreter.
                 python_executable=host.python_executable,
+                admin_port=admin_port,
             )
+            capacity_bytes = probe.ceiling_bytes
             capacity_source = "admission_ceiling"
+            if not probe.fast_probe_ok and admin_port > 0:
+                # The peer's own advertised port did not answer: the ceiling
+                # above came from the slower in-process computation. Confess
+                # once per dead port, not once per dashboard poll.
+                key = (_peer_key(host.ssh), admin_port)
+                with _PEER_ADMIN_PORTS_LOCK:
+                    seen = key in _CEILING_FALLBACK_SEEN
+                    _CEILING_FALLBACK_SEEN.add(key)
+                if not seen:
+                    _record_cluster_incident(
+                        Severity.WARN,
+                        "ceiling_fast_probe_fallback",
+                        f"fast ceiling probe unreachable on port {admin_port}; "
+                        "using slower local computation"
+                        + (
+                            f" ({probe.fast_probe_error})"
+                            if probe.fast_probe_error
+                            else ""
+                        ),
+                    )
         budget = await asyncio.to_thread(
             suggest_budget,
             role=request.roles.get(host.node_id, "headless"),
