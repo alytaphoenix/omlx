@@ -661,16 +661,22 @@ def _register_cluster_routes() -> None:
     global _cluster_routes_registered
     if _cluster_routes_registered:
         return
+    from .admin.routes import stamp_asset_version
     from .cluster.routes import join_router as cluster_join_router
     from .cluster.routes import router as cluster_router
     from .cluster.routes import set_cluster_getters
 
     set_cluster_getters(get_engine_pool)
+    # stamp_asset_version comes after require_admin on purpose: dependencies
+    # run in order, so an unauthenticated request is redirected to login
+    # before the X-Omlx-Asset-Version header exists — the dashboard must
+    # never misread a 401/302 as a stale-bundle signal (design B6).
     app.include_router(
         cluster_router,
         dependencies=[
             Depends(require_admin),
             Depends(require_distributed_inference_enabled),
+            Depends(stamp_asset_version),
         ],
     )
     # The bootstrap bytes are public but pinned by SHA-256 in an admin-created

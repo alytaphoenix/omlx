@@ -3251,3 +3251,155 @@ def test_readiness_rejects_an_invalid_ssh_target_before_probing(
 
     assert response.status_code == 400
     assert calls.get("probe") is None
+
+
+# ---------------------------------------------------------------------------
+# B6: GET /diagnostics?incident=<id> — the one-click evidence slice.
+
+
+def _record_slice_incident(store, **kwargs):
+    from omlx.cluster.incidents import Severity
+
+    return store.record(
+        Severity.ERROR,
+        kwargs.pop("source", "coordinator"),
+        kwargs.pop("state_code", "start_activation_failed"),
+        kwargs.pop("message", "rank 1 exited during load"),
+        **kwargs,
+    )
+
+
+def test_diagnostics_slice_correlates_job_readiness_and_log_window(
+    tmp_path, monkeypatch
+):
+    """The slice is that incident plus its job, readiness, and ±30 s window."""
+
+    from datetime import UTC, datetime
+
+    from omlx.cluster.incidents import configure_cluster_incidents
+    from omlx.cluster.start_job import get_start_job_store
+
+    incident_store = configure_cluster_incidents(tmp_path)
+    job, _ = get_start_job_store().create(
+        model_path=str(tmp_path / "model"),
+        hosts=["127.0.0.1", "studio.local"],
+    )
+    incident = _record_slice_incident(
+        incident_store,
+        job_id=job["job_id"],
+        deployment_id="dep-b6",
+    )
+    noise = _record_slice_incident(
+        incident_store, message="unrelated other incident"
+    )
+
+    def _iso(offset: float) -> str:
+        return datetime.fromtimestamp(incident.ts + offset, UTC).isoformat()
+
+    async def _fake_runtime():
+        return {
+            "jobs": [
+                {"rank": 0, "phase": "failed", "updated_at": _iso(5.0),
+                 "join_key": "must-not-leak"},
+                {"rank": 1, "phase": "ready", "updated_at": _iso(-12.0)},
+                {"rank": 0, "phase": "ready", "updated_at": _iso(120.0)},
+                {"rank": 0, "phase": "ready", "updated_at": "not-a-time"},
+            ],
+            "launchers": [
+                {"deployment_id": "dep-b6",
+                 "stderr_tail": ["ssh alyta@studio.local: exit 255"]},
+                {"deployment_id": "dep-other",
+                 "stderr_tail": ["should not appear"]},
+            ],
+        }
+
+    readiness_asked = {}
+
+    async def _fake_readiness(hosts: str, model: str = ""):
+        readiness_asked.update(hosts=hosts, model=model)
+        return {"ready": False, "rows": [], "hosts": hosts.split(",")}
+
+    monkeypatch.setattr(routes, "cluster_runtime", _fake_runtime)
+    monkeypatch.setattr(routes, "cluster_readiness", _fake_readiness)
+
+    response = _client().get(
+        "/admin/api/cluster/diagnostics", params={"incident": incident.id}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["scope"] == "cluster incident slice"
+
+    # Exactly the asked-for incident — the slice replaces the full bundle.
+    assert payload["incident"]["id"] == incident.id
+    assert "incidents" not in payload
+    assert noise.message not in str(payload)
+
+    # Correlation used the job's own hosts and model, nothing guessed.
+    assert payload["job"]["job_id"] == job["job_id"]
+    assert readiness_asked == {
+        "hosts": "127.0.0.1,studio.local",
+        "model": job["model_path"],
+    }
+    assert payload["readiness"]["ready"] is False
+
+    # ±30 s: the +5 s and −12 s markers made it, +120 s and the unparseable
+    # one did not; only the matching deployment's launcher tail rode along.
+    markers = [
+        entry for entry in payload["log_window"]
+        if entry["source"] == "runtime_marker"
+    ]
+    assert len(markers) == 2
+    lines = [
+        entry for entry in payload["log_window"]
+        if entry["source"] == "launcher:dep-b6"
+    ]
+    assert len(lines) == 1
+    assert "should not appear" not in str(payload["log_window"])
+
+    # Redaction applies to the slice exactly as to the full bundle.
+    assert markers[-1]["entry"]["join_key"] == "<redacted>"
+    assert lines[0]["line"] == "ssh <user>@studio.local: exit 255"
+
+
+def test_diagnostics_slice_degrades_gracefully_without_a_job(
+    tmp_path, monkeypatch
+):
+    """An incident from before any model was selected still answers (B6)."""
+
+    from omlx.cluster.incidents import configure_cluster_incidents
+
+    incident_store = configure_cluster_incidents(tmp_path)
+    incident = _record_slice_incident(
+        incident_store, state_code="vpn_full_tunnel", message="VPN eats fabric"
+    )
+
+    async def _fake_runtime():
+        return {"jobs": [], "launchers": []}
+
+    monkeypatch.setattr(routes, "cluster_runtime", _fake_runtime)
+
+    response = _client().get(
+        "/admin/api/cluster/diagnostics", params={"incident": incident.id}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["incident"]["id"] == incident.id
+    assert payload["job"] is None
+    assert payload["readiness"] is None
+    assert payload["log_window"] == []
+    assert payload["errors"] == []
+
+
+def test_diagnostics_slice_for_an_unknown_incident_is_a_404(tmp_path):
+    from omlx.cluster.incidents import configure_cluster_incidents
+
+    configure_cluster_incidents(tmp_path)
+
+    response = _client().get(
+        "/admin/api/cluster/diagnostics", params={"incident": "no-such-id"}
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "incident not found"

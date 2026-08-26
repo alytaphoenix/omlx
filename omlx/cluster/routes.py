@@ -2818,15 +2818,138 @@ async def cluster_runtime():
     return payload
 
 
+# B6: how far around an incident's timestamp the evidence slice reaches.
+_INCIDENT_LOG_WINDOW_S = 30.0
+
+
+def _marker_epoch(value: Any) -> float | None:
+    """Epoch seconds for an ISO-8601 runtime-marker timestamp, or ``None``."""
+
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+async def _incident_diagnostic_slice(incident_id: str) -> dict[str, Any]:
+    """One incident plus exactly the evidence needed to investigate it (B6).
+
+    Correlation is best-effort by design: an incident recorded before a
+    model was ever selected has no job, readiness, or launcher context —
+    those fields arrive as ``null``/empty rather than an error, because
+    "nothing was happening yet" is itself an answer. Everything leaves
+    through ``_redact_diagnostic`` like every other diagnostic payload.
+    """
+
+    try:
+        store = get_cluster_incidents()
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="cluster incident store is not available",
+        ) from exc
+    incident = next(
+        (item for item in store.list() if item.id == incident_id), None
+    )
+    if incident is None:
+        raise HTTPException(status_code=404, detail="incident not found")
+
+    errors: list[str] = []
+    job: dict[str, Any] | None = None
+    if incident.job_id:
+        try:
+            job = get_start_job_store().get(incident.job_id)
+        except RuntimeError as exc:
+            errors.append(f"job: {type(exc).__name__}: {exc}")
+
+    # Readiness reuses B4's report (via the cached /readiness path) against
+    # the hosts and model the correlated job actually named — never a guess.
+    readiness: dict[str, Any] | None = None
+    hosts = [
+        str(host)
+        for host in ((job or {}).get("hosts") or [])
+        if str(host).strip()
+    ]
+    if hosts:
+        try:
+            readiness = await cluster_readiness(
+                hosts=",".join(hosts),
+                model=str((job or {}).get("model_path") or ""),
+            )
+        except (HTTPException, OSError, RuntimeError, ValueError) as exc:
+            errors.append(f"readiness: {type(exc).__name__}: {exc}")
+
+    log_window: list[dict[str, Any]] = []
+    try:
+        runtime_payload = await cluster_runtime()
+    except (OSError, RuntimeError, ValueError) as exc:
+        runtime_payload = {"jobs": [], "launchers": []}
+        errors.append(f"runtime: {type(exc).__name__}: {exc}")
+    for marker in runtime_payload.get("jobs") or []:
+        if not isinstance(marker, dict):
+            continue
+        marker_ts = _marker_epoch(marker.get("updated_at"))
+        if (
+            marker_ts is None
+            or abs(marker_ts - incident.ts) > _INCIDENT_LOG_WINDOW_S
+        ):
+            continue
+        log_window.append(
+            {"ts": marker_ts, "source": "runtime_marker", "entry": marker}
+        )
+    for launcher in runtime_payload.get("launchers") or []:
+        if not isinstance(launcher, dict) or not incident.deployment_id:
+            continue
+        if launcher.get("deployment_id") != incident.deployment_id:
+            continue
+        # Launcher tail lines carry no per-line timestamps, so they join the
+        # window by deployment correlation instead of the ±30 s time filter.
+        for line in (launcher.get("stderr_tail") or [])[:64]:
+            log_window.append(
+                {
+                    "ts": None,
+                    "source": f"launcher:{incident.deployment_id}",
+                    "line": str(line),
+                }
+            )
+    log_window.sort(
+        key=lambda entry: (entry["ts"] is None, entry["ts"] or 0.0)
+    )
+
+    payload = {
+        "schema_version": 1,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "scope": "cluster incident slice",
+        "incident": incident.to_dict(),
+        "job": job,
+        "readiness": readiness,
+        "log_window": log_window[:256],
+        "errors": errors,
+    }
+    return _redact_diagnostic(payload)
+
+
 @router.get("/diagnostics")
-async def cluster_diagnostics():
+async def cluster_diagnostics(incident: str = Query(default="")):
     """Downloadable, bounded evidence for one cluster support report.
 
     The bundle is deliberately read-only. It captures the same local status,
     runtime markers, launcher tails, approved plans, and staging progress that
     are otherwise spread across several panels, while removing credentials and
     shortening unbounded worker output before the browser downloads it.
+
+    With ``?incident=<id>`` the response is the B6 evidence slice for that
+    one incident *instead of* the full bundle — the slice exists precisely
+    so nobody has to download and correlate the whole thing by hand, and the
+    full bundle's SSH-backed peer sweeps would make a one-click [Details]
+    fetch needlessly heavy.
     """
+
+    if incident.strip():
+        return await _incident_diagnostic_slice(incident.strip())
 
     errors: list[str] = []
     try:

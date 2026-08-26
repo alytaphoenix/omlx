@@ -1,5 +1,23 @@
 <div x-show="mainTab === 'cluster'" x-cloak data-cluster-view>
     <div class="animate-fade-in-up">
+        <!-- B6: stale cached bundle. Non-dismissable by design (B.3): there
+             is no close affordance because the only correct exit is the
+             reload the bar asks for — the page's JavaScript no longer
+             matches the server it is talking to. -->
+        <div x-show="assetStale" x-cloak data-asset-stale-bar
+             class="mb-6 flex items-center gap-3 rounded-xl border border-blue-300 bg-blue-50 px-4 py-3 text-sm text-blue-900">
+            <i data-lucide="refresh-cw" class="w-4 h-4 flex-shrink-0"></i>
+            <span class="font-semibold flex-shrink-0">Dashboard updated — reload</span>
+            <span class="text-xs text-blue-800 min-w-0">
+                This page is running an older copy of the dashboard than the
+                server now ships. Reload to pick up the update.
+            </span>
+            <button type="button" @click="window.location.reload()"
+                    class="ml-auto px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 flex-shrink-0">
+                Reload
+            </button>
+        </div>
+
         <!-- The normal path describes the outcome, not the distributed system. -->
         <div class="mb-6">
             <h2 class="text-2xl font-bold tracking-tight text-neutral-900">Use your accelerator pool together</h2>
@@ -120,6 +138,16 @@
                             </div>
                             <div class="text-amber-900 mt-0.5 break-words" x-text="incident.message"></div>
                         </div>
+                        <!-- B6: one click saves the server-correlated
+                             evidence slice for this incident — job record,
+                             readiness snapshot, ±30 s log window. -->
+                        <button type="button"
+                                data-incident-details
+                                @click="downloadClusterDiagnostics(incident.id)"
+                                :disabled="clusterDiagnosticsLoading"
+                                class="px-2 py-1 text-[10px] font-medium text-amber-800 border border-amber-300 rounded-md hover:bg-amber-100 flex-shrink-0 disabled:opacity-50">
+                            Details
+                        </button>
                         <button type="button"
                                 @click="dismissClusterIncident(incident.id)"
                                 class="px-2 py-1 text-[10px] font-medium text-amber-800 border border-amber-300 rounded-md hover:bg-amber-100 flex-shrink-0">
