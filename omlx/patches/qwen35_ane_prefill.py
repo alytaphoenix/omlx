@@ -2194,7 +2194,7 @@ def _bank_split_ladder(
                 total / (1 << 30),
                 _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
             )
-            return None
+            break
         spans = (
             [(0, len(source_bytes))]
             if cap <= 0
@@ -2317,7 +2317,7 @@ def _compile_single_banks(
                 total / (1 << 30),
                 _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
             )
-            return None
+            break
         spans = (
             [(0, len(weights))] if cap <= 0 else _bank_chunk_spans(weights, cap)
         )
