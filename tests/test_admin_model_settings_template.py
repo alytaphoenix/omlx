@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+from omlx.admin.routes import _load_locale
+
 
 def _model_settings_template() -> str:
     root = Path(__file__).resolve().parents[1]

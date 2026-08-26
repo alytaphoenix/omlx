@@ -1133,5 +1133,7 @@
   "modal.model_settings.profile_merge_notice": "Saving will add these new fields to your active profile.",
   "logs.auto_refresh_toggle_label": "Auto-refresh:",
   "js.error.model_settings_conflict": "Settings for this model changed on the server since you opened this form.",
-  "js.confirm.model_settings_conflict_choice": "Click OK to load the latest settings (your unsaved edits will be lost), or Cancel to overwrite the server with your current changes."
+  "js.confirm.model_settings_conflict_choice": "Click OK to load the latest settings (your unsaved edits will be lost), or Cancel to overwrite the server with your current changes.",
+  "modal.model_settings.stale_banner": "Settings changed on the server since this form was opened.",
+  "modal.model_settings.stale_banner_reload": "Reload settings"
 }
