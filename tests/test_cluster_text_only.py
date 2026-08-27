@@ -36,7 +36,10 @@ def test_text_only_layout_excludes_vision_and_mtp(tmp_path):
 
     ``vision_tower.blocks.N`` collides with decoder layer N and
     ``language_model.mtp.layers.0`` with layer 0; counting them inflated the
-    wrong stages. A VLM checkpoint (non-empty ``vision_config``) excludes them.
+    wrong stages. Vision exclusion is the caller's own ``text_only`` intent
+    (a VLM checkpoint sizes full unless a caller is specifically sizing a
+    text-only deployment of it -- see ``inspect_safetensors_layout``'s
+    docstring); MTP exclusion is unconditional (below).
     """
 
     (tmp_path / "config.json").write_text(
@@ -61,15 +64,23 @@ def test_text_only_layout_excludes_vision_and_mtp(tmp_path):
         ],
     )
 
-    layout = inspect_safetensors_layout(tmp_path)
+    # Un-flagged (catalogue) sizing: full size, vision included, MTP still
+    # excluded (unconditional).
+    full = inspect_safetensors_layout(tmp_path)
+    assert full.layer_weight_bytes == (1299, 1299)
+    assert full.fixed_weight_bytes == 150
 
-    # Only the two real decoder layers, equal-sized — no vision/MTP inflation.
-    assert layout.layer_weight_bytes == (300, 300)
-    assert layout.fixed_weight_bytes == 150  # embed + norm only
+    # A caller sizing a concrete text-only deployment of this checkpoint
+    # excludes vision too — only the two real decoder layers, equal-sized.
+    text_only = inspect_safetensors_layout(tmp_path, text_only=True)
+    assert text_only.layer_weight_bytes == (300, 300)
+    assert text_only.fixed_weight_bytes == 150  # embed + norm only
 
 
-def test_pure_text_layout_keeps_all_tensors(tmp_path):
-    """A non-VLM checkpoint (no vision_config) is unaffected by the filter."""
+def test_pure_text_layout_keeps_vision_irrelevant_but_excludes_mtp(tmp_path):
+    """A non-VLM checkpoint has no vision prefixes to exclude either way, but
+    a pure-text ``-mtp`` checkpoint has the exact same layer-0 collision as a
+    VLM's MTP heads, so MTP exclusion must not be gated on VLM-ness."""
 
     (tmp_path / "config.json").write_text(
         json.dumps({"model_type": "qwen3", "num_hidden_layers": 2})
@@ -80,6 +91,7 @@ def test_pure_text_layout_keeps_all_tensors(tmp_path):
             ("model.embed_tokens.weight", 100),
             ("model.layers.0.mlp.down_proj.weight", 300),
             ("model.layers.1.mlp.down_proj.weight", 300),
+            ("mtp.layers.0.weight", 777),  # collides w/ layer 0, no VLM in sight
             ("model.norm.weight", 50),
         ],
     )
@@ -184,3 +196,59 @@ def test_request_has_image_content_detects_image_parts():
     ]
     assert _request_has_image_content(text) is False
     assert _request_has_image_content(with_image) is True
+
+
+def test_reject_image_content_for_text_only_deployment_rejects_only_when_flagged():
+    """#2845 review: the fail-closed rejection must be a single choke point
+    every route can share, not something each route re-derives -- covers
+    the text-only + image case (400), text-only + text (fine), a
+    non-text-only deployment (guard does not apply), and a local (no
+    ``deployment`` attribute at all) engine (guard does not apply)."""
+
+    from fastapi import HTTPException
+
+    from omlx.server import _reject_image_content_for_text_only_deployment
+
+    image_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+            ],
+        }
+    ]
+    text_messages = [{"role": "user", "content": "hello"}]
+
+    text_only_engine = SimpleNamespace(deployment=SimpleNamespace(text_only=True))
+    with pytest.raises(HTTPException) as exc_info:
+        _reject_image_content_for_text_only_deployment(text_only_engine, image_messages)
+    assert exc_info.value.status_code == 400
+
+    # Plain text is always fine, even on a text-only deployment.
+    _reject_image_content_for_text_only_deployment(text_only_engine, text_messages)
+
+    # A non-text-only distributed deployment does not apply the guard.
+    vision_engine = SimpleNamespace(deployment=SimpleNamespace(text_only=False))
+    _reject_image_content_for_text_only_deployment(vision_engine, image_messages)
+
+    # A local (non-distributed) engine has no ``deployment`` attribute at
+    # all -- must not raise, not even AttributeError.
+    local_engine = SimpleNamespace()
+    _reject_image_content_for_text_only_deployment(local_engine, image_messages)
+
+
+def test_reject_image_content_choke_point_wired_into_both_routes():
+    """The specific #2845 blocker: /v1/messages must call the same
+    pre-extraction choke point /v1/chat/completions does, not silently drop
+    images via ``preserve_images`` keying on ``is_vlm`` (False for the
+    distributed engine)."""
+
+    import inspect
+
+    from omlx import server
+
+    chat_source = inspect.getsource(server.create_chat_completion)
+    anthropic_source = inspect.getsource(server.create_anthropic_message)
+    assert "_reject_image_content_for_text_only_deployment" in chat_source
+    assert "_reject_image_content_for_text_only_deployment" in anthropic_source
