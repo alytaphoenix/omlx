@@ -214,7 +214,7 @@ def test_soft_weight_target_is_clamped_to_current_safe_budget():
 # ---------------------------------------------------------------------------
 
 
-def _layout(path: str):
+def _layout(path: str, *, text_only: bool = False):
     from omlx.cluster.planner import ModelLayout
 
     return ModelLayout(
