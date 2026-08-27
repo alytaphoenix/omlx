@@ -242,7 +242,7 @@ def _validated_ssh_targets(hosts: str) -> list[str]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def inspect_safetensors_layout(model_path: str | Path):
+def inspect_safetensors_layout(model_path: str | Path, *, text_only: bool = False):
     """Compatibility seam for route tests, backed by the complete-model check.
 
     Older callers patched this route-local name.  Keeping the seam avoids
@@ -250,7 +250,7 @@ def inspect_safetensors_layout(model_path: str | Path):
     refuses a directory containing only one rank's previous stage.
     """
 
-    return complete_model_layout(model_path)
+    return complete_model_layout(model_path, text_only=text_only)
 
 
 def set_cluster_getters(engine_pool_getter: Any) -> None:
@@ -425,6 +425,13 @@ class ClusterPlanRequest(BaseModel):
     pipeline_microbatch_size: int | None = Field(default=None, gt=0, le=256)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    # Threads a concrete text-only deployment's intent into the layout
+    # measurement itself (inspect_safetensors_layout's ``text_only``): a
+    # VLM sizes full unless the caller is specifically planning a text-only
+    # deployment of it. Defaults False so every other caller of this
+    # request (autoconfigure, plain plan preview) keeps the catalogue-safe
+    # full-size measurement it already had.
+    text_only: bool = False
 
 
 class ClusterHostRequest(BaseModel):
@@ -660,7 +667,9 @@ def _model_and_nodes(request: ClusterPlanRequest):
             # A coordinator may retain only its previous pipeline stage.  Such
             # a directory is not a smaller complete model and must never be
             # used to build the next plan.
-            model = inspect_safetensors_layout(model_path)
+            model = inspect_safetensors_layout(
+                model_path, text_only=request.text_only
+            )
     else:
         model = synthetic_model_layout(
             total_weight_bytes=request.model_size_bytes,
@@ -2636,6 +2645,7 @@ def _create_deployment(
         pipeline_microbatch_size=requested_microbatch,
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
+        text_only=request.text_only,
     )
     plan = _create_cluster_plan(plan_request)
     if request.text_only and not (
@@ -2739,6 +2749,10 @@ def _performance_optimized_deployment(
         raise ValueError("performance probe did not return every cluster rank")
     source = (request.model_source or "").strip()
     model = (
+        # TODO: remote_model_layout doesn't yet accept text_only, so a
+        # remote model_source always sizes full (safe direction -- an
+        # over-, not under-, estimate for a text_only deployment; see
+        # inspect_safetensors_layout's text_only docstring).
         remote_model_layout(
             validate_ssh_target(source),
             deployment.model,
@@ -2748,7 +2762,9 @@ def _performance_optimized_deployment(
         )
         if source
         and source not in {LOCAL_NODE, "127.0.0.1", "localhost", "::1"}
-        else inspect_safetensors_layout(deployment.model)
+        else inspect_safetensors_layout(
+            deployment.model, text_only=deployment.text_only
+        )
     )
     # Same budgets the approved plan was built from — reserve, split cap and
     # role included. Re-deriving them here without the cap and the role is how
