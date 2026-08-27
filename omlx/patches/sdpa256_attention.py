@@ -130,25 +130,102 @@ def _note_route(decision: str, detail) -> None:
     )
 
 
-def _max_q_sub_for_headroom(
-    n_q_heads: int, kv_len: int, head_dim: int, score_dtype_size: float, headroom: int
+def _total_qsplit_bytes(
+    n_q_heads: int,
+    q_len: int,
+    kv_len: int,
+    causal: bool,
+    q_sub: int,
+    head_dim: int,
+    score_dtype_size: float,
 ) -> int:
-    """Largest query-row count whose unfused transient fits ``headroom``,
-    inverting ``estimate_unfused_sdpa_call_bytes`` exactly (same formula the
-    route gate and the admission guard already share) so q-split sizing
-    never drifts from what actually gets charged."""
-    per_row = n_q_heads * (kv_len * score_dtype_size + head_dim * 4)
-    if per_row <= 0 or headroom <= 0:
+    """Sum of every q-split sub-tile's transient, not just one sub-tile's.
+
+    Causal: each sub-tile's keys/values are narrowed to that sub-tile's own
+    causal end (``_unfused_qsplit_sdpa``), so kv width grows sub-tile to
+    sub-tile -- every sub-tile is a *different* size, and Metal's buffer
+    pool cannot reuse a differently-sized buffer for the next one. They
+    accumulate as retained (not just active) memory across the whole loop:
+    ``mx.eval`` between sub-tiles bounds what is *live* to one sub-tile,
+    but says nothing about what the pool has *retained* from the ones
+    before it (confirmed live -- see ``_unfused_qsplit_sdpa``'s docstring).
+
+    Non-causal: every sub-tile is ``q_sub`` rows against the full, constant
+    ``kv_len`` (no narrowing) -- same size as every other sub-tile, so the
+    pool genuinely reuses one buffer across the loop and only ONE
+    sub-tile's transient (not the whole q_len's) is ever retained at a
+    time. Summing here would overcharge a case that was never broken.
+    """
+
+    if not causal:
+        return estimate_unfused_sdpa_call_bytes(
+            n_q_heads, min(q_sub, q_len), kv_len, head_dim,
+            score_dtype_size=score_dtype_size,
+        )
+    kv_off = kv_len - q_len
+    total = 0
+    for qi0 in range(0, q_len, q_sub):
+        qi1 = min(qi0 + q_sub, q_len)
+        total += estimate_unfused_sdpa_call_bytes(
+            n_q_heads,
+            qi1 - qi0,
+            kv_off + qi1,
+            head_dim,
+            score_dtype_size=score_dtype_size,
+        )
+    return total
+
+
+def _max_q_sub_for_headroom(
+    n_q_heads: int,
+    q_len: int,
+    kv_len: int,
+    causal: bool,
+    head_dim: int,
+    score_dtype_size: float,
+    headroom: int,
+) -> int:
+    """Largest (128-aligned) query-row sub-tile count whose q-split
+    transient fits ``headroom`` -- the *total* retained across every
+    sub-tile in the split for a causal call (see ``_total_qsplit_bytes``),
+    not the naive "one sub-tile at a time" a per-call eval only bounds the
+    *active* set to. Non-causal degrades to the original single-transient
+    inversion, since every sub-tile there is the same size and genuinely
+    reusable.
+
+    A closed-form inversion of the causal sum is a quadratic in ``q_sub``;
+    a bounded linear search from a safe starting point (this call's
+    single-sub-tile estimate, an upper bound since it ignores accumulation
+    and can therefore only be too large) is simpler to keep correct than
+    an inverted formula that has to be re-derived by hand every time this
+    function's cost model changes.
+    """
+
+    if headroom <= 0:
         return 0
-    return int(headroom // per_row)
+    per_row = n_q_heads * (kv_len * score_dtype_size + head_dim * 4)
+    if per_row <= 0:
+        return 0
+    q_sub = min(q_len, int(headroom // per_row))
+    q_sub = (q_sub // 128) * 128
+    while q_sub >= 128:
+        total = _total_qsplit_bytes(
+            n_q_heads, q_len, kv_len, causal, q_sub, head_dim, score_dtype_size
+        )
+        if total <= headroom:
+            return q_sub
+        q_sub -= 128
+    return 0
 
 
 def set_unfused_headroom_provider(method) -> None:
-    """Register a bound method(kv_len) -> live headroom in bytes (negative
-    when no ceiling is active). Lets ``_should_route`` prefer the faster
-    unfused fallback whenever its O(L^2) transient fits. ``kv_len`` lets the
-    provider tell a same-shape repeat call (safe to credit pooled memory
-    against) from the first call at a new, larger kv_len (not safe -- see
+    """Register a bound method(kv_len, q_len) -> live headroom in bytes
+    (negative when no ceiling is active). Lets ``_should_route`` prefer the
+    faster unfused fallback whenever its O(L^2) transient fits. ``kv_len``
+    and ``q_len`` together let the provider tell a genuine same-shape
+    repeat call (safe to credit pooled memory against) from the first call
+    at a new, larger kv_len -- or a same-kv_len call with a different
+    q_len, e.g. a different chunk of the same request (not safe -- see
     Scheduler._sdpa256_unfused_headroom)."""
     global _HEADROOM_PROVIDER
     _HEADROOM_PROVIDER = weakref.WeakMethod(method)
@@ -168,7 +245,7 @@ def _parse_qsplit_env() -> bool:
 
 
 def _route_decision(
-    queries, keys, q_sub_ceiling: int | None = None
+    queries, keys, mask, q_sub_ceiling: int | None = None
 ) -> tuple[str, int]:
     """Decide unfused / q-split / tiled for a shape-matched prefill call.
 
@@ -220,7 +297,8 @@ def _route_decision(
         kv_len = keys.shape[-2]
         n_q_heads = batch * n_q
         dtype_size = queries.dtype.size
-        headroom = provider(kv_len)
+        causal = mask == "causal"
+        headroom = provider(kv_len, q_len)
         if headroom is None or headroom < 0:
             _note_route(
                 _ROUTE_TILED,
@@ -240,9 +318,8 @@ def _route_decision(
             return _ROUTE_UNFUSED, 0
         if _QSPLIT_ENABLED:
             q_sub = _max_q_sub_for_headroom(
-                n_q_heads, kv_len, HEAD_DIM, dtype_size, headroom
+                n_q_heads, q_len, kv_len, causal, HEAD_DIM, dtype_size, headroom
             )
-            q_sub = (q_sub // 128) * 128
             if q_sub_ceiling is not None:
                 q_sub = min(q_sub, q_sub_ceiling)
             if q_sub >= _QSPLIT_MIN_Q:
@@ -425,7 +502,7 @@ def _should_route(queries, keys, cache, mask, sinks) -> tuple[str, int]:
         # since that is the one object stable across every chunk/layer of a
         # single request but never shared across requests.
         ceiling = getattr(cache, "_sdpa256_q_sub_ceiling", None)
-        route, q_sub = _route_decision(queries, keys, q_sub_ceiling=ceiling)
+        route, q_sub = _route_decision(queries, keys, mask, q_sub_ceiling=ceiling)
         if cache is not None:
             try:
                 if route == _ROUTE_TILED:

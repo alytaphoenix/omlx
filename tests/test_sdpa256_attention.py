@@ -390,7 +390,7 @@ class _HeadroomOwner:
     def __init__(self, value):
         self.value = value
 
-    def headroom(self, kv_len):
+    def headroom(self, kv_len, q_len):
         return self.value
 
 
@@ -501,8 +501,15 @@ def test_route_hysteresis_caps_q_sub_not_just_the_route_label(
     because a later chunk's headroom estimate looks momentarily generous
     again -- capping only the route *label* while leaving q_sub uncapped
     was verified live to reproduce exactly that: a single qsplit sub-call
-    the same size as the plain unfused call it was supposed to avoid."""
-    from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+    the same size as the plain unfused call it was supposed to avoid.
+
+    Headroom values here are derived from ``_total_qsplit_bytes`` (the true
+    summed causal cost, #2991) rather than a naive per-row multiplication:
+    at this q_len/kv_len the naive formula overstates how much a split
+    actually saves (kv_off is already most of kv_len, so even a narrow
+    sub-tile is nearly full width) and would pick a q_sub that doesn't
+    really fit."""
+    from omlx.patches.sdpa256_attention import _total_qsplit_bytes
 
     sdpa256 = _sdpa256_provider_reset
 
@@ -511,12 +518,18 @@ def test_route_hysteresis_caps_q_sub_not_just_the_route_label(
 
     cache = _Cache()
     q, k, _ = _qkv(2048, 16384)
-    need = estimate_unfused_sdpa_call_bytes(24, 2048, 16384, 256, q.dtype.size)
-    per_row = need // 2048
+    n_q_heads, q_len, kv_len, hd = 24, 2048, 16384, 256
+    dtype_size = q.dtype.size
 
-    # First call: headroom fits ~1024 rows, not the full 2048 -> qsplit,
-    # ceiling latches to that q_sub.
-    owner = _HeadroomOwner(1024 * per_row)
+    def true_cost(q_sub):
+        return _total_qsplit_bytes(
+            n_q_heads, q_len, kv_len, True, q_sub, hd, dtype_size
+        )
+
+    # First call: headroom fits exactly the true (summed) cost of a
+    # 1024-row split, not the full 2048 -> qsplit, ceiling latches to that
+    # q_sub.
+    owner = _HeadroomOwner(true_cost(1024))
     sdpa256.set_unfused_headroom_provider(owner.headroom)
     route, q_sub = sdpa256._should_route(q, k, cache, "causal", None)
     assert route == "qsplit"
@@ -532,7 +545,7 @@ def test_route_hysteresis_caps_q_sub_not_just_the_route_label(
     assert cache._sdpa256_q_sub_ceiling <= 1024
 
     # Headroom tightens further -> ceiling ratchets down, never back up.
-    owner.value = 256 * per_row
+    owner.value = true_cost(256)
     route, q_sub = sdpa256._should_route(q, k, cache, "causal", None)
     assert route == "qsplit"
     assert q_sub == 256
@@ -562,7 +575,7 @@ def test_route_defaults_to_tiled_when_provider_raises(_sdpa256_provider_reset):
     sdpa256 = _sdpa256_provider_reset
 
     class _Boom:
-        def headroom(self, kv_len):
+        def headroom(self, kv_len, q_len):
             raise RuntimeError("no headroom info")
 
     boom = _Boom()
@@ -607,23 +620,75 @@ def test_parse_qsplit_env(monkeypatch):
     assert sdpa256._parse_qsplit_env() is False
 
 
-def test_max_q_sub_for_headroom():
+def test_max_q_sub_for_headroom_noncausal_matches_single_subtile_inversion():
+    """Non-causal: every sub-tile is the same (kv_len-wide) size, so the
+    Metal pool genuinely reuses one buffer across the loop -- sizing
+    degrades to inverting a single sub-tile's transient, same as before
+    this function accounted for retained-pool growth at all."""
     from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
     from omlx.patches.sdpa256_attention import _max_q_sub_for_headroom
 
-    n_q, kv_len, hd, dtype_size = 24, 16384, 256, 2.0
-    # Headroom for exactly N rows must accept N and reject N+1.
-    for n_rows in (1, 37, 512, 2048):
+    n_q, q_len, kv_len, hd, dtype_size = 24, 2048, 16384, 256, 2.0
+    # Headroom for exactly N (128-aligned) rows must accept N and reject
+    # a headroom one row short of the next 128-row step.
+    for n_rows in (128, 512, 2048):
         headroom = estimate_unfused_sdpa_call_bytes(
             n_q, n_rows, kv_len, hd, dtype_size
         )
-        assert _max_q_sub_for_headroom(n_q, kv_len, hd, dtype_size, headroom) == n_rows
         assert (
-            _max_q_sub_for_headroom(n_q, kv_len, hd, dtype_size, headroom - 1)
-            == n_rows - 1
+            _max_q_sub_for_headroom(n_q, q_len, kv_len, False, hd, dtype_size, headroom)
+            == n_rows
         )
-    assert _max_q_sub_for_headroom(n_q, kv_len, hd, dtype_size, 0) == 0
-    assert _max_q_sub_for_headroom(n_q, kv_len, hd, dtype_size, -1) == 0
+        short_headroom = (
+            estimate_unfused_sdpa_call_bytes(n_q, n_rows - 128, kv_len, hd, dtype_size)
+            + 1
+        )
+        assert (
+            _max_q_sub_for_headroom(
+                n_q, q_len, kv_len, False, hd, dtype_size, short_headroom
+            )
+            == n_rows - 128
+        )
+    assert _max_q_sub_for_headroom(n_q, q_len, kv_len, False, hd, dtype_size, 0) == 0
+    assert _max_q_sub_for_headroom(n_q, q_len, kv_len, False, hd, dtype_size, -1) == 0
+
+
+def test_max_q_sub_for_headroom_causal_accounts_for_retained_pool_growth():
+    """Causal: sub-tiles narrow keys/values to each sub-tile's own causal
+    end, so every sub-tile is a *different* size and the pool cannot reuse
+    across the loop (#2991) -- the true cost is the SUM of every sub-tile's
+    transient, not one sub-tile's. The old (buggy) formula priced this
+    identically to the non-causal case; the fix must therefore pick a
+    strictly smaller (or equal) q_sub than that naive single-tile
+    inversion whenever a split actually happens."""
+    from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+    from omlx.patches.sdpa256_attention import (
+        _max_q_sub_for_headroom,
+        _total_qsplit_bytes,
+    )
+
+    n_q, q_len, kv_len, hd, dtype_size = 24, 8192, 16384, 256, 2.0
+    per_row = n_q * (kv_len * dtype_size + hd * 4)
+    target = 2048
+
+    # headroom = the TRUE summed cost of splitting at `target`. The old
+    # (buggy) single-sub-tile formula would have inverted this same
+    # headroom to a q_sub *larger* than `target` (it prices a q-split call
+    # identically to one reused sub-tile, ignoring every other sub-tile
+    # piling up in the pool) -- so the naive per-row inversion of this
+    # headroom overshoots target, proving the naive formula is unsafe here.
+    headroom = _total_qsplit_bytes(n_q, q_len, kv_len, True, target, hd, dtype_size)
+    assert int(headroom // per_row) > target
+
+    q_sub = _max_q_sub_for_headroom(n_q, q_len, kv_len, True, hd, dtype_size, headroom)
+    assert q_sub == target
+    assert (
+        _total_qsplit_bytes(n_q, q_len, kv_len, True, q_sub, hd, dtype_size)
+        <= headroom
+    )
+
+    assert _max_q_sub_for_headroom(n_q, q_len, kv_len, True, hd, dtype_size, 0) == 0
+    assert _max_q_sub_for_headroom(n_q, q_len, kv_len, True, hd, dtype_size, -1) == 0
 
 
 # --- tiled-route engagement logging (issue #2283) --------------------------
@@ -728,7 +793,7 @@ def _sdpa256_headroom_fake(gib, usage_bytes=None):
         _memory_limits_propagated = False
         _prefill_memory_guard = False
         _sdpa256_unguarded_logged = False
-        _sdpa256_last_kv_len = None
+        _sdpa256_last_call_shape = None
         _prefill_headroom_safety = 0.90
         _PREFILL_HEADROOM_SAFETY = 0.90
         _prefill_abort_margin = 0.95
@@ -753,30 +818,30 @@ def test_scheduler_headroom_provider_math():
 
     gib = 1024**3
     fake = _sdpa256_headroom_fake(gib, usage_bytes=10 * gib)
-    kv_len = 16384
+    kv_len, q_len = 16384, 2048
     # Nothing propagated yet: guard state is unknown, so the negative
     # sentinel keeps the tiled default even though the flag reads False.
-    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len) == -1
+    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len, q_len) == -1
 
     # Enforcer has spoken and the guard is explicitly off: the user opted
     # out of memory management, so the route gets unbounded headroom and
     # keeps the unfused fast path (#2283).
     fake._memory_limits_propagated = True
     assert (
-        Scheduler._sdpa256_unfused_headroom(fake, kv_len)
+        Scheduler._sdpa256_unfused_headroom(fake, kv_len, q_len)
         == _SDPA256_UNBOUNDED_HEADROOM
     )
 
     # Guard on but the ceiling has not landed yet (startup race): stay on
     # the memory-safe default.
     fake._prefill_memory_guard = True
-    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len) == -1
+    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len, q_len) == -1
 
     # Watermark not propagated yet: _admission_limit_bytes falls back to
     # the hard limit alone.
     fake._memory_hard_limit_bytes = 100 * gib
     target = int(100 * gib * 0.90)
-    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len) == (
+    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len, q_len) == (
         target - 10 * gib
     ) // 2
 
@@ -784,7 +849,7 @@ def test_scheduler_headroom_provider_math():
     # same line the reactive enforcer actually kills at.
     fake._memory_hard_watermark_bytes = 85 * gib
     target = int(85 * gib * 0.90)
-    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len) == (
+    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len, q_len) == (
         target - 10 * gib
     ) // 2
 
@@ -807,7 +872,7 @@ def test_sdpa256_headroom_charges_2x_transient():
     fake._memory_hard_limit_bytes = 100 * gib
 
     raw_headroom = int(100 * gib * 0.90) - 10 * gib
-    charged = Scheduler._sdpa256_unfused_headroom(fake, 16384)
+    charged = Scheduler._sdpa256_unfused_headroom(fake, 16384, 2048)
     assert charged == raw_headroom // 2
     assert charged < raw_headroom
 
@@ -819,8 +884,13 @@ def test_sdpa256_headroom_credits_pool_only_on_repeated_shape():
     retained pool inflated, so the *uncredited* reactive hard-watermark
     guard tripped abruptly instead of the old code's clean predictive 400.
     Within one chunk every full-attention layer shares one (kv_len, q_len)
-    shape, so only a same-kv_len repeat call is guaranteed a same-size freed
-    transient to reuse -- the first call at a new, larger kv_len is not."""
+    shape, so only a genuine same-shape repeat call is guaranteed a
+    same-size freed transient to reuse -- the first call at a new, larger
+    kv_len is not, and (#2991) neither is a same-kv_len call at a
+    *different* q_len (e.g. two differently-sized q-split sub-tiles that
+    happen to land on the same kv_len): keying on kv_len alone would
+    wrongly credit that case too, crediting a buffer the pool never
+    actually freed at that size."""
     from omlx.scheduler import Scheduler
 
     gib = 1024**3
@@ -832,7 +902,7 @@ def test_sdpa256_headroom_credits_pool_only_on_repeated_shape():
         _memory_limits_propagated = True
         _prefill_memory_guard = True
         _sdpa256_unguarded_logged = False
-        _sdpa256_last_kv_len = None
+        _sdpa256_last_call_shape = None
         _prefill_headroom_safety = 0.90
         _PREFILL_HEADROOM_SAFETY = 0.90
         _prefill_abort_margin = 0.95
@@ -847,18 +917,25 @@ def test_sdpa256_headroom_credits_pool_only_on_repeated_shape():
             return 10 * gib
 
     fake = _Fake()
-    # First call at kv_len=A: no same-shape call has run yet -> uncredited.
-    Scheduler._sdpa256_unfused_headroom(fake, 16384)
-    # Second call, same kv_len=A (e.g. layer 2 of the same chunk): a
-    # same-size transient was already freed by the first call -> credited.
-    Scheduler._sdpa256_unfused_headroom(fake, 16384)
-    # Third call, new larger kv_len=B (next chunk): nothing this size has
+    # First call at (kv_len=A, q_len=X): no same-shape call has run yet ->
+    # uncredited.
+    Scheduler._sdpa256_unfused_headroom(fake, 16384, 2048)
+    # Second call, same (kv_len=A, q_len=X) (e.g. layer 2 of the same
+    # chunk): a same-size transient was already freed by the first call ->
+    # credited.
+    Scheduler._sdpa256_unfused_headroom(fake, 16384, 2048)
+    # Third call, same kv_len=A but a DIFFERENT q_len=Y (e.g. a q-split
+    # sub-tile of a different width landing on the same kv_len as a prior
+    # chunk) -- not the same-size transient the pool actually freed, so
+    # this must be uncredited even though kv_len matches (#2991).
+    Scheduler._sdpa256_unfused_headroom(fake, 16384, 512)
+    # Fourth call, new larger kv_len=B (next chunk): nothing this shape has
     # been freed yet -> uncredited again, even though the pool has entries.
-    Scheduler._sdpa256_unfused_headroom(fake, 18432)
-    # Fourth call, repeats kv_len=B -> credited.
-    Scheduler._sdpa256_unfused_headroom(fake, 18432)
+    Scheduler._sdpa256_unfused_headroom(fake, 18432, 2048)
+    # Fifth call, repeats (kv_len=B, q_len=X) -> credited.
+    Scheduler._sdpa256_unfused_headroom(fake, 18432, 2048)
 
-    assert fake.credit_calls == [False, True, False, True]
+    assert fake.credit_calls == [False, True, False, False, True]
 
 
 def test_current_usage_bytes_credits_cache_memory_on_the_phys_side(monkeypatch):
@@ -913,11 +990,11 @@ def test_unguarded_fast_path_logs_once(caplog):
     fake = _Fake()
     with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
         assert (
-            Scheduler._sdpa256_unfused_headroom(fake, 16384)
+            Scheduler._sdpa256_unfused_headroom(fake, 16384, 2048)
             == _SDPA256_UNBOUNDED_HEADROOM
         )
         assert (
-            Scheduler._sdpa256_unfused_headroom(fake, 16384)
+            Scheduler._sdpa256_unfused_headroom(fake, 16384, 2048)
             == _SDPA256_UNBOUNDED_HEADROOM
         )
     records = [
@@ -952,7 +1029,7 @@ def test_scheduler_init_registers_headroom_provider(_sdpa256_provider_reset):
     assert bound is not None
     assert bound.__self__ is scheduler
     # Ceiling not propagated yet -> negative sentinel keeps the tiled default.
-    assert bound(16384) == -1
+    assert bound(16384, 2048) == -1
 
 
 # --- mlx-vlm coverage (issue: VLM engine head-256 prefill unprotected) ----

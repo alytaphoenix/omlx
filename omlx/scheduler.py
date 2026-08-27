@@ -1902,12 +1902,15 @@ class Scheduler:
         # One-shot marker for the guard-off fast-path INFO emitted by
         # _sdpa256_unfused_headroom.
         self._sdpa256_unguarded_logged: bool = False
-        # kv_len of the most recent _sdpa256_unfused_headroom call, so it can
-        # tell a same-shape repeat (layers 2..N of one chunk, safe to credit
-        # pool reuse) from the first head-dim-256 call at a new, larger
-        # kv_len (whose transient is strictly bigger than anything freed so
-        # far this request -- see _sdpa256_unfused_headroom's docstring).
-        self._sdpa256_last_kv_len: int | None = None
+        # (kv_len, q_len) of the most recent _sdpa256_unfused_headroom call,
+        # so it can tell a genuine same-shape repeat (layers 2..N of one
+        # chunk, safe to credit pool reuse) from the first head-dim-256 call
+        # at a new, larger kv_len -- or a same-kv_len call at a different
+        # q_len (e.g. a different chunk of the same request landing on the
+        # same kv_len), neither of whose transient is safe to credit against
+        # what a differently-shaped predecessor left in the pool -- see
+        # _sdpa256_unfused_headroom's docstring.
+        self._sdpa256_last_call_shape: tuple[int, int] | None = None
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
         # set; in-flight requests proceed.
@@ -3901,7 +3904,7 @@ class Scheduler:
         safety_cap = self._prefill_abort_cap()
         return base_cap, safety_cap, self._prefill_abort_margin
 
-    def _sdpa256_unfused_headroom(self, kv_len: int) -> int:
+    def _sdpa256_unfused_headroom(self, kv_len: int, q_len: int) -> int:
         """Live headroom (bytes) for one unfused SDPA transient at ``kv_len``,
         under the same target the adaptive prefill throttle enforces (hard
         ceiling x headroom safety, clamped by ``_admission_limit_bytes`` --
@@ -3921,13 +3924,17 @@ class Scheduler:
         run that the first correction alone didn't fix:
 
         1. Credits the retained Metal buffer pool (``credit_cache_memory``)
-           only when ``kv_len`` matches the previous call's -- i.e. this is
-           a repeat of the same chunk's shape (layers 2..N of the same
-           forward pass), not the chunk's first head-dim-256 call. Within a
-           chunk every full-attention layer shares one (kv_len, q_len)
-           shape, so a same-kv_len call is guaranteed a same-size transient
-           just freed into the pool: genuine reuse, safe to credit. The
-           FIRST call at a new (larger) kv_len has no such guarantee.
+           only when ``(kv_len, q_len)`` matches the previous call's -- i.e.
+           this is a repeat of the same chunk's shape (layers 2..N of the
+           same forward pass), not the chunk's first head-dim-256 call, and
+           not a *different* chunk that happens to land on the same
+           kv_len (same kv_len, different q_len -- e.g. a q-split sub-tile
+           of a different width -- is not the same-size transient the pool
+           actually freed). Within a chunk every full-attention layer
+           shares one (kv_len, q_len) shape, so a same-shape call is
+           guaranteed a same-size transient just freed into the pool:
+           genuine reuse, safe to credit. The FIRST call at a new shape has
+           no such guarantee.
 
         2. Charges 2x the candidate transient, not 1x (see the ``// 2`` at
            the end). kv_len only grows within a request, so by the time
@@ -3970,8 +3977,9 @@ class Scheduler:
         # this fix (confirmed via a live 258k-token run).
         base_cap = self._admission_limit_bytes() or hard_cap
         target = int(base_cap * headroom_safety)
-        same_shape_as_last_call = kv_len == self._sdpa256_last_kv_len
-        self._sdpa256_last_kv_len = kv_len
+        call_shape = (kv_len, q_len)
+        same_shape_as_last_call = call_shape == self._sdpa256_last_call_shape
+        self._sdpa256_last_call_shape = call_shape
         headroom = target - self._current_usage_bytes(
             credit_cache_memory=same_shape_as_last_call
         )
