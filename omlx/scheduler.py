@@ -12368,10 +12368,22 @@ class Scheduler:
                     )
 
                     if tq_active:
+                        # Same condition the KV-dtype averaging above uses
+                        # to decide whether turboquant_skip_last is actually
+                        # in effect for this model (a single-layer model has
+                        # nothing to skip): the estimator must only pay the
+                        # extra dense-layer comparison when a dense layer
+                        # genuinely exists in this forward pass (#3108).
+                        skip_last_active = (
+                            self._turboquant_skip_last
+                            and not isinstance(actual_kv_cache_layers, bool)
+                            and actual_kv_cache_layers > 1
+                        )
                         self.memory_monitor.register_tiled_prefill_tile(
                             query_block=_LONG_PREFILL_QUERY_BLOCK_SIZE,
                             kv_tile=_LONG_PREFILL_KEY_CHUNK_SIZE,
                             min_kv_len=_LONG_PREFILL_QUANTIZED_THRESHOLD,
+                            skip_last=skip_last_active,
                         )
                     else:
                         self.memory_monitor.clear_tiled_prefill_tile()

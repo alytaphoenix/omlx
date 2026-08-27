@@ -466,8 +466,24 @@ class TestSetModelInfoTurboQuantDtype:
             query_block=_LONG_PREFILL_QUERY_BLOCK_SIZE,
             kv_tile=_LONG_PREFILL_KEY_CHUNK_SIZE,
             min_kv_len=_LONG_PREFILL_QUANTIZED_THRESHOLD,
+            skip_last=True,  # turboquant_skip_last defaults True, 40 layers
         )
         sched.memory_monitor.clear_tiled_prefill_tile.assert_not_called()
+
+    def test_turboquant_active_registers_skip_last_false_when_disabled(self):
+        """#3108: the estimator must know whether turboquant_skip_last is
+        actually in effect for THIS model, not just assume it -- passing it
+        unconditionally would either wrongly double-price a model that skips
+        nothing, or (worse) wrongly trust the cheap tile estimate alone for
+        a model that does skip a layer."""
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.register_tiled_prefill_tile.call_args.kwargs
+        assert kwargs["skip_last"] is False
 
     def test_no_turboquant_clears_tiled_prefill_tile_on_monitor(self):
         sched = self._make_sched_with_config(_PlainLMConfig())

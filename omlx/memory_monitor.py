@@ -63,6 +63,13 @@ _SDPA_FALLBACK_SCORE_DTYPE_SIZE = 2
 _SDPA_TILED_PREFILL_HEAD_DIMS: dict[int, int] = {}
 _SDPA_TILED_MIN_KV_LEN = 8192
 
+# The pinned mlx-vlm TurboQuant kernel (quantized_attention) builds its
+# score tile, output, normalizer and max_score as mx.float32 unconditionally
+# -- not at the model's compute dtype -- so its tile transient must be priced
+# at 4 bytes/elem regardless of self._score_dtype_size (#3108: pricing it at
+# the compute dtype undercounted a bf16 model's tile by 2x).
+_TURBOQUANT_SCORE_DTYPE_SIZE = 4
+
 
 def register_tiled_prefill_head_dim(
     head_dim: int, *, min_kv_len: int = 8192, kv_tile: int = 1024
@@ -235,6 +242,13 @@ class MemoryMonitor:
         # under-charging that other model's admission guard.
         # (query_block, kv_tile, min_kv_len); see register_tiled_prefill_tile.
         self._tiled_prefill_override: tuple[int, int, int] | None = None
+        # True when the registered tiled route leaves one KV-cache layer on
+        # its ordinary (non-tiled) kernel (TurboQuant's turboquant_skip_last)
+        # -- that layer's own transient must also be priced (see
+        # register_tiled_prefill_tile's skip_last docstring and
+        # _estimate_sdpa_activation_bytes's use of it), since it can exceed
+        # the tiled estimate and is exercised in the same forward pass.
+        self._tiled_prefill_skip_last: bool = False
         # Fixed-shape ANE prefill I/O surfaces (issue #2841); set via
         # set_model_info, 0 unless the Qwen ANE prefill backend is attached.
         self._ane_prefill_transient_bytes: int = 0
@@ -698,7 +712,12 @@ class MemoryMonitor:
         return total + self._fixed_state_bytes
 
     def register_tiled_prefill_tile(
-        self, *, query_block: int, kv_tile: int, min_kv_len: int
+        self,
+        *,
+        query_block: int,
+        kv_tile: int,
+        min_kv_len: int,
+        skip_last: bool = False,
     ) -> None:
         """Register a bounded-transient tiled prefill route for THIS
         scheduler's model, scoped to this MemoryMonitor instance (unlike
@@ -714,15 +733,24 @@ class MemoryMonitor:
         regardless of the chunk's true query_tokens); kv_tile bounds the KV
         axis. min_kv_len must match the kernel's own route-gate threshold —
         registering a lower value would charge the cheap tile estimate for
-        calls that actually take the expensive unfused fallback."""
+        calls that actually take the expensive unfused fallback.
+
+        ``skip_last`` (TurboQuant's own ``turboquant_skip_last``, default
+        True) means one KV-cache layer stays on the ordinary kernel instead
+        of this tiled route -- its own transient can exceed the tiled
+        estimate (#3108) and is exercised in the same forward pass, so
+        ``_estimate_sdpa_activation_bytes`` must price both routes and
+        return the larger, not just this one."""
         self._tiled_prefill_override = (
             int(query_block),
             int(kv_tile),
             int(min_kv_len),
         )
+        self._tiled_prefill_skip_last = bool(skip_last)
 
     def clear_tiled_prefill_tile(self) -> None:
         self._tiled_prefill_override = None
+        self._tiled_prefill_skip_last = False
 
     def _uses_fused_sdpa(self, query_tokens: int, kv_len: int) -> bool:
         hd = self._head_dim or 0
@@ -772,6 +800,10 @@ class MemoryMonitor:
         # at 256 regardless of how large this chunk's query_tokens is) --
         # using the raw query_tokens here would re-introduce an O(L^2)-ish
         # over-charge on large chunks, defeating the point of registering it.
+        # Priced at _TURBOQUANT_SCORE_DTYPE_SIZE (fp32), not
+        # self._score_dtype_size (the model's compute dtype): the pinned
+        # kernel builds its score tile, output, normalizer and max_score as
+        # mx.float32 unconditionally (#3108).
         if self._tiled_prefill_override is not None:
             query_block, kv_tile, min_kv_len = self._tiled_prefill_override
             if query_tokens > 1 and kv_len >= min_kv_len:
@@ -779,9 +811,38 @@ class MemoryMonitor:
                     n_q
                     * min(query_tokens, query_block)
                     * min(kv_tile, kv_len)
-                    * self._score_dtype_size
+                    * _TURBOQUANT_SCORE_DTYPE_SIZE
                 )
-                return output + tile_scores + bias
+                tiled_estimate = output + tile_scores + bias
+                if not self._tiled_prefill_skip_last:
+                    return tiled_estimate
+                # turboquant_skip_last leaves one KV-cache layer on its
+                # ordinary (non-tiled) kernel, exercised in the same
+                # forward pass as every tiled layer -- that layer's own
+                # transient (the dense/head_dim-tiled/unfused estimate
+                # every non-TurboQuant call already computes below) can
+                # exceed the tiled estimate above (#3108: a head_dim
+                # outside sdpa256's tiled set falls all the way to the
+                # O(L^2) unfused fallback there), so the true per-request
+                # peak is the larger of the two routes actually in play,
+                # not just the cheaper one.
+                dense_estimate = self._estimate_dense_sdpa_activation_bytes(
+                    n_q, query_tokens, kv_len, hd, output, bias
+                )
+                return max(tiled_estimate, dense_estimate)
+
+        return self._estimate_dense_sdpa_activation_bytes(
+            n_q, query_tokens, kv_len, hd, output, bias
+        )
+
+    def _estimate_dense_sdpa_activation_bytes(
+        self, n_q: int, query_tokens: int, kv_len: int, hd: int, output: int, bias: int
+    ) -> int:
+        """The estimate as if no per-instance tiled override (TurboQuant)
+        were registered: the module-global head_dim tiled route (e.g. the
+        sdpa256 patch) if active, else the O(L^2) unfused fallback. Shared
+        between the no-override tail and the turboquant_skip_last
+        peak-across-routes comparison above."""
 
         # O(L) tiled-prefill kernel active for this head_dim (e.g. the head_dim
         # 256 sdpa256 patch): the score matrix is never materialized. The peak
