@@ -332,7 +332,7 @@ def test_an_intent_for_a_different_pair_never_steers_this_one(
         configure_link(HOSTS)
 
         # Tier 3 chose fresh (the first static candidate), not the record.
-        assert applied[0][2] == "172.16.99.1"
+        assert applied[0][2] == "10.90.99.1"
     finally:
         _reset_store()
 
@@ -343,7 +343,7 @@ def test_a_colliding_intent_falls_through_to_tier3_and_is_rewritten(
     try:
         store = configure_fabric_intent(tmp_path)
         store.record(
-            subnet="172.16.99.0/24",
+            subnet="10.90.99.0/24",
             hosts=HOSTS,
             chosen_by="auto",
             reason="collision_free_default",
@@ -351,16 +351,16 @@ def test_a_colliding_intent_falls_through_to_tier3_and_is_rewritten(
         )
         # A utun now claims the recorded range: the WARP-incident shape.
         applied = _stub_link_setup(
-            monkeypatch, current_ips={}, hostile=("172.16.99.0/24",)
+            monkeypatch, current_ips={}, hostile=("10.90.99.0/24",)
         )
 
         assert configure_link(HOSTS).ready is True
         assert applied == [
-            ("ifconfig", "127.0.0.1", "172.16.100.1", 24),
-            ("ifconfig", "Studio.local", "172.16.100.2", 24),
+            ("ifconfig", "127.0.0.1", "10.91.99.1", 24),
+            ("ifconfig", "Studio.local", "10.91.99.2", 24),
         ]
         rewritten = store.current()
-        assert rewritten.subnet == "172.16.100.0/24"
+        assert rewritten.subnet == "10.91.99.0/24"
         assert rewritten.chosen_by == "auto"
         assert rewritten.addressing == "ifconfig"
     finally:
@@ -486,7 +486,7 @@ def test_an_unconfigured_store_never_blocks_link_setup(monkeypatch):
     applied = _stub_link_setup(monkeypatch, current_ips={})
 
     assert configure_link(HOSTS).ready is True
-    assert applied[0][2] == "172.16.99.1"
+    assert applied[0][2] == "10.90.99.1"
 
 
 # --- C5: detect_drift — live addressing versus the recorded intent ----------

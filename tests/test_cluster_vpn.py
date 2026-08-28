@@ -53,6 +53,12 @@ default                                 fe80::%utun0                    UGcIg   
 
 # `warp-cli settings` (warp-cli 2025.x) with a managed split-tunnel Exclude
 # policy — the 172.16.0.0/12 line is the range the incident's fix used.
+# 10.0.0.0/8 is deliberately NOT here: the org policy did not exclude it,
+# which is exactly why the original 10.0.1.x fabric assignment got tunneled
+# (see _WARP_FULL_TUNNEL_NETSTAT's "10/8 utun4" route below) instead of
+# reaching the peer directly — an excluded 10.0.0.0/8 would have made the
+# incident impossible to reproduce, and the two fixtures would contradict
+# each other (a range can't be both tunneled and excluded from the tunnel).
 _WARP_SETTINGS_EXCLUDE = """\
 Always On: true
 Switch Locked: true
@@ -61,7 +67,6 @@ Disabled for Wifi: false
 Disabled for Ethernet: false
 Fallback domains: intranet, internal, private, localdomain
 Exclude mode, with hosts/ips:
-  10.0.0.0/8
   100.64.0.0/10
   169.254.0.0/16
   172.16.0.0/12
@@ -125,7 +130,12 @@ def test_split_tunnel_exclusions_are_parsed_and_hostnames_skipped():
     exclusions = parse_warp_settings(_WARP_SETTINGS_EXCLUDE)
 
     assert "172.16.0.0/12" in exclusions
-    assert "10.0.0.0/8" in exclusions
+    assert "192.168.0.0/16" in exclusions
+    # 10.0.0.0/8 is deliberately NOT excluded in this fixture -- see its
+    # definition above: it's the range the incident's netstat capture shows
+    # actually tunneled, and a fixture claiming it as both tunneled and
+    # excluded would be internally contradictory.
+    assert "10.0.0.0/8" not in exclusions
     assert all("/" in entry for entry in exclusions)
     assert not any("example.com" in entry for entry in exclusions)
 
