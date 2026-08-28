@@ -86,6 +86,13 @@ class DriftFinding:
     persists, so re-asserting it needs no new consent); every other case must
     surface as a WARN incident inviting a consented Fabric Doctor re-address,
     never a silent privileged action.
+
+    ``addressing="networksetup"`` (and therefore ``auto_restore=True``) is
+    dormant today: ``configure_link`` split the networksetup write-half out
+    into its own not-yet-landed change (#2875 review) rather than enable it
+    unvalidated, so every intent this build records is ``"ifconfig"``. Kept
+    here (not removed) since the store already accepts both values and this
+    is the exact behavior that follow-up needs the moment it ships.
     """
 
     kind: str  # "address_lost" | "address_changed" | "intent_collides"
