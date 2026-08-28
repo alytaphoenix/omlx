@@ -48,9 +48,10 @@ from .collective import (
     _run_launcher,
 )
 from .transport import (
-    _UNROUTABLE_NETWORKS,
     HostInterfaces,
+    LinkCommandRunner,
     SharedLink,
+    _run_link_command,
     probe_host_interfaces,
     shared_link_addresses,
     verify_link_reachability,
@@ -71,8 +72,8 @@ ERRNO_DIAGNOSES: dict[int, tuple[str, str, str | None]] = {
         "ETIMEDOUT",
         "the connection is being silently dropped — a firewall or VPN on the "
         "fabric path",
-        "Move the link to a subnet the VPN ignores (Fabric Doctor → Move link "
-        "addresses) or add a VPN split-tunnel exclusion for the fabric range.",
+        "Click Start Cluster again to move the link to a subnet the VPN "
+        "ignores, or add a VPN split-tunnel exclusion for the fabric range.",
     ),
     61: (
         "ECONNREFUSED",
@@ -96,7 +97,12 @@ class DoctorFinding:
     check_id: str  # "link_presence" | "address_sanity" | "subnet_collision"
     # | "route_pinning" | "bound_connect" | "jaccl_probe"
     # | "rdma_staleness" | "admin_port"
-    state: str  # "pass" | "fail" | "skipped"
+    # "warn" is for a finding that is real but not a fabric fault -- admin_port
+    # is the one user today (a heuristic, best-effort read whose failure only
+    # means planning falls back to a slower path): it must not stop the
+    # ladder, gate DoctorReport.ok, or become the verdict's first_red (#2878
+    # review).
+    state: str  # "pass" | "fail" | "warn" | "skipped"
     evidence: str
     diagnosis: str = ""
     remedy: str = ""
@@ -285,6 +291,79 @@ def _validate_rdma_matrix(
                 raise ValueError("JACCL RDMA matrix is missing a peer path")
 
 
+# mlx._distributed_utils.launch's ring backend assigns one port per rank,
+# globally sequential across every host in hostfile order, not one shared
+# port re-used per host: rank 0 (the coordinator, hosts[0]) binds
+# starting_port, rank 1 (the peer, hosts[1]) binds starting_port + 1. A span
+# sized for a single rank under-covers a two-rank launch, and checking only
+# the coordinator's own loopback never proves anything about the port the
+# peer actually binds (#2878 review).
+_PORT_CHECK_SCRIPT = (
+    "import socket,sys\n"
+    "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n"
+    "s.bind(('0.0.0.0',int(sys.argv[1])))\n"
+    "s.close()"
+)
+_PORT_SPAN_ATTEMPTS = 8
+
+
+def _remote_port_free(
+    host: str,
+    port: int,
+    *,
+    runner: LinkCommandRunner,
+) -> bool:
+    """Best-effort bind check for one port on a remote host.
+
+    A TOCTOU race remains between this check and the real launch -- the same
+    tradeoff ``choose_fabric_subnet`` already accepts for the fabric range
+    itself: a port verified free moments ago is still better odds than one
+    never checked at all.
+    """
+
+    result = runner(
+        host, ("/usr/bin/python3", "-c", _PORT_CHECK_SCRIPT, str(port))
+    )
+    return result.returncode == 0
+
+
+def _reserve_port_span(
+    hosts: Sequence[str],
+    *,
+    port_check_runner: LinkCommandRunner,
+) -> int:
+    """Find a starting port whose per-rank span is free on every host.
+
+    hosts[i] binds starting_port + i (see the ring-backend note above).
+    Local ports are reserved with a real bind-and-release the same way
+    ``_find_loopback_port_span`` always has; remote ports are checked
+    best-effort over the same SSH identity every other Doctor probe uses.
+    """
+
+    last_conflict = ""
+    for _ in range(_PORT_SPAN_ATTEMPTS):
+        starting_port = _find_loopback_port_span(len(hosts))
+        conflict = next(
+            (
+                host
+                for offset, host in enumerate(hosts)
+                if host not in _LOCAL_HOSTS
+                and not _remote_port_free(
+                    host, starting_port + offset, runner=port_check_runner
+                )
+            ),
+            None,
+        )
+        if conflict is None:
+            return starting_port
+        last_conflict = conflict
+    raise CollectiveSmokeError(
+        "could not find a port span free on both the coordinator and "
+        f"{last_conflict or 'the peer'} after "
+        f"{_PORT_SPAN_ATTEMPTS} attempts"
+    )
+
+
 def run_fabric_collective_probe(
     hosts: Sequence[str],
     addresses: Sequence[str],
@@ -292,6 +371,7 @@ def run_fabric_collective_probe(
     timeout: float = 10.0,
     *,
     runner: LauncherRunner = _run_launcher,
+    port_check_runner: LinkCommandRunner = _run_link_command,
     deployments: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     """A minimal two-rank JACCL handshake across the fabric addresses.
@@ -328,7 +408,7 @@ def run_fabric_collective_probe(
             "collective. Stop the deployment first."
         )
 
-    starting_port = _find_loopback_port_span(1)
+    starting_port = _reserve_port_span(hosts, port_check_runner=port_check_runner)
     hostfile_payload = {
         "backend": "jaccl",
         "envs": ["MLX_METAL_FAST_SYNCH=1"],
@@ -505,48 +585,55 @@ def check_link_address_sanity(
         )
         return findings
 
-    stale: list[str] = []
+    unaddressed: list[str] = []
     renumbered: list[str] = []
     for host in hosts:
         probed = interfaces[host]
         assert probed is not None
-        fabric = _fabric_interfaces(probed)
-        for entry in probed.addresses:
-            if entry.interface not in fabric:
-                continue
-            with suppress(ValueError):
-                ip = ipaddress.ip_address(entry.address)
-                if any(ip in network for network in _UNROUTABLE_NETWORKS):
-                    stale.append(f"{host} {entry}")
-        # Interface renumbering (en6 → en4 after replug/reboot): the RDMA
-        # device moved but the address stayed on the old Thunderbolt name.
-        if probed.rdma_interfaces and not any(
+        # A 169.254 self-assigned address can never appear here to detect
+        # directly: probe_host_interfaces already drops _UNROUTABLE_NETWORKS
+        # entries (including 169.254.0.0/16) at the source, so a check
+        # looking for one on probed.addresses can never fire (#2878 review).
+        # What that failure actually looks like once filtered is an RDMA
+        # device with NO address at all -- the same shape rdma_staleness
+        # (check 5) detects, moved here so the ladder stops with the right
+        # diagnosis immediately instead of limping through checks 2-4 first
+        # on a link that was never really addressed. Split from interface
+        # renumbering below (en6 → en4 after replug/reboot, where an
+        # orphaned address still sits on the old Thunderbolt name) --
+        # those two share the same "RDMA device unaddressed" trigger but
+        # need different evidence and diagnosis text.
+        if not probed.rdma_interfaces or any(
             entry.interface in probed.rdma_interfaces
             for entry in probed.addresses
         ):
-            orphaned = [
-                str(entry)
-                for entry in probed.addresses
-                if entry.interface in probed.thunderbolt_interfaces
-            ]
-            if orphaned:
-                renumbered.append(f"{host}: {', '.join(orphaned)}")
+            continue
+        orphaned = [
+            str(entry)
+            for entry in probed.addresses
+            if entry.interface in probed.thunderbolt_interfaces
+        ]
+        if orphaned:
+            renumbered.append(f"{host}: {', '.join(orphaned)}")
+        else:
+            unaddressed.append(
+                f"{host} has RDMA devices "
+                f"({', '.join(sorted(probed.rdma_interfaces))}) but no "
+                "fabric address"
+            )
 
-    if stale:
+    if unaddressed:
         findings.append(
             DoctorFinding(
                 check_id="address_sanity",
                 state="fail",
-                evidence=(
-                    "self-assigned or loopback addresses on the fabric: "
-                    + "; ".join(stale)
-                ),
+                evidence="; ".join(unaddressed),
                 diagnosis=(
-                    "macOS never finished configuring the link — a 169.254 "
-                    "self-assigned address is present but unroutable (this "
-                    "commonly appears after a reboot)"
+                    "macOS never finished configuring the link, or a "
+                    "169.254 self-assigned address was applied and could "
+                    "not be used (this commonly appears after a reboot)"
                 ),
-                remedy="Run Fabric Doctor → Re-address link.",
+                remedy="Click Start Cluster again — it re-addresses the link automatically.",
                 fix_action={"kind": "readdress", "hosts": list(hosts)},
             )
         )
@@ -564,7 +651,7 @@ def check_link_address_sanity(
                     "en6 → en4 after a replug or reboot), leaving the fabric "
                     "address on the old interface name"
                 ),
-                remedy="Run Fabric Doctor → Re-address link.",
+                remedy="Click Start Cluster again — it re-addresses the link automatically.",
                 fix_action={"kind": "readdress", "hosts": list(hosts)},
             )
         )
@@ -620,8 +707,20 @@ def check_subnet_collision(
             )
         ]
 
-    # The link's own subnets are not collisions with themselves.
-    collision_set = [net for net in hostile if net not in fabric_networks]
+    # The link's own subnets are not collisions with themselves. Excluded
+    # when a hostile entry IS (or is narrower than) a fabric network, not
+    # merely overlapping it (transport.configure_link's own_networks had
+    # the same equality-vs-real-collision gap — #2875 review; plain
+    # overlap over-excludes here too: a hostile entry broader than the
+    # fabric subnet, like a utun routing all of 10/8 while the fabric
+    # sits at 10.0.1.0/24, is a real collision risk this check exists to
+    # catch, not something to wave away just because it happens to cover
+    # the fabric's own range).
+    collision_set = [
+        net
+        for net in hostile
+        if not any(net == own or net.subnet_of(own) for own in fabric_networks)
+    ]
     tunnel_routed = {
         net for net in collision_set if net not in interface_networks
     }
@@ -665,7 +764,10 @@ def check_subnet_collision(
                     state="fail",
                     evidence=evidence,
                     diagnosis=diagnosis,
-                    remedy="Run Fabric Doctor → Move link addresses.",
+                    remedy=(
+                        "Click Start Cluster again — it will pick a "
+                        "different, collision-free subnet automatically."
+                    ),
                     fix_action={"kind": "move_subnet", "hosts": list(hosts)},
                 )
             ]
@@ -699,7 +801,7 @@ def check_reachability(
                     "the two Macs share no verified fabric addressing, so "
                     "there is no route to check"
                 ),
-                remedy="Run Fabric Doctor → Re-address link.",
+                remedy="Click Start Cluster again — it re-addresses the link automatically.",
                 fix_action={"kind": "readdress"},
             ),
             DoctorFinding(
@@ -747,8 +849,8 @@ def check_reachability(
                     "address over the Thunderbolt interface"
                 ),
                 remedy=(
-                    "Run Fabric Doctor → Re-address link to clear the stale "
-                    "route."
+                    "Click Start Cluster again — it re-addresses the link "
+                    "automatically, clearing the stale route."
                 ),
                 fix_action={"kind": "readdress"},
             ),
@@ -991,7 +1093,7 @@ def check_staleness_admin(
                     "the link's addresses were lost (this happens after a "
                     "reboot when addressing was applied with ifconfig)"
                 ),
-                remedy="Run Fabric Doctor → Re-address link.",
+                remedy="Click Start Cluster again — it re-addresses the link automatically.",
                 fix_action={"kind": "readdress", "hosts": list(hosts)},
             )
         )
@@ -1008,7 +1110,10 @@ def check_staleness_admin(
     findings.append(
         DoctorFinding(
             check_id="admin_port",
-            state="pass" if ok else "fail",
+            # A heuristic best-effort read, not a fabric fault: "fail" here
+            # would stop the ladder and gate the whole report on something
+            # whose worst case is "planning is a bit slower" (#2878 review).
+            state="pass" if ok else "warn",
             evidence=detail,
             diagnosis=(
                 ""
@@ -1052,26 +1157,39 @@ def _verdict(
             f"Fabric Doctor stopped at {first_red.check_id}: "
             f"{first_red.diagnosis or first_red.evidence}"
         )
+    # A "warn" finding (admin_port today) is real but never the fabric
+    # verdict's headline -- it did not stop the ladder and does not gate
+    # DoctorReport.ok, so it rides along as a suffix on whatever verdict
+    # the actually-decisive checks produced (#2878 review).
+    warnings = [finding for finding in findings if finding.state == "warn"]
+    warning_suffix = (
+        " (" + "; ".join(finding.evidence for finding in warnings) + ")"
+        if warnings
+        else ""
+    )
     probe = next(
         (finding for finding in findings if finding.check_id == "jaccl_probe"),
         None,
     )
     if probe is not None and probe.state == "skipped":
-        return f"No faults found; the collective probe was skipped: {probe.evidence}"
+        return (
+            f"No faults found; the collective probe was skipped: "
+            f"{probe.evidence}{warning_suffix}"
+        )
     if probe_result is not None:
         bandwidth = probe_result.get("bandwidth_gbps")
         if bandwidth:
             return (
                 f"Fabric verified — {bandwidth:.0f} Gb/s measured across the "
-                "link."
+                f"link.{warning_suffix}"
             )
         elapsed = probe_result.get("elapsed_seconds")
         if isinstance(elapsed, (int, float)):
             return (
                 "Fabric verified — the two-rank collective handshake "
-                f"completed in {elapsed:.2f}s."
+                f"completed in {elapsed:.2f}s.{warning_suffix}"
             )
-    return "Fabric verified — every check passed."
+    return f"Fabric verified — every check passed.{warning_suffix}"
 
 
 def run_fabric_doctor(

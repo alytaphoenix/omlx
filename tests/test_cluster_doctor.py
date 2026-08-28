@@ -27,6 +27,7 @@ from omlx.cluster.transport import (
     InterfaceAddress,
     LinkEndpoint,
     SharedLink,
+    verify_link_reachability,
 )
 from omlx.cluster.vpn import VPNProfile
 
@@ -124,6 +125,40 @@ def test_all_green_run_verifies_fabric():
     assert report.verdict == (
         "Fabric verified — the two-rank collective handshake completed in 1.25s."
     )
+
+
+def test_check3_runs_through_the_real_verify_path_with_ssh_shaped_runner():
+    # Every other test in this file stubs DoctorProbes.verify with a canned
+    # (bool, str) tuple, so none of them actually exercise
+    # transport.verify_link_reachability -- the function check 3 wraps in
+    # production. That gap is exactly how #2849's shell-quoting bug shipped:
+    # it made this check always fail on a healthy fabric, and no test here
+    # would have caught it. This one wires the real function through an
+    # ssh-shaped runner fake (the same shape _run_link_command's real ssh
+    # argv takes) so a regression in the wiring, not just the pure logic,
+    # fails the suite (#2878 review).
+    link = _healthy_link()
+    calls = []
+
+    def runner(host, command):
+        calls.append((host, tuple(command)))
+        if command[0] == "/sbin/route":
+            return subprocess.CompletedProcess(command, 0, "interface: en3\n", "")
+        if command[0] == "python3":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(command, 0, "one packet received\n", "")
+
+    probes = _probes(
+        shared_link=lambda source, peer, **_: link,
+        verify=lambda link: verify_link_reachability(link, runner=runner),
+    )
+    report = run_fabric_doctor(HOSTS, probes=probes)
+    by_id = _by_id(report)
+    assert by_id["route_pinning"].state == "pass"
+    assert by_id["bound_connect"].state == "pass"
+    # Both directions actually ran ssh-shaped commands -- not a stub return.
+    assert ("127.0.0.1", ("/sbin/route", "-n", "get", "172.16.99.2")) in calls
+    assert ("peer.local", ("/sbin/route", "-n", "get", "172.16.99.1")) in calls
 
 
 def test_success_verdict_carries_bandwidth_when_measured():
@@ -227,21 +262,25 @@ def test_check1_no_thunderbolt_interfaces_fails_presence():
     assert findings[1].state == "skipped"
 
 
-def test_check1_self_assigned_address_fails_with_readdress_fix():
+def test_check1_unaddressed_rdma_device_fails_with_readdress_fix():
+    # probe_host_interfaces already drops 169.254 self-assigned addresses
+    # before doctor.py ever sees them, so a self-assigned address can never
+    # appear on probed.addresses directly (#2878 review). What that failure
+    # actually looks like once filtered is an RDMA device with no address
+    # at all -- en0 has an address but the RDMA interface (en3) does not.
     interfaces = {
         HOSTS[0]: _interfaces(
-            HOSTS[0], addresses=(("en3", "169.254.12.7", 16),)
+            HOSTS[0], addresses=(("en0", "192.168.1.10", 24),)
         ),
         HOSTS[1]: _healthy_interfaces()[HOSTS[1]],
     }
-    # parse_interface_addresses filters 169.254 in production reads; the
-    # check still guards against a probe that reports one.
     findings = check_link_address_sanity(HOSTS, interfaces)
     sanity = findings[1]
     assert sanity.check_id == "address_sanity"
     assert sanity.state == "fail"
-    assert "169.254.12.7" in sanity.evidence
-    assert "self-assigned" in sanity.diagnosis
+    assert "no fabric address" in sanity.evidence
+    assert "en3" in sanity.evidence
+    assert "never finished configuring" in sanity.diagnosis
     assert sanity.fix_action == {"kind": "readdress", "hosts": list(HOSTS)}
 
 
@@ -296,7 +335,7 @@ def test_check2_tunnel_routed_prefix_names_the_client():
     assert finding.state == "fail"
     assert finding.evidence == "WARP routes 10.0.0.0/8 through utun4"
     assert finding.fix_action == {"kind": "move_subnet", "hosts": list(HOSTS)}
-    assert "Move link addresses" in finding.remedy
+    assert "Start Cluster" in finding.remedy
 
 
 def test_check2_lan_overlap_reported_without_vpn_language():
@@ -336,6 +375,61 @@ def test_check2_passes_when_fabric_range_is_clean():
     )
     assert findings[0].state == "pass"
     assert "172.16.99.0/24" in findings[0].evidence
+
+
+def test_check2_narrower_hostile_entry_for_own_address_is_not_a_collision():
+    # hostile_networks() doesn't know which routes are "own" -- a
+    # directly-connected route for the fabric's own address can surface at
+    # a different (often narrower) mask than the interface's configured
+    # /24, e.g. a /32 host route. Exact-equality exclusion misses this and
+    # flags the link's own address as colliding with itself -- the same
+    # self-exclusion blind spot transport.configure_link's own_networks
+    # filter had (#2875 review); subnet_of must recognize it as own.
+    interfaces = {
+        HOSTS[0]: _interfaces(
+            HOSTS[0],
+            addresses=(("en3", "10.90.99.1", 24),),
+        ),
+        HOSTS[1]: _interfaces(
+            HOSTS[1],
+            addresses=(("en3", "10.90.99.2", 24),),
+        ),
+    }
+    findings = check_subnet_collision(
+        HOSTS,
+        interfaces,
+        hostile=(ipaddress.ip_network("10.90.99.1/32"),),
+        vpn_profiles={host: VPNProfile() for host in HOSTS},
+    )
+    assert findings[0].state == "pass"
+
+
+def test_check2_hostile_network_broader_than_fabric_still_collides():
+    # A hostile entry broader than the fabric's own subnet (a VPN tunnel
+    # routing all of 10.0.0.0/8 while the fabric sits at 10.90.99.0/24) is
+    # a real, independent collision risk. Plain .overlaps() would exclude
+    # it just because it happens to cover the fabric's own address -- the
+    # same bug transport.configure_link's own_networks filter had (#2875
+    # review); this must still fail here.
+    interfaces = {
+        HOSTS[0]: _interfaces(
+            HOSTS[0],
+            addresses=(("en3", "10.90.99.1", 24),),
+        ),
+        HOSTS[1]: _interfaces(
+            HOSTS[1],
+            addresses=(("en3", "10.90.99.2", 24),),
+        ),
+    }
+    findings = check_subnet_collision(
+        HOSTS,
+        interfaces,
+        hostile=(ipaddress.ip_network("10.0.0.0/8"),),
+        vpn_profiles={host: VPNProfile() for host in HOSTS},
+    )
+    finding = findings[0]
+    assert finding.state == "fail"
+    assert "10.0.0.0/8" in finding.evidence
 
 
 def test_check2_no_fabric_addresses_is_a_pass_with_honest_evidence():
@@ -555,7 +649,10 @@ def test_check5_devices_without_addresses_is_the_reboot_finding():
     assert stale.fix_action == {"kind": "readdress", "hosts": list(HOSTS)}
 
 
-def test_check5_admin_port_failure_reported():
+def test_check5_admin_port_failure_reported_as_warning():
+    # admin_port is a best-effort heuristic read whose failure only means
+    # planning falls back to a slower path -- it must not stop the ladder
+    # or gate DoctorReport.ok like a real fabric fault would (#2878 review).
     findings = check_staleness_admin(
         HOSTS,
         _healthy_interfaces(),
@@ -564,7 +661,7 @@ def test_check5_admin_port_failure_reported():
     assert findings[0].state == "pass"
     admin = findings[1]
     assert admin.check_id == "admin_port"
-    assert admin.state == "fail"
+    assert admin.state == "warn"
     assert "9000" in admin.evidence
 
 
@@ -591,6 +688,18 @@ def _fake_runner(records=(0, 1), returncode=0, stderr=""):
         return subprocess.CompletedProcess(
             args=list(argv), returncode=returncode, stdout=stdout, stderr=stderr
         )
+
+    return runner
+
+
+def _fake_port_check_runner(busy_hosts=()):
+    """A port_check_runner stub: every host is free unless listed as busy."""
+
+    busy = set(busy_hosts)
+
+    def runner(host, command):
+        rc = 1 if host in busy else 0
+        return subprocess.CompletedProcess(command, rc, "", "")
 
     return runner
 
@@ -640,6 +749,7 @@ def test_probe_success_reports_hosts_and_elapsed():
         ("172.16.99.1", "172.16.99.2"),
         _MATRIX,
         runner=_fake_runner(),
+        port_check_runner=_fake_port_check_runner(),
         deployments=(),
     )
     assert result["ok"] is True
@@ -647,6 +757,81 @@ def test_probe_success_reports_hosts_and_elapsed():
     assert result["hosts"] == list(HOSTS)
     assert result["addresses"] == ["172.16.99.1", "172.16.99.2"]
     assert result["elapsed_seconds"] >= 0
+
+
+def test_probe_checks_the_peers_own_rank_port_not_the_coordinators():
+    # mlx's ring launcher assigns starting_port + i to hosts[i] -- hosts[0]
+    # (the coordinator) binds starting_port itself, hosts[1] (the peer)
+    # binds starting_port + 1. Checking availability only on the
+    # coordinator's own loopback never proves the peer's actual port is
+    # free (#2878 review).
+    checked = []
+
+    def port_check_runner(host, command):
+        checked.append((host, int(command[-1])))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = run_fabric_collective_probe(
+        HOSTS,
+        ("172.16.99.1", "172.16.99.2"),
+        _MATRIX,
+        runner=_fake_runner(),
+        port_check_runner=port_check_runner,
+        deployments=(),
+    )
+    assert len(checked) == 1
+    peer_host, peer_port = checked[0]
+    assert peer_host == "peer.local"
+    assert peer_port == result["starting_port"] + 1
+
+
+def test_probe_retries_with_a_fresh_span_when_the_peer_reports_busy():
+    attempts = []
+
+    def port_check_runner(host, command):
+        port = int(command[-1])
+        attempts.append(port)
+        # The first candidate port is reported busy on the peer; every
+        # later candidate is free.
+        busy_port = attempts[0]
+        return subprocess.CompletedProcess(
+            command, 1 if port == busy_port else 0, "", ""
+        )
+
+    result = run_fabric_collective_probe(
+        HOSTS,
+        ("172.16.99.1", "172.16.99.2"),
+        _MATRIX,
+        runner=_fake_runner(),
+        port_check_runner=port_check_runner,
+        deployments=(),
+    )
+    assert result["ok"] is True
+    assert len(attempts) >= 2
+    assert result["starting_port"] + 1 != attempts[0]
+
+
+def test_probe_gives_up_after_exhausting_port_span_attempts():
+    launched = []
+
+    def runner(argv, *, timeout):
+        launched.append(argv)
+        raise AssertionError("must not launch without a verified port span")
+
+    def always_busy(host, command):
+        return subprocess.CompletedProcess(command, 1, "", "")
+
+    with pytest.raises(CollectiveSmokeError) as excinfo:
+        run_fabric_collective_probe(
+            HOSTS,
+            ("172.16.99.1", "172.16.99.2"),
+            _MATRIX,
+            runner=runner,
+            port_check_runner=always_busy,
+            deployments=(),
+        )
+    assert launched == []
+    assert "peer.local" in str(excinfo.value)
 
 
 def test_probe_writes_deployment_shaped_hostfile():
@@ -665,6 +850,7 @@ def test_probe_writes_deployment_shaped_hostfile():
         ("172.16.99.1", "172.16.99.2"),
         _MATRIX,
         runner=runner,
+        port_check_runner=_fake_port_check_runner(),
         deployments=(),
     )
     assert captured["backend"] == "jaccl"
@@ -683,6 +869,7 @@ def test_probe_launcher_failure_carries_stderr():
             ("172.16.99.1", "172.16.99.2"),
             _MATRIX,
             runner=_fake_runner(returncode=1, stderr="jaccl error: 60"),
+            port_check_runner=_fake_port_check_runner(),
             deployments=(),
         )
     assert "error: 60" in str(excinfo.value)

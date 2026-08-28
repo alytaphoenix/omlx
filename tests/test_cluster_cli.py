@@ -198,7 +198,7 @@ def test_cluster_doctor_red_report_exits_nonzero(monkeypatch):
                     check_id="subnet_collision",
                     state="fail",
                     evidence="WARP routes 10.0.0.0/8 through utun4",
-                    remedy="Run Fabric Doctor → Move link addresses.",
+                    remedy="Click Start Cluster again — it will pick a different, collision-free subnet automatically.",
                 ),
             ),
             verdict="Fabric Doctor stopped at subnet_collision: collision",
@@ -220,7 +220,7 @@ def test_cluster_doctor_red_report_exits_nonzero(monkeypatch):
     assert exit_code == 1
     assert "FAIL" in captured
     assert "subnet_collision" in captured
-    assert "Move link addresses" in captured
+    assert "Start Cluster" in captured
     assert "Fabric Doctor stopped at subnet_collision" in captured
 
 

@@ -2002,6 +2002,11 @@ class ClusterDoctorRequest(BaseModel):
 _DOCTOR_JOBS: dict[str, dict[str, Any]] = {}
 _DOCTOR_JOBS_LOCK = threading.Lock()
 _MAX_DOCTOR_JOBS = 16
+_DOCTOR_JOB_IN_FLIGHT_PHASES = {"queued", "running"}
+
+
+class DoctorJobConflictError(RuntimeError):
+    """Another Fabric Doctor run is already in flight."""
 
 
 def _doctor_job_snapshot(job_id: str) -> dict[str, Any] | None:
@@ -2013,7 +2018,30 @@ def _doctor_job_snapshot(job_id: str) -> dict[str, Any] | None:
 
 
 def _record_doctor_job(job: dict[str, Any]) -> None:
+    """Register a new job, refusing it if one is already in flight.
+
+    The Doctor spawns real SSH probes and a real collective-probe subprocess;
+    running two at once contends for the same fabric and ports. The client
+    already disables its own button while a run is active, but that is
+    cosmetic — this lock-guarded check-and-insert is the actual guard, closing
+    the race a second tab, a stale page, or a retried request would otherwise
+    hit (#2878 review).
+    """
+
     with _DOCTOR_JOBS_LOCK:
+        active = next(
+            (
+                existing
+                for existing in _DOCTOR_JOBS.values()
+                if existing.get("phase") in _DOCTOR_JOB_IN_FLIGHT_PHASES
+            ),
+            None,
+        )
+        if active is not None:
+            raise DoctorJobConflictError(
+                f"A Fabric Doctor run ({active['job_id']}) is already in "
+                "progress. Wait for it to finish before starting another."
+            )
         if len(_DOCTOR_JOBS) >= _MAX_DOCTOR_JOBS:
             finished = [
                 key
@@ -2071,7 +2099,7 @@ def _run_doctor_job(job_id: str, hosts: tuple[str, ...]) -> None:
         Severity.ERROR
         if "fail" in states
         else Severity.WARN
-        if "skipped" in states
+        if "skipped" in states or "warn" in states
         else Severity.INFO
     )
     _record_cluster_incident(
@@ -2092,18 +2120,21 @@ async def cluster_doctor_start(request: ClusterDoctorRequest):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     job_id = secrets.token_hex(12)
-    _record_doctor_job(
-        {
-            "job_id": job_id,
-            "phase": "queued",
-            "hosts": list(hosts),
-            "findings": [],
-            "verdict": "",
-            "error": "",
-            "created_at": time.time(),
-            "updated_at": time.time(),
-        }
-    )
+    try:
+        _record_doctor_job(
+            {
+                "job_id": job_id,
+                "phase": "queued",
+                "hosts": list(hosts),
+                "findings": [],
+                "verdict": "",
+                "error": "",
+                "created_at": time.time(),
+                "updated_at": time.time(),
+            }
+        )
+    except DoctorJobConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     thread = threading.Thread(
         target=_run_doctor_job,
         args=(job_id, hosts),

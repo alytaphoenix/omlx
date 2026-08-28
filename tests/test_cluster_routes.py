@@ -2592,6 +2592,48 @@ def test_doctor_crash_marks_job_failed_with_incident(tmp_path, monkeypatch):
     assert recorded[0].severity == "error"
 
 
+def test_doctor_refuses_a_second_run_while_one_is_in_flight(tmp_path, monkeypatch):
+    # POST /doctor spawns real SSH probes and a real collective-probe
+    # subprocess; the only guard against a second concurrent run was a
+    # client-side flag, so a second tab, a stale page, or a retry could
+    # still fire a second run server-side (#2878 review).
+    import threading as _threading
+
+    _incident_store(tmp_path, monkeypatch)
+    started = _threading.Event()
+    release = _threading.Event()
+
+    def blocking_run(hosts, **_):
+        started.set()
+        release.wait(timeout=5)
+        return _fake_doctor_report(hosts)
+
+    monkeypatch.setattr(routes, "run_fabric_doctor", blocking_run)
+    client = _client()
+
+    first = client.post(
+        "/admin/api/cluster/doctor",
+        json={"hosts": ["127.0.0.1", "studio.local"]},
+    )
+    assert first.status_code == 202
+    assert started.wait(timeout=5)
+
+    second = client.post(
+        "/admin/api/cluster/doctor",
+        json={"hosts": ["127.0.0.1", "studio.local"]},
+    )
+    assert second.status_code == 409
+
+    release.set()
+    _wait_for_doctor_phase(client, first.json()["job_id"])
+
+    third = client.post(
+        "/admin/api/cluster/doctor",
+        json={"hosts": ["127.0.0.1", "studio.local"]},
+    )
+    assert third.status_code == 202
+
+
 def test_doctor_rejects_bad_hosts_and_counts(monkeypatch):
     client = _client()
     assert (
