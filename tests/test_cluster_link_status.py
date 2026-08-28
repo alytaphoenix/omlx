@@ -328,7 +328,9 @@ def _stub_fresh_subnet_selection(monkeypatch):
     routes and VPN posture to pick a collision-free /24. On a developer Mac
     those reads see the real machine, so the stubs stand in for two clean
     hosts: nothing occupied, no VPN, and the selection lands on the first
-    static candidate, 172.16.99.0/24.
+    static candidate, 10.90.99.0/24 (the closest match to the previous
+    single hardcoded default; only a detected VPN promotes 172.16.x -- see
+    choose_fabric_subnet's own tests).
     """
 
     monkeypatch.setattr(
@@ -384,8 +386,8 @@ def test_gui_setup_uses_native_authorization_on_both_macs(monkeypatch):
     configure_link(HOSTS)
 
     assert configured == [
-        ("127.0.0.1", "en6", "172.16.99.1"),
-        ("Studio.local", "en5", "172.16.99.2"),
+        ("127.0.0.1", "en6", "10.90.99.1"),
+        ("Studio.local", "en5", "10.90.99.2"),
     ]
 
 
@@ -428,8 +430,8 @@ def test_gui_setup_can_configure_a_worker_to_worker_pair(monkeypatch):
 
     assert configure_link(hosts).ready is True
     assert configured == [
-        ("mini.local", "172.16.99.1"),
-        ("studio.local", "172.16.99.2"),
+        ("mini.local", "10.90.99.1"),
+        ("studio.local", "10.90.99.2"),
     ]
 
 

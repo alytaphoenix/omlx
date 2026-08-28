@@ -1380,16 +1380,23 @@ _UNROUTABLE_NETWORKS = (
     ipaddress.ip_network("169.254.0.0/16"),
 )
 
-# Point-to-point fabric subnet candidates, in preference order. 172.16.0.0/12
-# leads because corporate full-tunnel VPNs (e.g. Cloudflare WARP) commonly
-# *exclude* it from the tunnel, so a fabric addressed here survives a VPN that
-# would otherwise swallow a 10.x link — the real incident that motivated this:
-# an auto-assigned 10.0.1.x link was silently eaten by WARP while ping/SSH over
-# the LAN kept working. 192.168.0.0/16 is deliberately absent (usual home LAN).
-# Each candidate is a /24; the two hosts take .1 and .2.
+# Point-to-point fabric subnet candidates, in static preference order. 10.x
+# leads (closest available match to the previous single hardcoded default,
+# 10.0.1.1/24) so a cluster with no detected VPN keeps getting a 10.x fabric
+# by default -- moving the default itself to 172.16.x is a separate,
+# deliberate behavior change deferred to its own PR with a migration note
+# (#2867 review), not something to bundle into VPN-avoidance silently.
+# 172.16.0.0/12 still exists here as the SECOND static tier and is what a
+# detected VPN's ``preferred`` promotes to the front (see choose_fabric_subnet)
+# -- corporate full-tunnel VPNs (e.g. Cloudflare WARP) commonly *exclude* it
+# from the tunnel, so a fabric addressed there survives a VPN that would
+# otherwise swallow a 10.x link. The real incident that motivated adding it:
+# an auto-assigned 10.0.1.x link was silently eaten by WARP while ping/SSH
+# over the LAN kept working. 192.168.0.0/16 is deliberately absent (usual
+# home LAN). Each candidate is a /24; the two hosts take .1 and .2.
 _FABRIC_SUBNET_CANDIDATES = tuple(
-    ipaddress.ip_network(f"172.16.{block}.0/24") for block in range(99, 116)
-) + tuple(ipaddress.ip_network(f"10.{block}.99.0/24") for block in range(90, 100))
+    ipaddress.ip_network(f"10.{block}.99.0/24") for block in range(90, 100)
+) + tuple(ipaddress.ip_network(f"172.16.{block}.0/24") for block in range(99, 116))
 
 
 def choose_fabric_subnet(
@@ -1429,9 +1436,18 @@ def choose_fabric_subnet(
     for candidate in ordered:
         if not any(candidate.overlaps(net) for net in occupied):
             return candidate
-    raise LinkSetupError(
-        "Could not find a free private subnet for the Thunderbolt link — every "
-        "candidate range already overlaps a network in use on one of the Macs."
+    # Last resort: every candidate collides with something already in use
+    # (e.g. an aggressive full-tunnel VPN policy vetoing the whole static
+    # list). Hard-failing Start Cluster here previously turned that into a
+    # 503 where the old hardcoded default at least attempted a link -- pick
+    # the candidate with the fewest collisions instead and let it actually
+    # try. The post-addressing assess_link() call this choice feeds is the
+    # real authority on whether the link works, so this degrades exactly
+    # like a probe failure above: a subnet we cannot prove free is still
+    # better than refusing to try one at all.
+    return min(
+        ordered,
+        key=lambda candidate: sum(1 for net in occupied if candidate.overlaps(net)),
     )
 
 
