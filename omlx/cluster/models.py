@@ -152,6 +152,12 @@ class ClusterStatus:
     fabric_kind: str | None = None
     fabric_group_id: str | None = None
     fabric_verified: bool = False
+    # The port this node's own admin API answers on. Advertised so a
+    # coordinator's fast memory-ceiling probe can target the peer's real
+    # server instead of guessing conventional ports (C5). 0 means the port
+    # is unknown (worker-only installs, older peers) and the coordinator
+    # must fall back to its legacy guesses.
+    admin_port: int = 0
 
     @property
     def thunderbolt_peer_connected(self) -> bool:
@@ -167,6 +173,7 @@ class ClusterStatus:
             "collected_at": self.collected_at,
             "node": {
                 "hostname": self.hostname,
+                "admin_port": self.admin_port,
                 "platform": self.platform,
                 "chip_name": self.chip_name,
                 "physical_memory_bytes": self.physical_memory_bytes,

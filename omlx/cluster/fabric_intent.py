@@ -20,6 +20,7 @@ import os
 import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -72,6 +73,137 @@ class FabricIntent:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"fabric intent record is malformed: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class DriftFinding:
+    """Live addressing no longer matches the recorded intent (C5 watchdog).
+
+    ``auto_restore`` and ``incident`` are policy *as data* — this module never
+    performs the restoration or records the incident itself. Silent re-assert
+    is only ever appropriate when the collision check still passes and the
+    intent was applied via ``networksetup`` (the service configuration
+    persists, so re-asserting it needs no new consent); every other case must
+    surface as a WARN incident inviting a consented Fabric Doctor re-address,
+    never a silent privileged action.
+
+    ``addressing="networksetup"`` (and therefore ``auto_restore=True``) is
+    dormant today: ``configure_link`` split the networksetup write-half out
+    into its own not-yet-landed change (#2875 review) rather than enable it
+    unvalidated, so every intent this build records is ``"ifconfig"``. Kept
+    here (not removed) since the store already accepts both values and this
+    is the exact behavior that follow-up needs the moment it ships.
+    """
+
+    kind: str  # "address_lost" | "address_changed" | "intent_collides"
+    live: str  # what the fabric interfaces carry right now
+    expected: str  # the subnet the intent recorded
+    auto_restore: bool = False
+    incident: str = ""  # WARN copy for the caller; empty when auto_restore
+
+
+# The design's exact collision copy: the recorded choice is now unusable and
+# only a consented re-address can produce a new one.
+_COLLISION_INCIDENT = (
+    "The link's saved addresses now collide with a new VPN range — "
+    "Fabric Doctor needs to pick new ones."
+)
+
+
+def _drift_finding(kind: str, live: str, intent: FabricIntent) -> DriftFinding:
+    if kind == "intent_collides":
+        return DriftFinding(
+            kind=kind,
+            live=live,
+            expected=intent.subnet,
+            auto_restore=False,
+            incident=_COLLISION_INCIDENT,
+        )
+    if intent.addressing == "networksetup":
+        # The service configuration persists across reboots; re-asserting the
+        # recorded addresses grants nothing new, so the caller may restore
+        # silently (configure_link's tier 2 is that re-assert).
+        return DriftFinding(
+            kind=kind, live=live, expected=intent.subnet, auto_restore=True
+        )
+    return DriftFinding(
+        kind=kind,
+        live=live,
+        expected=intent.subnet,
+        auto_restore=False,
+        incident=(
+            f"The link's saved fabric addresses ({intent.subnet}) are no "
+            "longer applied — addresses set with ifconfig drift on reboot. "
+            "Run Fabric Doctor to re-apply them."
+        ),
+    )
+
+
+def detect_drift(
+    intent: FabricIntent,
+    live_interfaces: Iterable[Any],
+    *,
+    collides: Callable[[ipaddress.IPv4Network], bool] | None = None,
+) -> DriftFinding | None:
+    """Compare live fabric addressing against the recorded intent. Pure.
+
+    ``live_interfaces`` is the fresh ``probe_host_interfaces`` reading the
+    caller already holds (duck-typed ``HostInterfaces``: ``addresses`` entries
+    with ``interface``/``address``, plus ``rdma_interfaces`` and
+    ``thunderbolt_interfaces`` naming the fabric-capable interfaces).
+    ``collides`` is the caller's collision check over everything *else* the
+    hosts carry or route (``hostile_networks`` minus the intent's own subnet,
+    exactly like ``configure_link``'s ``own_networks`` filter — passing the
+    raw hostile set would make a healthy link "collide" with itself).
+
+    A collision outranks the address comparison: a collided intent must never
+    be re-applied, silently or otherwise, so ``intent_collides`` wins even
+    when the addresses are also missing or changed.
+
+    Explicit non-goal: no event-driven wake/network-change watcher — this is
+    deliberately poll-driven and catches drift within one dashboard tick.
+    """
+
+    try:
+        network = ipaddress.ip_network(intent.subnet)
+    except ValueError:
+        # A record whose subnet cannot parse must never steer addressing;
+        # from_dict refuses these, so this is belt-and-braces only.
+        return None
+
+    hosts = tuple(live_interfaces)  # tolerate one-shot iterables
+    if collides is not None and collides(network):  # type: ignore[arg-type]
+        return _drift_finding("intent_collides", _live_summary(hosts), intent)
+
+    fabric_addresses: list[tuple[str, str]] = []
+    for host in hosts:
+        fabric_interfaces = frozenset(
+            getattr(host, "rdma_interfaces", ()) or ()
+        ) | frozenset(getattr(host, "thunderbolt_interfaces", ()) or ())
+        for entry in getattr(host, "addresses", ()) or ():
+            if entry.interface not in fabric_interfaces:
+                continue
+            fabric_addresses.append((entry.interface, entry.address))
+
+    for _, address in fabric_addresses:
+        with suppress(ValueError):
+            if ipaddress.ip_address(address) in network:
+                return None  # live matches intent
+    if fabric_addresses:
+        live = ", ".join(
+            f"{interface} {address}" for interface, address in fabric_addresses
+        )
+        return _drift_finding("address_changed", live, intent)
+    return _drift_finding("address_lost", "", intent)
+
+
+def _live_summary(live_interfaces: Iterable[Any]) -> str:
+    parts = [
+        f"{entry.interface} {entry.address}"
+        for host in live_interfaces
+        for entry in (getattr(host, "addresses", ()) or ())
+    ]
+    return ", ".join(parts)
 
 
 class FabricIntentStore:
