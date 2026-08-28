@@ -925,72 +925,6 @@ def _authorized_ifconfig(
     _run_authorized(host, shell_command)
 
 
-# Network service names macOS itself creates ("Thunderbolt Bridge", "Wi-Fi")
-# and the renamed ones seen in the field ("EXO Thunderbolt 2") are short and
-# printable; anything else is refused before it can reach a privileged shell.
-_SERVICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()/-]{0,63}$")
-
-
-def _authorized_networksetup(
-    host: str,
-    service: str,
-    address: str,
-    mask: str,
-    *,
-    create_hardware_port: str | None = None,
-) -> None:
-    """Assign one fixed service-owned address through the native auth dialog.
-
-    Unlike raw ``ifconfig``, a ``networksetup -setmanual`` assignment is
-    written into the system configuration, so it survives reboots and
-    interface renumbering — the durability C2 is after. Inputs are validated
-    exactly like ``_authorized_ifconfig``'s: no free text reaches the
-    privileged command. When the service does not exist yet,
-    ``create_hardware_port`` folds ``-createnetworkservice`` into the same
-    shell command, so the user sees a single admin prompt.
-    """
-
-    if not _SERVICE_NAME.fullmatch(service):
-        raise LinkSetupError(
-            f"Refusing an invalid network service name: {service!r}"
-        )
-    try:
-        parsed_address = ipaddress.IPv4Address(address)
-    except ValueError as exc:
-        raise LinkSetupError(f"Refusing an invalid link address: {address!r}") from exc
-    try:
-        # A non-contiguous or garbage mask raises rather than widening the net.
-        parsed_mask = ipaddress.ip_network(f"0.0.0.0/{mask}").netmask
-    except (TypeError, ValueError) as exc:
-        raise LinkSetupError(f"Refusing an invalid netmask: {mask!r}") from exc
-
-    set_manual = shlex.join(
-        [
-            "/usr/sbin/networksetup",
-            "-setmanual",
-            service,
-            str(parsed_address),
-            str(parsed_mask),
-        ]
-    )
-    shell_command = set_manual
-    if create_hardware_port is not None:
-        if not _SERVICE_NAME.fullmatch(create_hardware_port):
-            raise LinkSetupError(
-                f"Refusing an invalid hardware port name: {create_hardware_port!r}"
-            )
-        create = shlex.join(
-            [
-                "/usr/sbin/networksetup",
-                "-createnetworkservice",
-                service,
-                create_hardware_port,
-            ]
-        )
-        shell_command = f"{create} && {set_manual}"
-    _run_authorized(host, shell_command)
-
-
 def _recorded_intent(hosts: Iterable[str]):
     """The stored fabric intent for exactly this pair, or None.
 
@@ -1043,35 +977,50 @@ def _apply_link_address(
     address: str,
     *,
     prefix_length: int,
-    prefer_service: bool,
 ) -> str:
     """Assign one link address, returning the mechanism actually used.
 
-    ``"networksetup"`` means the address is service-owned and survives reboot;
-    ``"ifconfig"`` means it drifts on reboot and the recorded intent is what
-    the watchdog (C5) re-applies. Service addressing is opt-in: the two-Mac
-    rig's recon confirmed each Thunderbolt port maps to its own service, but
-    ``-setmanual`` has not yet been validated against a live RDMA link there
-    (the peer's service config was still DHCP while the interface carried the
-    fabric address), so the empirically proven ``ifconfig`` path stays the
-    default until the spike's write-half lands.
+    Always ``"ifconfig"`` today: the address drifts on reboot and the
+    recorded intent (see ``_record_intent``) is what the watchdog (C5)
+    re-applies, so durability comes from the intent store replaying the
+    choice, not from the OS remembering the interface config itself. A
+    service-owned ``networksetup -setmanual`` assignment would survive
+    reboot on its own and was prototyped here, but split out to its own
+    change (#2875 review): the two-Mac rig's recon confirmed each
+    Thunderbolt port maps to its own service, but ``-setmanual`` itself has
+    not yet been validated against a live RDMA link (the peer's service
+    config was still DHCP while the interface carried the fabric address),
+    and that validation needs its own live pass before the write-half ships.
     """
 
-    if prefer_service:
-        service = _interface_service(host, interface)
-        if service:
-            _authorized_networksetup(
-                host, service, address, _netmask_for_prefix(prefix_length)
-            )
-            return "networksetup"
     _authorized_ifconfig(host, interface, address, prefix_length=prefix_length)
     return "ifconfig"
 
 
+def _own_network(
+    host: str, address: str, interfaces: HostInterfaces | None
+) -> ipaddress.IPv4Network:
+    """This host's current link network at its REAL prefix, not a guess.
+
+    ``interfaces`` is the same probe ``hostile_networks`` was built from, so
+    matching against its real ``InterfaceAddress.prefix_length`` is what lets
+    ``configure_link`` recognize its own address in ``hostile`` by overlap
+    regardless of mask (#2875 review). Falls back to an assumed /24 only
+    when the probe failed or doesn't carry this exact address (transient
+    interface state) -- some candidate is still needed for tier 1/2's
+    collision check, but the guess must never be preferred over ground
+    truth when it exists.
+    """
+
+    if interfaces is not None:
+        for entry in interfaces.addresses:
+            if entry.address == address:
+                return entry.network
+    return ipaddress.ip_network(f"{address}/24", strict=False)
+
+
 def configure_link(
     hosts: list[str] | tuple[str, ...],
-    *,
-    prefer_service_addressing: bool = False,
 ) -> LinkStatus:
     """Prepare an active RDMA link entirely behind the GUI's Start button.
 
@@ -1130,12 +1079,30 @@ def configure_link(
     # The link's own current addressing is in ``hostile`` too (it sits on an
     # interface); it is not a collision with itself, so tiers 1 and 2 check
     # candidates against everything *else* the two Macs carry or route.
+    # Built at each interface's REAL prefix (from the same probe that fed
+    # ``hostile``), not an assumed /24: a fabric on any other mask compared
+    # by equality against ``hostile``'s real-prefix entry for that same
+    # address never matched, so tier 1 mistook a working link for a
+    # collision with itself and re-addressed it behind an admin prompt
+    # (#2875 review).
     own_networks = {
-        ipaddress.ip_network(f"{address}/24", strict=False)
-        for address in current_ips.values()
+        _own_network(host, address, probed.get(host))
+        for host, address in current_ips.items()
         if address
     }
-    collision_set = tuple(net for net in hostile if net not in own_networks)
+    # Excluded when a hostile entry IS (or is narrower than) an own network
+    # -- not merely overlapping it. A hostile entry broader than own (a
+    # utun routing all of 10/8 while this link sits at 10.0.1.0/24) is a
+    # real, independent collision risk for every OTHER candidate in that
+    # range; blanket-excluding it just because it happens to cover this
+    # link's own current address would silently drop that risk entirely
+    # (candidate.overlaps(10.0.0.0/8) is trivially true for endless
+    # candidates that have nothing to do with this link's own address).
+    collision_set = tuple(
+        net
+        for net in hostile
+        if not any(net == own or net.subnet_of(own) for own in own_networks)
+    )
 
     def collides(candidate: ipaddress.IPv4Network) -> bool:
         return any(candidate.overlaps(net) for net in collision_set)
@@ -1186,7 +1153,6 @@ def configure_link(
                 active_ports[host] or "",
                 target,
                 prefix_length=network.prefixlen,
-                prefer_service=prefer_service_addressing,
             )
         )
 
@@ -1501,13 +1467,6 @@ _IFCONFIG_HEADER = re.compile(
 )
 _HARDWARE_PORT = re.compile(r"^Hardware Port:\s*(?P<port>.+)$")
 _HARDWARE_DEVICE = re.compile(r"^Device:\s*(?P<device>\S+)$")
-# networksetup -listnetworkserviceorder: "(3) EXO Thunderbolt 2" followed by
-# "(Hardware Port: Thunderbolt 2, Device: en2)". A disabled service prints
-# "(*)" in place of its order number.
-_SERVICE_ORDER_ENTRY = re.compile(r"^\((?P<order>\d+|\*)\)\s+(?P<service>.+)$")
-_SERVICE_ORDER_PORT = re.compile(
-    r"^\(Hardware Port:\s*(?P<port>[^,]+),\s*Device:\s*(?P<device>[^)]*)\)$"
-)
 
 
 @dataclass(frozen=True)
@@ -1656,82 +1615,6 @@ def parse_thunderbolt_interfaces(output: str) -> frozenset[str]:
                 interfaces.add(match.group("device"))
             port = ""
     return frozenset(interfaces)
-
-
-def parse_hardware_ports(output: str) -> dict[str, str]:
-    """BSD device → hardware-port name, from ``-listallhardwareports``.
-
-    ``networksetup -listallhardwareports`` names the hardware port
-    ("Thunderbolt 2") behind every BSD device but never the *service*: on the
-    two-Mac rig the services over these ports are renamed ("EXO Thunderbolt
-    1/2/3"), so the service name has to be joined in from
-    ``-listnetworkserviceorder`` (``parse_network_services``). Mapping through
-    the hardware-port name rather than a cached BSD device is what survives
-    interface renumbering (the en6→en4 case above).
-    """
-
-    ports: dict[str, str] = {}
-    port = ""
-    for raw in output.splitlines():
-        line = raw.strip()
-        match = _HARDWARE_PORT.match(line)
-        if match is not None:
-            port = match.group("port").strip()
-            continue
-        match = _HARDWARE_DEVICE.match(line)
-        if match is not None and port:
-            ports[match.group("device")] = port
-            port = ""
-    return ports
-
-
-def parse_network_services(output: str) -> dict[str, str]:
-    """Hardware-port name → service name, from ``-listnetworkserviceorder``.
-
-    Keyed by hardware port, not BSD device: the Device this listing shows is
-    the service's cached binding and goes stale when interfaces renumber. A
-    disabled service (order printed as ``*``) cannot apply an address and is
-    skipped.
-    """
-
-    services: dict[str, str] = {}
-    pending: str | None = None
-    for raw in output.splitlines():
-        line = raw.strip()
-        match = _SERVICE_ORDER_PORT.match(line)
-        if match is not None:
-            if pending:
-                services[match.group("port").strip()] = pending
-            pending = None
-            continue
-        match = _SERVICE_ORDER_ENTRY.match(line)
-        if match is not None:
-            pending = (
-                None
-                if match.group("order") == "*"
-                else match.group("service").strip()
-            )
-    return services
-
-
-def _interface_service(host: str, interface: str) -> str | None:
-    """The network service owning a BSD interface, joined by hardware port.
-
-    None when the interface has no service of its own — e.g. a Thunderbolt
-    Bridge member — which is exactly when the caller must fall back to raw
-    ``ifconfig`` addressing.
-    """
-
-    ports = parse_hardware_ports(
-        _read(host, ["networksetup", "-listallhardwareports"])
-    )
-    port = ports.get(interface)
-    if not port:
-        return None
-    services = parse_network_services(
-        _read(host, ["networksetup", "-listnetworkserviceorder"])
-    )
-    return services.get(port)
 
 
 def parse_linux_ip_addresses(output: str) -> tuple[InterfaceAddress, ...]:
