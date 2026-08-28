@@ -1208,10 +1208,13 @@ class TestExposedProfileModels:
         pool = EnginePool()
         manager.set_settings("qwen-base", ModelSettings(max_context_window=100000))
         self._save_exposed_profile(manager, {"max_context_window": 4096})
-        _base_id, merged = manager.get_exposed_profile_runtime_settings_for_request(
-            "qwen-base:thinking"
-        )
-        expected_signature = pool._engine_runtime_signature("qwen-base", merged)
+        # Register the entry before computing the signature, matching every
+        # real caller (load(), the post-load record, the admin settings
+        # diff): _engine_runtime_signature's qwen4_ple_ssd_offload field is
+        # only included when self._entries already has the entry, so a
+        # signature computed before registration is never comparable to one
+        # computed after -- not a settings mismatch, just entry-presence
+        # timing (production never calls it in that order).
         pool._entries["qwen-base"] = EngineEntry(
             model_id="qwen-base",
             model_path="/fake/qwen-base",
@@ -1219,8 +1222,12 @@ class TestExposedProfileModels:
             engine_type="vlm",
             estimated_size=1,
             engine=object(),
-            runtime_settings_signature=expected_signature,
         )
+        _base_id, merged = manager.get_exposed_profile_runtime_settings_for_request(
+            "qwen-base:thinking"
+        )
+        expected_signature = pool._engine_runtime_signature("qwen-base", merged)
+        pool._entries["qwen-base"].runtime_settings_signature = expected_signature
         server_module._server_state.engine_pool = pool
 
         status = server_module._with_exposed_profile_status(
