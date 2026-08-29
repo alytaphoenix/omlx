@@ -161,6 +161,19 @@ _MAX_PENDING_WRITES = _compute_max_pending_writes()
 # cost of taking multiple saves to fully reconverge.
 _MAX_INLINE_UNLINKS_PER_SAVE = 32
 
+# Throttle for persisting a main-block LRU touch to disk mtime on an SSD-tier
+# hit (design doc §A2). GDN sidecars always os.utime on hit; main blocks are
+# hit far more often, so this only fires once the previously recorded access
+# is itself more than this long stale — one extra syscall per cold hit that
+# actually needed it, none on a chain being hit repeatedly within the window.
+_MAIN_BLOCK_UTIME_THROTTLE_SECONDS = 3600
+
+# Minimum age (mtime) before a `*_tmp.safetensors` staging leftover is
+# treated as a crash remnant rather than a concurrent manager's in-flight
+# rename target. A live writer renames within seconds of creating the temp
+# file (`_write_block_file`), so this has wide margin.
+_TMP_STAGING_MIN_AGE_SECONDS = 600
+
 
 # Cache format version. Bump when on-disk layout or RotatingKVCache meta_state
 # semantics change in a way that older blocks become unsafe to load.
@@ -259,6 +272,7 @@ def _cache_compat_signature(
     cachelist_subtypes: dict[str, list[str]] | None = None,
     payload_layout: str | None = None,
     gdn_sidecar_state_dtype: str | None = None,
+    ane_prefill: bool | None = None,
 ) -> str:
     """Return a stable compatibility signature for a persisted cache block."""
     payload = {
@@ -267,6 +281,15 @@ def _cache_compat_signature(
         "block_size": int(block_size or 0),
         "layer_cache_types": list(layer_cache_types or []),
     }
+    # ANE prefill computes KV through a different numeric path (fp16
+    # fixed-shape ANE programs vs the GPU kernels), so blocks written under
+    # it are not interchangeable with GPU-computed blocks — and if the ANE
+    # path ever corrupts (seen live on an unsupported MoE model), an
+    # unstamped cache converts that transient corruption into persistent
+    # poisoning that survives disabling the setting. Only stamped when
+    # active so pre-existing signatures stay byte-identical.
+    if ane_prefill:
+        payload["ane_prefill"] = True
     # TurboQuant packed state width depends on the bit depth
     # (packed_width = ceil(head_dim * bits / 32)), so blocks written at
     # different bit depths are shape-incompatible (#2045). Only stamped
@@ -315,6 +338,19 @@ def cache_signature_for(
         cachelist_subtypes=cachelist_subtypes,
         gdn_sidecar_state_dtype=gdn_sidecar_state_dtype,
     )
+
+
+def _signature_ane_prefill(cache_signature: str) -> bool:
+    """True when a stored signature was stamped as ANE-prefill-computed."""
+    if not cache_signature:
+        return False
+    try:
+        payload = json.loads(cache_signature)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("ane_prefill"))
 
 
 def _signature_turboquant_bits(cache_signature: str) -> float | None:
@@ -1693,6 +1729,11 @@ class PagedSSDCacheManager(CacheManager):
         # the layer signature. None disables the check (legacy managers /
         # models without mixed CacheList layers).
         self._expected_cachelist_subtypes: dict[str, list[str]] | None = None
+        # Whether Qwen ANE prefill is active for the live engine; learned
+        # together with the layer signature. ANE-computed KV is a different
+        # numeric path than GPU-computed KV, so blocks written under one
+        # must not be replayed under the other.
+        self._expected_ane_prefill: bool = False
         # Set once we have swept stale-signature blocks for the current
         # ``_expected_layer_cache_types`` / ``_expected_turboquant_kv_bits``.
         # Re-assigning the signature (e.g., via
@@ -1707,10 +1748,17 @@ class PagedSSDCacheManager(CacheManager):
         self._last_disk_pressure_warn: float = 0.0
         self._last_promotion_failure_warn: float = 0.0
 
+        # Set by the external disk-pressure guard tick (design doc §R2) once
+        # free disk falls below the configured hard floor. A cache write is
+        # always optional — refusing one here is strictly safe, unlike
+        # refusing a request; admission is deliberately untouched by this.
+        self._disk_pressure_hard = False
+
         # Statistics
         self._stats = {
             "saves": 0,
             "saves_persisted": 0,
+            "saves_refused_disk_pressure": 0,
             "loads": 0,
             "hits": 0,
             "misses": 0,
@@ -1726,6 +1774,12 @@ class PagedSSDCacheManager(CacheManager):
             "preload_time_ms": 0.0,
             "ssd_write_drops": 0,
             "ssd_inline_write_fallbacks": 0,
+            # Tier hit-rates (design doc §0.4/§A3): ``hits`` already lumps
+            # every tier together (hot cache + main-block SSD reads); these
+            # two isolate the SSD-tier main-block vs. sidecar-restore split
+            # that A3's budget-share decision needs.
+            "main_block_ssd_hits": 0,
+            "gdn_sidecar_restore_hits": 0,
         }
 
         # --- Hot cache (in-memory raw-bytes tier) ---
@@ -1908,6 +1962,12 @@ class PagedSSDCacheManager(CacheManager):
             return False
         if not entry.get("dirty", True):
             return True
+        if self._disk_pressure_hard:
+            # Same refusal as save_block's direct path (design doc §R2) —
+            # this is the single choke point hot-cache LRU spill also goes
+            # through, independent of any in-flight save_block call.
+            self._stats["saves_refused_disk_pressure"] += 1
+            return False
 
         blk_meta = entry.get("block_metadata")
         if blk_meta is None:
@@ -2214,6 +2274,31 @@ class PagedSSDCacheManager(CacheManager):
             if root_fd is not None:
                 os.close(root_fd)
 
+    def _persist_main_block_lru_touch(
+        self, file_path: Path, previous_last_access: float
+    ) -> None:
+        """Throttled disk-mtime touch on a main-block SSD-tier hit (§A2).
+
+        Only the in-memory ``PagedSSDBlockMetadata.last_access`` was ever
+        updated on a hit; ``_read_file_metadata`` reseeds ``last_access``
+        from ``st_mtime`` at every restart, so a heavily-reused old prefix
+        looked exactly as stale as a written-yesterday-never-hit block —
+        and the shared three-index eviction walk compared main-block
+        *write* time against sidecar *access* time, systematically
+        evicting the main blocks whose loss forces a full re-prefill.
+        Callers pass the access time recorded *before* this hit so the
+        throttle measures how stale the persisted signal already was.
+        """
+        if (
+            time.time() - previous_last_access
+            < _MAIN_BLOCK_UTIME_THROTTLE_SECONDS
+        ):
+            return
+        try:
+            os.utime(file_path, None)
+        except OSError as e:
+            logger.debug("Failed to persist main-block LRU touch: %s", e)
+
     def _tracked_ssd_size(self) -> int:
         """Return all tracked main-KV and GDN-sidecar bytes.
 
@@ -2235,6 +2320,135 @@ class PagedSSDCacheManager(CacheManager):
             + self._gdn_sidecar_index.count
         )
 
+    def _reap_stale_tmp_staging_files(self) -> tuple[int, int]:
+        """Delete age-gated ``*_tmp.safetensors`` staging leftovers.
+
+        A live writer renames its temp file within seconds of creating it
+        (``_write_block_file``); anything older than
+        ``_TMP_STAGING_MIN_AGE_SECONDS`` is a crash remnant, not an
+        in-flight write from a concurrent manager on the same directory
+        (design doc §7 rule 2). Runs inside the single-writer scan window,
+        before these names would otherwise be skipped by the indexing glob.
+        """
+        if self._cache_dir is None:
+            return 0, 0
+        now = time.time()
+        candidates: list[Path] = []
+        for subdir in self.SUBDIR_CHARS:
+            subdir_path = self._cache_dir / subdir
+            if subdir_path.is_symlink() or not subdir_path.is_dir():
+                continue
+            candidates.extend(subdir_path.glob("*_tmp.safetensors"))
+        sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+        if sidecar_root.is_dir() and not sidecar_root.is_symlink():
+            for signature_dir in sidecar_root.iterdir():
+                if signature_dir.is_symlink() or not signature_dir.is_dir():
+                    continue
+                candidates.extend(signature_dir.glob("*_tmp.safetensors"))
+
+        count = 0
+        total_bytes = 0
+        for tmp_path in candidates:
+            if tmp_path.is_symlink():
+                continue
+            try:
+                st = tmp_path.stat()
+            except OSError:
+                continue
+            if now - st.st_mtime < _TMP_STAGING_MIN_AGE_SECONDS:
+                continue
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                logger.warning(
+                    "Failed to reap stale staging file %s: %s", tmp_path, exc
+                )
+                continue
+            count += 1
+            total_bytes += st.st_size
+        if count:
+            logger.info(
+                "Reaped %d stale staging file(s) (%s)",
+                count,
+                format_bytes(total_bytes),
+            )
+        return count, total_bytes
+
+    def _reap_corrupt_final_file(self, file_path: Path) -> int:
+        """Delete a final-name cache file whose metadata failed to parse.
+
+        Only called for names that survived the ``*_tmp.safetensors``
+        filter, so ``file_path`` was created by a completed, fsync'd atomic
+        rename (``_write_block_file``) — an unparseable file at that name is
+        corrupt, not in-flight, and safe to remove outright (design doc §7
+        rule 2 only age-gates the staging-name class; this is the
+        already-final class).
+        """
+        if file_path.is_symlink():
+            return 0
+        try:
+            size = file_path.stat().st_size
+            file_path.unlink()
+        except FileNotFoundError:
+            return 0
+        except OSError as exc:
+            logger.warning("Failed to reap corrupt cache file %s: %s", file_path, exc)
+            return 0
+        logger.info("Reaped corrupt cache file %s (%s)", file_path, format_bytes(size))
+        return size
+
+    def _reap_gdn_sidecar_digest_dirs(self) -> int:
+        """Remove malformed-name sidecar digest dirs and now-empty ones.
+
+        A digest dir is only ever created with a valid hex digest name
+        (``commit_gdn_checkpoint_file`` / ``_gdn_signature_digest``);
+        anything else at that level was never indexed by
+        ``_scan_existing_gdn_sidecars`` and is safe to remove outright. A
+        validly-named dir left empty (its sidecars were all evicted or
+        reaped) is inert clutter.
+        """
+        if self._cache_dir is None:
+            return 0
+        root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+        if root.is_symlink() or not root.is_dir():
+            return 0
+
+        removed = 0
+        for signature_dir in list(root.iterdir()):
+            if signature_dir.is_symlink() or not signature_dir.is_dir():
+                continue
+            digest = signature_dir.name
+            valid_name = len(digest) == self._GDN_SIGNATURE_DIGEST_LENGTH
+            if valid_name:
+                try:
+                    bytes.fromhex(digest)
+                except ValueError:
+                    valid_name = False
+            try:
+                is_empty = not any(signature_dir.iterdir())
+            except OSError:
+                continue
+            if valid_name and not is_empty:
+                continue
+            try:
+                if valid_name:
+                    signature_dir.rmdir()
+                else:
+                    shutil.rmtree(signature_dir)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to reap GDN sidecar digest dir %s: %s",
+                    signature_dir,
+                    exc,
+                )
+                continue
+            removed += 1
+        if removed:
+            logger.info("Reaped %d GDN sidecar digest dir(s)", removed)
+        return removed
+
     def _scan_existing_files(self) -> None:
         """Scan cache directory for existing files and build the compatible index.
 
@@ -2242,14 +2456,24 @@ class PagedSSDCacheManager(CacheManager):
         indexed. Incompatible blocks are left on disk so a shared SSD cache
         directory can safely serve multiple loaded models without one model's
         startup scan deleting another model's cache.
+
+        Runs inside the single-writer window (before the writer thread
+        starts), so this is also where the age-gated staging-file and
+        provably-corrupt/orphaned reconciliation sweep runs (design doc §7
+        R1) — sweeping here means multi-manager double-runs on a shared
+        directory are idempotent rather than racing a live writer.
         """
         logger.info(f"Scanning SSD cache directory: {self._cache_dir}")
+
+        self._reap_stale_tmp_staging_files()
 
         scanned = 0
         indexed = 0
         skipped_incompatible = 0
         skipped_incompatible_bytes = 0
         errors = 0
+        reaped_corrupt = 0
+        reaped_corrupt_bytes = 0
 
         for subdir in self.SUBDIR_CHARS:
             subdir_path = self._cache_dir / subdir
@@ -2257,10 +2481,19 @@ class PagedSSDCacheManager(CacheManager):
                 continue
 
             for file_path in subdir_path.glob("*.safetensors"):
+                if file_path.name.endswith("_tmp.safetensors"):
+                    # Staging leftovers are handled (age-gated) above, not
+                    # indexed here regardless of age.
+                    continue
                 scanned += 1
                 try:
                     metadata = self._read_file_metadata(file_path)
                     if metadata is None:
+                        if HAS_MLX:
+                            reaped = self._reap_corrupt_final_file(file_path)
+                            if reaped:
+                                reaped_corrupt += 1
+                                reaped_corrupt_bytes += reaped
                         continue
                     if not self._is_compatible_block(metadata):
                         skipped_incompatible += 1
@@ -2276,6 +2509,7 @@ class PagedSSDCacheManager(CacheManager):
         sidecars_indexed, sidecars_skipped, sidecars_bytes = (
             self._scan_existing_gdn_sidecars()
         )
+        reaped_digest_dirs = self._reap_gdn_sidecar_digest_dirs()
 
         self._index.sort_lru_by_last_access()
         self._incompatible_index.sort_lru_by_last_access()
@@ -2295,6 +2529,13 @@ class PagedSSDCacheManager(CacheManager):
             log_msg += f", skipped_gdn_sidecars={sidecars_skipped}"
         if sidecars_bytes > 0:
             log_msg += f", gdn_size={format_bytes(sidecars_bytes)}"
+        if reaped_corrupt > 0:
+            log_msg += (
+                f", reaped_corrupt={reaped_corrupt} files "
+                f"({format_bytes(reaped_corrupt_bytes)})"
+            )
+        if reaped_digest_dirs > 0:
+            log_msg += f", reaped_gdn_digest_dirs={reaped_digest_dirs}"
         logger.info(log_msg)
 
         # Startup can find a cache directory that already exceeds the shared
@@ -2310,6 +2551,13 @@ class PagedSSDCacheManager(CacheManager):
         rewrite it merely to rebuild the LRU index, so the signature digest and
         source hash are recovered from the namespace path and timestamps/sizes
         are recovered from ``stat``.
+
+        A file whose name doesn't parse as a hex source hash is corrupt or
+        foreign at a final path (sidecars have no in-directory `_tmp`
+        staging convention of their own — they're promoted directly via
+        ``os.replace`` from external staging), so it's reaped outright,
+        symlinks excepted (design doc §7 R1 step 2, "same treatment in the
+        sidecar... scans").
         """
         if self._cache_dir is None:
             return 0, 0, 0
@@ -2333,13 +2581,23 @@ class PagedSSDCacheManager(CacheManager):
                 skipped += 1
                 continue
             for file_path in signature_dir.glob("*.safetensors"):
+                if file_path.name.endswith("_tmp.safetensors"):
+                    continue
                 try:
                     source_hash = bytes.fromhex(file_path.stem)
-                    if (
-                        not source_hash
-                        or file_path.is_symlink()
-                        or not file_path.is_file()
-                    ):
+                    if not source_hash:
+                        raise ValueError("empty sidecar source hash")
+                except ValueError as e:
+                    skipped += 1
+                    logger.debug(
+                        "Skipping malformed GDN sidecar name %s: %s", file_path, e
+                    )
+                    if not file_path.is_symlink():
+                        with contextlib.suppress(OSError):
+                            file_path.unlink()
+                    continue
+                try:
+                    if file_path.is_symlink() or not file_path.is_file():
                         raise ValueError("invalid sidecar source hash or file")
                     stat_result = file_path.stat()
                     metadata = GDNCheckpointMetadata(
@@ -2374,6 +2632,13 @@ class PagedSSDCacheManager(CacheManager):
         """Atomically promote a request-local recurrent snapshot to SSD."""
         if self._hot_cache_only or self._cache_dir is None:
             return None
+        if self._disk_pressure_hard:
+            # Same refusal as save_block (design doc §R2): a sidecar
+            # commit is an optional cache write, never required for
+            # correctness — the caller's boundary-snapshot store keeps its
+            # own degrade-to-placeholder path for exactly this case.
+            self._stats["saves_refused_disk_pressure"] += 1
+            return None
         if not isinstance(source_block_hash, bytes) or not source_block_hash:
             return None
         staged_path = Path(staged_path)
@@ -2386,46 +2651,70 @@ class PagedSSDCacheManager(CacheManager):
 
         signature_digest = self._gdn_signature_digest(cache_signature)
         final_path = self._get_gdn_sidecar_path(source_block_hash, cache_signature)
-        with self._lock:
-            try:
-                sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
-                sidecar_root.mkdir(parents=True, exist_ok=True)
-                if (
-                    sidecar_root.is_symlink()
-                    or sidecar_root.resolve(strict=True).parent
-                    != self._cache_dir.resolve(strict=True)
-                ):
-                    logger.warning("Rejecting unsafe GDN sidecar root")
-                    return None
-                final_path.parent.mkdir(parents=True, exist_ok=True)
-                if (
-                    final_path.parent.is_symlink()
-                    or final_path.parent.resolve(strict=True).parent
-                    != sidecar_root.resolve(strict=True)
-                ):
-                    logger.warning("Rejecting unsafe GDN sidecar destination")
-                    return None
-                if staged_stat.st_dev != final_path.parent.stat().st_dev:
-                    logger.warning("Rejecting cross-filesystem GDN sidecar promotion")
-                    return None
+        try:
+            # Directory-safety checks and mkdir are pure filesystem
+            # introspection with no dependency on shared index/LRU state, so
+            # they run unlocked; mkdir(exist_ok=True) is safe under
+            # concurrent callers by construction.
+            sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+            sidecar_root.mkdir(parents=True, exist_ok=True)
+            if (
+                sidecar_root.is_symlink()
+                or sidecar_root.resolve(strict=True).parent
+                != self._cache_dir.resolve(strict=True)
+            ):
+                logger.warning("Rejecting unsafe GDN sidecar root")
+                return None
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            if (
+                final_path.parent.is_symlink()
+                or final_path.parent.resolve(strict=True).parent
+                != sidecar_root.resolve(strict=True)
+            ):
+                logger.warning("Rejecting unsafe GDN sidecar destination")
+                return None
+            if staged_stat.st_dev != final_path.parent.stat().st_dev:
+                logger.warning("Rejecting cross-filesystem GDN sidecar promotion")
+                return None
+
+            # From here, the index-removal window IS the concurrency guard:
+            # only the single store-cache worker thread ever calls this
+            # method (ThreadPoolExecutor max_workers=1, scheduler.py — "we
+            # never have two stores racing on the same paged_ssd index"), so
+            # commit-vs-commit races on the same key cannot happen. Holding
+            # self._lock only for the two index mutations below — not across
+            # os.replace/fsync/the inline eviction unlinks inside
+            # enforce_size_limit — matches enforce_size_limit's own stated
+            # policy (decide evictions under the lock, unlink outside it) and
+            # keeps the lock available to the inference thread's
+            # latency-sensitive GDN restore/lookup path
+            # (get_gdn_checkpoint_file_with_diagnostic, forget_gdn_checkpoint)
+            # during the slow disk I/O below. Removing `old` from the index
+            # here, before releasing the lock, is what makes the unlocked
+            # window safe: forget_gdn_checkpoint's own remove()+unlink()
+            # (also under self._lock) will see the key already absent and
+            # skip its unlink, so it can never race os.replace for the same
+            # path.
+            with self._lock:
                 old = self._gdn_sidecar_index.remove(
                     source_block_hash, signature_digest
                 )
-                try:
-                    # Temporarily remove the destination from LRU accounting so
-                    # size enforcement cannot evict/unlink the checkpoint being
-                    # replaced. Account for the full incoming file while the old
-                    # entry is protected; on promotion failure the old metadata
-                    # is restored below and its file remains intact.
-                    self._enforce_size_limit_for_new_block(staged_stat.st_size)
-                    os.replace(staged_path, final_path)
-                    _fsync_parent_dir(final_path)
-                    committed_at = time.time()
-                    # os.replace preserves the staging file's timestamps. Stamp
-                    # the actual commit/access time so a restart reconstructs LRU
-                    # order from a meaningful mtime rather than stale staging age.
-                    with contextlib.suppress(OSError):
-                        os.utime(final_path, (committed_at, committed_at))
+            try:
+                # Temporarily removed from LRU accounting above so size
+                # enforcement cannot evict/unlink the checkpoint being
+                # replaced. Account for the full incoming file while the old
+                # entry is protected; on promotion failure the old metadata
+                # is restored below and its file remains intact.
+                self._enforce_size_limit_for_new_block(staged_stat.st_size)
+                os.replace(staged_path, final_path)
+                _fsync_parent_dir(final_path)
+                committed_at = time.time()
+                # os.replace preserves the staging file's timestamps. Stamp
+                # the actual commit/access time so a restart reconstructs LRU
+                # order from a meaningful mtime rather than stale staging age.
+                with contextlib.suppress(OSError):
+                    os.utime(final_path, (committed_at, committed_at))
+                with self._lock:
                     self._gdn_sidecar_index.add(
                         GDNCheckpointMetadata(
                             source_block_hash=source_block_hash,
@@ -2439,16 +2728,17 @@ class PagedSSDCacheManager(CacheManager):
                             last_access=committed_at,
                         )
                     )
-                    return final_path
-                except OSError:
-                    if old is not None and self._is_safe_gdn_sidecar_file(
-                        old.file_path
-                    ):
+                return final_path
+            except OSError:
+                if old is not None and self._is_safe_gdn_sidecar_file(
+                    old.file_path
+                ):
+                    with self._lock:
                         self._gdn_sidecar_index.add(old)
-                    raise
-            except OSError as exc:
-                logger.warning("Failed to commit GDN sidecar: %s", exc)
-                return None
+                raise
+        except OSError as exc:
+            logger.warning("Failed to commit GDN sidecar: %s", exc)
+            return None
 
     def get_gdn_checkpoint_file(
         self, source_block_hash: bytes, cache_signature: str
@@ -2511,6 +2801,7 @@ class PagedSSDCacheManager(CacheManager):
             if used_legacy_fp32_fallback:
                 self._gdn_legacy_fp32_fallbacks += 1
 
+            self._stats["gdn_sidecar_restore_hits"] += 1
             self._gdn_sidecar_index.touch(source_block_hash, signature_digest)
             try:
                 # Persist the LRU touch across manager restarts without
@@ -2687,7 +2978,23 @@ class PagedSSDCacheManager(CacheManager):
         if not self._signature_bits_match(metadata.cache_signature):
             return False
 
+        if not self._signature_ane_match(metadata.cache_signature):
+            return False
+
         return True
+
+    def _signature_ane_match(self, cache_signature: str) -> bool:
+        """True when a block's ANE-prefill provenance matches expectations.
+
+        Strict both ways: an ANE-off session must never replay
+        ANE-computed blocks (the poisoning vector this check exists for),
+        and an ANE-on session must not adopt GPU-computed blocks as its
+        own numeric lineage. Legacy blocks carry no stamp and count as
+        GPU-computed.
+        """
+        return _signature_ane_prefill(cache_signature) == bool(
+            self._expected_ane_prefill
+        )
 
     def _signature_bits_match(self, cache_signature: str) -> bool:
         """True when a block's recorded TurboQuant depth satisfies expectations.
@@ -2735,6 +3042,13 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 "TurboQuant depth: expected "
                 f"{self._expected_turboquant_kv_bits}, got {actual}"
+            )
+        if not self._signature_ane_match(cache_signature):
+            return (
+                "ANE prefill provenance: expected "
+                f"{'ANE' if self._expected_ane_prefill else 'GPU'}-computed, "
+                f"got {'ANE' if _signature_ane_prefill(cache_signature) else 'GPU'}"
+                "-computed"
             )
 
         expected_subtypes = self._expected_cachelist_subtypes
@@ -2802,6 +3116,7 @@ class PagedSSDCacheManager(CacheManager):
             turboquant_kv_bits=turboquant_kv_bits,
             cachelist_subtypes=cachelist_subtypes,
             payload_layout=self._payload_layout,
+            ane_prefill=self._expected_ane_prefill or None,
         )
 
     def gdn_cache_signature_for(
@@ -3228,6 +3543,14 @@ class PagedSSDCacheManager(CacheManager):
                 return True
             return False
 
+        if self._disk_pressure_hard:
+            # A cache write is always optional (design doc §R2) — refuse
+            # rather than risk pushing an already-critical disk over the
+            # edge. The block is simply recomputed/re-saved once pressure
+            # eases; admission (serving the request) is untouched.
+            self._stats["saves_refused_disk_pressure"] += 1
+            return False
+
         file_path = self._get_file_path(block_hash)
 
         try:
@@ -3416,6 +3739,14 @@ class PagedSSDCacheManager(CacheManager):
             # derived arrays before memoryview() so the buffer protocol never
             # becomes the first MLX eval site on the store-cache worker thread.
             # Race history: #978/#1040/#1106/#1437/#1558.
+            #
+            # Batch-eval all arrays in one command-buffer submission (mirrors
+            # boundary_snapshot_store's pattern) instead of letting each
+            # _extract_tensor_bytes call trigger its own separate eval —
+            # measured 19ms/48-layer state one-by-one; per-array mx.eval calls
+            # below become no-op re-checks once the arrays are materialized.
+            if arrays:
+                mx.eval(*arrays.values())
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)
@@ -3868,9 +4199,12 @@ class PagedSSDCacheManager(CacheManager):
                 return None
 
             # Update access time
+            previous_last_access = metadata.last_access
             self._index.touch(block_hash)
+            self._persist_main_block_lru_touch(file_path, previous_last_access)
             self._stats["loads"] += 1
             self._stats["hits"] += 1
+            self._stats["main_block_ssd_hits"] += 1
 
             # Promote to hot cache for faster access next time
             if self._hot_cache_enabled:
@@ -4069,9 +4403,12 @@ class PagedSSDCacheManager(CacheManager):
                         pass
 
             # Update access time
+            previous_last_access = block_metadata.last_access
             self._index.touch(block_hash)
+            self._persist_main_block_lru_touch(file_path, previous_last_access)
             self._stats["loads"] += 1
             self._stats["hits"] += 1
+            self._stats["main_block_ssd_hits"] += 1
 
             # Promote to hot cache for faster access next time
             if self._hot_cache_enabled and promote_to_hot_cache:
@@ -4275,6 +4612,7 @@ class PagedSSDCacheManager(CacheManager):
         *,
         turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
+        ane_prefill: bool = False,
     ) -> bool:
         """Set the live layer-cache signature, replacing stale expectations.
 
@@ -4299,6 +4637,8 @@ class PagedSSDCacheManager(CacheManager):
             float(turboquant_kv_bits) if turboquant_kv_bits is not None else None
         )
 
+        new_ane = bool(ane_prefill)
+
         with self._lock:
             old_signature = self._expected_layer_cache_types
             old_canonical = _canonicalize_layer_cache_types(old_signature)
@@ -4306,10 +4646,12 @@ class PagedSSDCacheManager(CacheManager):
             subtypes_changed = (
                 cachelist_subtypes != self._expected_cachelist_subtypes
             )
+            ane_changed = new_ane != self._expected_ane_prefill
             if (
                 old_canonical == new_canonical
                 and not bits_changed
                 and not subtypes_changed
+                and not ane_changed
             ):
                 if old_signature != new_signature:
                     self._expected_layer_cache_types = new_signature
@@ -4318,16 +4660,18 @@ class PagedSSDCacheManager(CacheManager):
             self._expected_layer_cache_types = new_signature
             self._expected_turboquant_kv_bits = new_bits
             self._expected_cachelist_subtypes = cachelist_subtypes
+            self._expected_ane_prefill = new_ane
             self._signature_sweep_completed = False
 
         logger.info(
             "PagedSSDCacheManager updated layer cache signature "
             "(%d layers, %d unique types, turboquant_kv_bits=%s, "
-            "cachelist_subtypes=%s)",
+            "cachelist_subtypes=%s, ane_prefill=%s)",
             len(new_signature),
             len(set(new_canonical or ())),
             new_bits,
             "yes" if cachelist_subtypes else "no",
+            "yes" if new_ane else "no",
         )
         return True
 
@@ -4389,6 +4733,9 @@ class PagedSSDCacheManager(CacheManager):
                     stale.append(h)
                     continue
                 if not self._signature_bits_match(meta.cache_signature):
+                    stale.append(h)
+                    continue
+                if not self._signature_ane_match(meta.cache_signature):
                     stale.append(h)
                     continue
                 if self._expected_cachelist_subtypes is not None and (
@@ -4625,9 +4972,83 @@ class PagedSSDCacheManager(CacheManager):
                     f"above target for subsequent saves to drain"
                 )
 
-    def enforce_size_limit(self) -> int:
+    _RECONCILE_BATCH_SIZE = 32
+
+    def reconcile_tracked_sizes(self, batch_size: int = _RECONCILE_BATCH_SIZE) -> int:
+        """Stat-validate a bounded batch of LRU-tail entries, pruning dead ones.
+
+        Design doc §A5: several ``PagedSSDCacheManager`` instances can own
+        one shared cache directory (one per loaded model, plus a
+        draft-model manager under SpecPrefill/DFlash). When manager A
+        evicts and unlinks a file manager B still has indexed, B's
+        ``total_size`` keeps counting it and ``has_block`` still reports
+        True until B happens to touch the entry — this is the periodic
+        decay the disk-pressure guard tick drives so drift doesn't
+        accumulate indefinitely between natural touches. Read-only stat
+        plus in-memory index mutation only; never unlinks a file (there is
+        nothing to unlink — a dead entry is dead precisely because the
+        file is already gone).
+        """
+        if self._cache_dir is None:
+            return 0
+
+        pruned = 0
+        with self._lock:
+            candidates: list[tuple[Any, Any]] = []
+            for source_index in (
+                self._index,
+                self._incompatible_index,
+                self._gdn_sidecar_index,
+            ):
+                for metadata in source_index.get_lru_entries(batch_size):
+                    candidates.append((source_index, metadata))
+
+            for source_index, metadata in candidates:
+                try:
+                    alive = metadata.file_path.is_file()
+                except OSError:
+                    alive = False
+                if alive:
+                    continue
+                if source_index is self._gdn_sidecar_index:
+                    source_index.remove_key(metadata.key)
+                else:
+                    source_index.remove(metadata.block_hash)
+                pruned += 1
+
+        if pruned:
+            logger.info(
+                "Disk pressure guard reconcile: pruned %d dead index entr%s",
+                pruned,
+                "y" if pruned == 1 else "ies",
+            )
+        return pruned
+
+    def set_disk_pressure_hard(self, active: bool) -> None:
+        """Toggle the hard-floor write-refusal switch (design doc §R2).
+
+        Set by the external disk-pressure guard tick, not by this manager —
+        the guard is the cross-consumer, idle-time actor; this class only
+        owns the mechanism. Admission (serving requests) is deliberately
+        untouched; only optional cache writes are refused.
+        """
+        self._disk_pressure_hard = bool(active)
+
+    def enforce_size_limit(
+        self, *, trigger_fraction: float = 1.0, target_fraction: float = 0.9
+    ) -> int:
         """
         Enforce SSD cache size limit by evicting LRU files.
+
+        Args:
+            trigger_fraction: Fraction of the effective max size at which
+                eviction triggers. 1.0 (default) preserves the historical
+                behavior of only reacting once the full cap is exceeded.
+                The disk-pressure guard tick passes a smaller value under
+                soft pressure so the cache sheds gradually before the save-
+                time clamp would otherwise force a cliff eviction burst.
+            target_fraction: Fraction of the effective max size to shave
+                down to once triggered.
 
         Returns:
             Number of bytes freed.
@@ -4641,11 +5062,12 @@ class PagedSSDCacheManager(CacheManager):
         with self._lock:
             initial_size = self._tracked_ssd_size()
             effective_max = self._get_effective_max_size()
+            trigger_size = int(effective_max * trigger_fraction)
 
-            if initial_size <= effective_max:
+            if initial_size <= trigger_size:
                 return 0
 
-            target_size = int(effective_max * 0.9)  # 90% of effective max
+            target_size = int(effective_max * target_fraction)
             evicted = self._evict_tracked_until_size(target_size)
 
         # Do NOT remove from hot cache — see _enforce_size_limit_for_new_block
@@ -4979,6 +5401,13 @@ class PagedSSDCacheManager(CacheManager):
                 ),
                 "gdn_sidecar_count": self._gdn_sidecar_index.count,
                 "gdn_sidecar_size_bytes": self._gdn_sidecar_index.total_size,
+                # Per-tier breakdown (design doc §0.1): turns the doc's
+                # one-off du/stat table into a trackable series.
+                "compatible_block_count": self._index.count,
+                "compatible_block_size_bytes": self._index.total_size,
+                "incompatible_block_count": self._incompatible_index.count,
+                "incompatible_block_size_bytes": self._incompatible_index.total_size,
+                "disk_pressure_hard": self._disk_pressure_hard,
                 **self._stats,
             }
 

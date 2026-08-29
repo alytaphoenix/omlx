@@ -328,6 +328,54 @@ def test_batch_tq_dequantize():
     assert dv.shape[2] == 9
 
 
+@pytest.mark.parametrize("bits", [1.0, 4.0, 8.0])
+def test_batch_tq_finalize_matches_dequantized_roll_exactly(bits):
+    """finalize() rolls the quantized state directly (§F3/4.5) instead of
+    dequantize -> dynamic_roll -> requantize. dequantize is a pure per-token
+    unpack (bit-unpack + fixed codebook lookup + fixed rotation, no
+    cross-token state), so it must commute exactly with the token-axis
+    reindex: dequantize(finalize(state)) == dynamic_roll(dequantize(state)).
+    The old requantize-on-the-way-back-in step had no reason to be exact;
+    this asserts the new path is.
+    """
+    from mlx_lm.models.cache import dynamic_roll
+
+    batch = BatchTurboQuantKVCache([0, 0], bits=bits)
+    keys = mx.random.normal((2, 2, 8, 32))
+    values = mx.random.normal((2, 2, 8, 32))
+    batch.update_and_fetch(keys, values)
+
+    ref_k, ref_v = batch.dequantize()
+
+    right_padding = [3, 5]
+    batch.prepare(right_padding=right_padding)
+    batch.finalize()
+
+    rolled_k, rolled_v = batch.dequantize()
+    shift = mx.array(right_padding)
+    expected_k = dynamic_roll(ref_k, shift[:, None], axis=2)
+    expected_v = dynamic_roll(ref_v, shift[:, None], axis=2)
+
+    assert mx.array_equal(rolled_k, expected_k).item()
+    assert mx.array_equal(rolled_v, expected_v).item()
+    assert batch.offset[0].item() == 8 - right_padding[0]
+    assert batch.offset[1].item() == 8 - right_padding[1]
+    assert batch.left_padding[0].item() == right_padding[0]
+    assert batch.left_padding[1].item() == right_padding[1]
+
+
+def test_batch_tq_finalize_no_right_padding_is_noop():
+    batch = BatchTurboQuantKVCache([0], bits=4.0)
+    batch.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32))
+    )
+    before_k, before_v = batch.dequantize()
+    batch.finalize()  # _right_padding is None -> must be a no-op
+    after_k, after_v = batch.dequantize()
+    assert mx.array_equal(before_k, after_k).item()
+    assert mx.array_equal(before_v, after_v).item()
+
+
 def test_batch_tq_state_property():
     batch = BatchTurboQuantKVCache([2, 0], bits=4.0)
     s = batch.state
@@ -507,9 +555,11 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
         raise RuntimeError("forced quantized prefill failure")
 
     original_dequantize = TurboQuantKVCache.dequantize
+    dequant_kwargs = {}
 
     def spy_dequantize(self, *args, **kwargs):
         calls["dequantize"] += 1
+        dequant_kwargs.update(kwargs)
         return original_dequantize(self, *args, **kwargs)
 
     monkeypatch.setattr(
@@ -527,6 +577,10 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
 
     assert out.shape == queries.shape
     assert calls == {"quantized": 1, "dequantize": 1}
+    # F4: must pass the request's own views, not dequantize the ENTIRE
+    # resident cache (the default when keys_state/values_state are omitted)
+    # -- see docs/qwen35-hardening-and-optimization.md F4.
+    assert dequant_kwargs == {"keys_state": ks, "values_state": vs}
 
 
 @pytest.mark.parametrize("q_len", [2, 4, 9])
