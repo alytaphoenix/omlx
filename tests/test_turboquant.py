@@ -526,11 +526,114 @@ def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypat
     )
 
     assert out.shape == queries.shape
-    assert prefill_calls == [(ks, vs)]
+    # Above the long-prefill threshold the tiled route runs FIRST:
+    # prefill_attention materializes untiled O(L*T) score slabs and must
+    # not be attempted before it (it ACCEPTS array masks, so "try it and
+    # fall through on None" only worked for str masks).
+    assert prefill_calls == []
     assert len(calls) == 1
     assert calls[0][0] is ks
     assert calls[0][1] is vs
     assert calls[0][2] == 256
+
+
+def test_attention_patch_long_array_mask_prefill_never_hits_slab_path(monkeypatch):
+    """The O(L*T) hazard test: prefill_attention accepts BOOLEAN array masks
+    (e.g. Qwen4-Exp QSA's block-sparse selection) and materializes untiled
+    fp32 score slabs, so above the long-prefill threshold it must never be
+    reached — the tiled quantized_attention (which slices masks per key
+    chunk via _apply_attention_mask) handles the call."""
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4)
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)),
+        mx.random.normal((1, 2, 8, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    prefill_calls = []
+    quantized_calls = []
+
+    def fake_prefill_attention(self, *args, **kwargs):
+        prefill_calls.append(kwargs)
+        return None
+
+    def fake_quantized_attention(
+        self, queries, keys_state=None, values_state=None, scale=1.0, mask=None
+    ):
+        quantized_calls.append(mask)
+        return mx.zeros_like(queries)
+
+    monkeypatch.setattr(
+        TurboQuantKVCache, "prefill_attention", fake_prefill_attention
+    )
+    monkeypatch.setattr(
+        TurboQuantKVCache, "quantized_attention", fake_quantized_attention
+    )
+
+    queries = mx.random.normal((1, 4, 2, 32))
+    bool_mask = mx.ones((1, 1, 2, 8), dtype=mx.bool_)
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=32**-0.5, mask=bool_mask
+    )
+
+    assert out.shape == queries.shape
+    assert prefill_calls == []
+    assert len(quantized_calls) == 1
+    assert quantized_calls[0] is bool_mask
+
+
+def test_attention_patch_short_prefill_keeps_prefill_attention_first(monkeypatch):
+    """Below the long-prefill threshold the single-dispatch fast path is
+    unchanged: prefill_attention first, no tiled attempt."""
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4096)
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)),
+        mx.random.normal((1, 2, 8, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    prefill_calls = []
+    quantized_calls = []
+
+    def fake_prefill_attention(
+        self, queries, keys_state=None, values_state=None, scale=1.0, mask=None
+    ):
+        prefill_calls.append(mask)
+        return mx.zeros_like(queries)
+
+    def fake_quantized_attention(self, *args, **kwargs):
+        quantized_calls.append(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        TurboQuantKVCache, "prefill_attention", fake_prefill_attention
+    )
+    monkeypatch.setattr(
+        TurboQuantKVCache, "quantized_attention", fake_quantized_attention
+    )
+
+    queries = mx.random.normal((1, 4, 2, 32))
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=32**-0.5, mask=None
+    )
+
+    assert out.shape == queries.shape
+    assert len(prefill_calls) == 1
+    assert quantized_calls == []
 
 
 def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
@@ -548,11 +651,15 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
     )
     tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
     ks, vs = tq.state
-    calls = {"quantized": 0, "dequantize": 0}
+    calls = {"quantized": 0, "prefill": 0, "dequantize": 0}
 
     def failing_quantized_attention(self, *args, **kwargs):
         calls["quantized"] += 1
         raise RuntimeError("forced quantized prefill failure")
+
+    def none_prefill_attention(self, *args, **kwargs):
+        calls["prefill"] += 1
+        return None
 
     original_dequantize = TurboQuantKVCache.dequantize
     dequant_kwargs = {}
@@ -567,6 +674,11 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
         "quantized_attention",
         failing_quantized_attention,
     )
+    monkeypatch.setattr(
+        TurboQuantKVCache,
+        "prefill_attention",
+        none_prefill_attention,
+    )
     monkeypatch.setattr(TurboQuantKVCache, "dequantize", spy_dequantize)
 
     queries = mx.random.normal((1, 4, 2, 32))
@@ -576,7 +688,8 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
     mx.eval(out)
 
     assert out.shape == queries.shape
-    assert calls == {"quantized": 1, "dequantize": 1}
+    # Tiled-first failed -> prefill_attention gets its chance -> dequantize.
+    assert calls == {"quantized": 1, "prefill": 1, "dequantize": 1}
     # F4: must pass the request's own views, not dequantize the ENTIRE
     # resident cache (the default when keys_state/values_state are omitted)
     # -- see docs/qwen35-hardening-and-optimization.md F4.

@@ -189,7 +189,11 @@ def _parse_qsplit_env() -> bool:
 
 
 def _route_decision(
-    queries, keys, cache=None, q_sub_ceiling: int | None = None
+    queries,
+    keys,
+    cache=None,
+    q_sub_ceiling: int | None = None,
+    allow_qsplit: bool = True,
 ) -> tuple[str, int]:
     """Decide unfused / q-split / tiled for a shape-matched prefill call.
 
@@ -263,7 +267,7 @@ def _route_decision(
                 f"~{headroom / 2**20:.0f}MiB headroom at kv_len={kv_len}",
             )
             return _ROUTE_UNFUSED, 0
-        if _QSPLIT_ENABLED:
+        if _QSPLIT_ENABLED and allow_qsplit:
             q_sub = _max_q_sub_for_headroom(
                 n_q_heads, kv_len, HEAD_DIM, dtype_size, headroom
             )
@@ -294,17 +298,55 @@ def _route_decision(
         return _ROUTE_TILED, 0  # headroom info unavailable -> memory-safe default
 
 
+def _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len):
+    """Reshape a boolean attention mask so it broadcasts against the tiled
+    kernel's 5-D ``[batch, n_kv, group, q, k]`` layout.
+
+    Accepts the shapes model code actually emits: ``[B, 1, L, T]`` (QSA's
+    per-layer sparse mask, and most create_causal_mask outputs), a full
+    per-head ``[B, n_q, L, T]``, ``[B, L, T]``, or a bare ``[L, T]``. The
+    trailing two axes must already match the CALL's (q_len, k_len) —
+    Qwen3_5Attention narrows the mask to kv_seq_len before SDPA.
+    """
+    if mask.ndim == 4:
+        if mask.shape[1] == 1:
+            return mask[:, :, None]  # [B, 1, 1, L, T]
+        # Per-head mask: fold heads into (n_kv, group).
+        return mask.reshape(batch, n_kv, group_size, q_len, k_len)
+    if mask.ndim == 3:
+        return mask[:, None, None]
+    if mask.ndim == 2:
+        return mask[None, None, None]
+    raise ValueError(f"unsupported attention mask ndim: {mask.ndim}")
+
+
 def _flash_sdpa256(queries, keys, values, scale, mask):
     """Flash-style online-softmax attention for head_dim=256 prefill.
 
     queries: [batch, n_q, q_len, head_dim]
     keys/values: [batch, n_kv, k_len, head_dim]   (n_q % n_kv == 0)
-    mask: "causal" or None. Returns [batch, n_q, q_len, head_dim] in
+    mask: "causal", None, or a BOOLEAN mx.array (e.g. Qwen4-Exp QSA's
+    block-sparse selection mask). Returns [batch, n_q, q_len, head_dim] in
     queries.dtype.
 
     Tiles over Q and KV, keeping a running (max m, sum denom, accumulator acc) per
     query row so the [q x full_kv] score matrix is never materialized. fp32
     accumulators; output cast back to the input dtype. GQA via reshape+broadcast.
+
+    Boolean masks are sliced per (q, kv) tile and applied with the same
+    finite ``_NEG_INF`` sentinel the causal branch uses. A query row whose
+    LEADING tiles are fully masked transiently accumulates uniform exp(0)
+    weight, but the first tile containing a real score raises the running
+    max from ``_NEG_INF`` so ``corr = exp(_NEG_INF - real) == 0.0`` wipes
+    the accumulators exactly — the online softmax self-corrects, and QSA
+    guarantees every row at least one visible key (its tail term always
+    includes the query's own position). A row masked EVERYWHERE degrades to
+    uniform weights over the row — the same degenerate output the stock
+    unfused fallback produces for such rows (softmax over equal finfo-min
+    scores), with no NaN in either path. For array masks the causal
+    early-exit on the KV loop is skipped: an arbitrary bool mask may permit
+    keys past the causal diagonal, and with a cached prefix the truncation
+    saves almost nothing anyway.
 
     MLX is lazy: without forcing materialization the whole tiled graph would stay
     live until eval (peak dominated by graph buildup, not the O(L) working set),
@@ -314,7 +356,12 @@ def _flash_sdpa256(queries, keys, values, scale, mask):
     batch, n_q, q_len, head_dim = queries.shape
     _, n_kv, k_len, _ = keys.shape
     group_size = n_q // n_kv
-    causal = mask == "causal"
+    causal = isinstance(mask, str) and mask == "causal"
+    bool_mask = None
+    if isinstance(mask, mx.array):
+        if mask.dtype != mx.bool_:
+            raise ValueError("_flash_sdpa256 only supports boolean array masks")
+        bool_mask = _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len)
 
     qr = queries.reshape(batch, n_kv, group_size, q_len, head_dim)
     kr = keys.reshape(batch, n_kv, 1, k_len, head_dim)
@@ -347,6 +394,8 @@ def _flash_sdpa256(queries, keys, values, scale, mask):
             if causal:
                 k_pos = mx.arange(kj0, kj1).reshape(1, 1, 1, 1, kt)
                 s = mx.where(k_pos > q_pos, _NEG_INF, s)
+            elif bool_mask is not None:
+                s = mx.where(bool_mask[..., qi0:qi1, kj0:kj1], s, _NEG_INF)
 
             m_tile = mx.max(s, axis=-1, keepdims=True)
             m_new = mx.maximum(m, m_tile)
@@ -397,7 +446,8 @@ def _unfused_qsplit_sdpa(
     memory trip it was sized to avoid).
     """
     q_len = queries.shape[-2]
-    causal = mask == "causal"
+    causal = isinstance(mask, str) and mask == "causal"
+    is_array_mask = isinstance(mask, mx.array)
     kv_off = keys.shape[-2] - q_len if causal else 0
     out_tiles = []
     for qi0 in range(0, q_len, q_sub):
@@ -406,9 +456,20 @@ def _unfused_qsplit_sdpa(
         if causal:
             k_slice = keys[..., : kv_off + qi1, :]
             v_slice = values[..., : kv_off + qi1, :]
+            sub_mask = mask
         else:
+            # Array masks (e.g. QSA's boolean selection) carry their own
+            # per-position visibility, so the causal keys-narrowing trick
+            # (which relies on MLX's right-aligned "causal" semantics) does
+            # not apply: keep keys/values full-width and slice the mask's
+            # query rows to this sub-tile. Transient per sub-call is
+            # n_q x q_sub x kv_len — the same width _max_q_sub_for_headroom
+            # sized q_sub against.
             k_slice, v_slice = keys, values
-        out_tile = original_sdpa(q_slice, k_slice, v_slice, cache, scale, mask, sinks)
+            sub_mask = mask[..., qi0:qi1, :] if is_array_mask else mask
+        out_tile = original_sdpa(
+            q_slice, k_slice, v_slice, cache, scale, sub_mask, sinks
+        )
         mx.eval(out_tile)
         out_tiles.append(out_tile)
     return mx.concatenate(out_tiles, axis=-2)
@@ -434,7 +495,21 @@ def _should_route(queries, keys, cache, mask, sinks) -> tuple[str, int]:
         # hasattr(cache, "bits"); let the quant-aware path handle it.
         if cache is not None and hasattr(cache, "bits"):
             return _ROUTE_UNFUSED, 0
-        if not (mask is None or (isinstance(mask, str) and mask == "causal")):
+        # Boolean array masks are routable: Qwen4-Exp QSA replaces the
+        # "causal" string with a [B, 1, L, T] block-sparse bool mask on
+        # every long-context prefill, which previously forced the stock
+        # unfused O(L*T) fallback here — the head_dim-256 memory wall this
+        # patch exists to fix, resurfacing through the mask gate. The
+        # q-split route row-slices such masks; the tiled route applies them
+        # per (q, kv) tile. Additive float masks stay unroutable (nothing
+        # on the hd-256 prefill path emits them; keeping them out narrows
+        # the blast radius of this process-wide wrapper).
+        mask_is_bool = isinstance(mask, mx.array) and mask.dtype == mx.bool_
+        if not (
+            mask is None
+            or (isinstance(mask, str) and mask == "causal")
+            or mask_is_bool
+        ):
             return _ROUTE_UNFUSED, 0
         n_q = queries.shape[-3]
         n_kv = keys.shape[-3]
@@ -458,7 +533,23 @@ def _should_route(queries, keys, cache, mask, sinks) -> tuple[str, int]:
         # pressure that forced tiled doesn't spontaneously relax within a
         # request, and the cache (hence the latch) dies with the request.
         ceiling = getattr(cache, "_sdpa256_q_sub_ceiling", None)
-        route, q_sub = _route_decision(queries, keys, cache, q_sub_ceiling=ceiling)
+        # Bool-array masks (QSA) must never take q-split: unlike the causal
+        # route, array-mask sub-calls cannot narrow keys/values to a causal
+        # end, so each sub-call still materializes an n_q x q_sub x kv_len
+        # slab — and the hysteresis ratchet walks q_sub DOWN between calls,
+        # so every layer/call produces a DIFFERENT slab size the Metal pool
+        # cannot reuse. Measured live (Qwen3.8-Flash 40k probe): +7.3GB pool
+        # growth by kv_len=14336 and a pre-chunk guard rejection at 14k —
+        # worse than the unfused O(L*T) wall it replaced. Unfused (single
+        # reusable slab) when it fits, else straight to tiled (uniform
+        # O(tile) buffers), nothing in between.
+        route, q_sub = _route_decision(
+            queries,
+            keys,
+            cache,
+            q_sub_ceiling=ceiling,
+            allow_qsplit=not mask_is_bool,
+        )
         if cache is not None:
             try:
                 if route == _ROUTE_TILED:

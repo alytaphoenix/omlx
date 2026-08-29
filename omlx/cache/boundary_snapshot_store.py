@@ -50,6 +50,10 @@ logger = logging.getLogger(__name__)
 _MAX_PENDING_WRITES = 128
 _DEFAULT_PENDING_MAX_BYTES = 512 * 1024 * 1024
 _PENDING_RESERVATION_TIMEOUT_S = 2.0
+# A single boundary snapshot above this is almost certainly carrying a
+# sliceable layer's full KV prefix (recurrent-only state is ~100-200MB) —
+# see the oversized-snapshot warning in save().
+_OVERSIZED_SNAPSHOT_WARN_BYTES = 256 * 1024 * 1024
 _GDN_SIDECAR_FORMAT_VERSION = "2"
 _GDN_STATE_DTYPES = frozenset(
     {"fp32", "bf16", "int8", "rht_int8", "rht_int16"}
@@ -233,6 +237,8 @@ class BoundarySnapshotSSDStore:
         self._pending_bytes = 0
         self._pending_peak_bytes = 0
         self._backpressure_ms = 0.0
+        # Requests already warned about oversized snapshots (once per request).
+        self._oversized_warned_requests: set[str] = set()
 
         # Set by the external disk-pressure guard tick (design doc §R2).
         # A boundary snapshot is only ever needed for a mid-chain restart;
@@ -349,6 +355,29 @@ class BoundarySnapshotSSDStore:
             del extracted
 
             raw_size = sum(len(raw) for raw, _dtype, _shape in tensors_raw.values())
+
+            # Regression guard for the next unregistered sliceable cache
+            # class: recurrent boundary state (GDN etc.) is ~100-200MB per
+            # snapshot; a snapshot far above that almost certainly carries a
+            # sliceable layer's full KV prefix that the capture site failed
+            # to blank (Qwen4-Exp QSAKVCache shipped exactly this — ~1.1GB
+            # snapshots at 40k tokens, quadratic across a request, #2551
+            # class of bug). Warn once per request so the log names the
+            # problem before the memory guard does.
+            if raw_size > _OVERSIZED_SNAPSHOT_WARN_BYTES:
+                if request_id not in self._oversized_warned_requests:
+                    self._oversized_warned_requests.add(request_id)
+                    logger.warning(
+                        "Boundary snapshot for %s at %d tokens is unexpectedly "
+                        "large (%.0fMB > %.0fMB): a sliceable cache class may "
+                        "be missing from the boundary-snapshot skip set "
+                        "(scheduler._KNOWN_SLICEABLE_CACHE_TYPES), making "
+                        "snapshot cost quadratic in context length.",
+                        request_id,
+                        token_count,
+                        raw_size / 1024**2,
+                        _OVERSIZED_SNAPSHOT_WARN_BYTES / 1024**2,
+                    )
 
             # 3. Reserve a byte-bounded pending slot.  A single checkpoint is
             # allowed to exceed the configured cap when the queue is empty;
@@ -735,6 +764,7 @@ class BoundarySnapshotSSDStore:
         # Remove from registry.
         with self._registry_lock:
             self._file_registry.pop(request_id, None)
+        self._oversized_warned_requests.discard(request_id)
 
         # Wait briefly for the writer to finish any item it had already
         # pulled. If it's genuinely stuck (slow disk, dead thread) fall
