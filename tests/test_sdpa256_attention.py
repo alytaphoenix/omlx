@@ -159,6 +159,231 @@ def test_qsplit_no_mask_matches_reference():
     assert _max_abs(out, ref) < 2e-2
 
 
+# --- boolean array masks (Qwen4-Exp QSA block-sparse selection) ----------
+#
+# QSA replaces the "causal" string with a [B, 1, L, T] bool mask on every
+# long-context prefill; the routes must apply it exactly (tiled: per
+# (q, kv) tile; qsplit: row-sliced with full-width keys). Reference is a
+# dense fp32 pass using the same finite _NEG_INF sentinel convention. FA256
+# precedent tolerances: <=5e-3 vs the dense fp32 reference, NaN assertion
+# on every output.
+
+
+def _dense_ref_bool(q, k, v, scale, mask):
+    """Dense fp32 masked attention reference (finite -1e30 sentinel)."""
+    from omlx.patches.sdpa256_attention import _NEG_INF
+
+    B, n_q, L, D = q.shape
+    n_kv, T = k.shape[1], k.shape[2]
+    g = n_q // n_kv
+    qf = q.astype(mx.float32).reshape(B, n_kv, g, L, D)
+    kf = k.astype(mx.float32).reshape(B, n_kv, 1, T, D)
+    vf = v.astype(mx.float32).reshape(B, n_kv, 1, T, D)
+    s = (qf @ mx.swapaxes(kf, -1, -2)) * scale
+    m5 = mask[:, :, None] if mask.ndim == 4 else mask
+    s = mx.where(m5, s, _NEG_INF)
+    w = mx.softmax(s, axis=-1)
+    out = w @ vf
+    return out.reshape(B, n_q, L, D).astype(q.dtype)
+
+
+def _qsa_like_mask(q_len, k_len, block=64, topk=8, seed=7):
+    """Causal-subset block-sparse mask shaped like QSA's output: for each
+    query row, a random top-k of complete causal blocks plus the causal
+    tail (which always includes the query's own position — QSA's >=1
+    visible key guarantee)."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    offset = k_len - q_len
+    m = np.zeros((q_len, k_len), dtype=bool)
+    for i in range(q_len):
+        gpos = offset + i
+        n_complete = (gpos + 1) // block
+        if n_complete > 0:
+            winners = rng.choice(n_complete, size=min(topk, n_complete), replace=False)
+            for b in winners:
+                m[i, b * block : (b + 1) * block] = True
+        # causal tail: incomplete trailing block through self
+        m[i, n_complete * block : gpos + 1] = True
+    return mx.array(m)[None, None]  # [1, 1, L, T]
+
+
+def test_flash_sdpa256_bool_mask_matches_dense_reference():
+    from omlx.patches.sdpa256_attention import _flash_sdpa256
+
+    q_len, k_len = 256, 8448  # chunked prefill over a long cached prefix
+    q, _, _ = _qkv(q_len, q_len)
+    _, k, v = _qkv(k_len, k_len)
+    mask = _qsa_like_mask(q_len, k_len)
+    out = _flash_sdpa256(q, k, v, SCALE_256, mask)
+    ref = _dense_ref_bool(q, k, v, SCALE_256, mask)
+    mx.eval(out, ref)
+    assert not mx.any(mx.isnan(out)).item()
+    assert _max_abs(out, ref) < 5e-3
+
+
+def test_flash_sdpa256_bool_mask_matches_stock_sdpa():
+    """Also agree with MLX's own bool-mask handling (finfo-min convention) —
+    catches a sentinel-convention divergence the dense ref would share."""
+    from omlx.patches.sdpa256_attention import _flash_sdpa256
+
+    q_len, k_len = 256, 8448
+    q, _, _ = _qkv(q_len, q_len)
+    _, k, v = _qkv(k_len, k_len)
+    mask = _qsa_like_mask(q_len, k_len)
+    out = _flash_sdpa256(q, k, v, SCALE_256, mask)
+    ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=SCALE_256, mask=mask)
+    mx.eval(out, ref)
+    assert not mx.any(mx.isnan(out)).item()
+    assert _max_abs(out, ref) < 2e-2
+
+
+def test_flash_sdpa256_bool_mask_fully_masked_leading_tiles():
+    """A row whose first KV tiles are ALL masked exercises the online-softmax
+    late-wipe path: uniform exp(0) garbage accumulates until the first tile
+    with a real score raises the running max from _NEG_INF, making
+    corr == exp(_NEG_INF - real) == 0.0 wipe the accumulators exactly."""
+    import numpy as np
+
+    from omlx.patches.sdpa256_attention import _KV_TILE, _flash_sdpa256
+
+    q_len, k_len = 64, 4 * _KV_TILE + 128
+    q, _, _ = _qkv(q_len, q_len)
+    _, k, v = _qkv(k_len, k_len)
+    m = np.zeros((q_len, k_len), dtype=bool)
+    # rows 0..31: nothing visible until midway through tile 2
+    m[:32, 2 * _KV_TILE + 512 :] = True
+    # rows 32..62: standard causal-ish tail
+    m[32:63, : k_len - 256] = True
+    # row 63: visible ONLY in the final partial tile
+    m[63, 4 * _KV_TILE :] = True
+    mask = mx.array(m)[None, None]
+
+    out = _flash_sdpa256(q, k, v, SCALE_256, mask)
+    ref = _dense_ref_bool(q, k, v, SCALE_256, mask)
+    mx.eval(out, ref)
+    assert not mx.any(mx.isnan(out)).item()
+    assert _max_abs(out, ref) < 5e-3
+
+
+def test_flash_sdpa256_bool_mask_all_false_row_no_nan():
+    """A row masked EVERYWHERE (impossible under QSA, possible for arbitrary
+    callers of this process-wide patch) must degrade to uniform weights —
+    the same degenerate output the stock unfused fallback produces — with
+    no NaN."""
+    import numpy as np
+
+    from omlx.patches.sdpa256_attention import _flash_sdpa256
+
+    q_len, k_len = 32, 2048
+    q, _, _ = _qkv(q_len, q_len)
+    _, k, v = _qkv(k_len, k_len)
+    m = np.ones((q_len, k_len), dtype=bool)
+    m[5, :] = False
+    mask = mx.array(m)[None, None]
+
+    out = _flash_sdpa256(q, k, v, SCALE_256, mask)
+    ref = _dense_ref_bool(q, k, v, SCALE_256, mask)
+    mx.eval(out, ref)
+    assert not mx.any(mx.isnan(out)).item()
+    assert not mx.any(mx.isnan(ref)).item()
+    assert _max_abs(out, ref) < 5e-3
+
+
+def test_qsplit_bool_mask_matches_dense_reference():
+    """qsplit with an array mask keeps keys/values FULL-WIDTH (the causal
+    keys-narrowing trick does not apply) and row-slices the mask."""
+    from omlx.patches.sdpa256_attention import _unfused_qsplit_sdpa
+
+    q_len, k_len = 256, 8448
+    q, _, _ = _qkv(q_len, q_len)
+    _, k, v = _qkv(k_len, k_len)
+    mask = _qsa_like_mask(q_len, k_len)
+    out = _unfused_qsplit_sdpa(
+        q, k, v, None, SCALE_256, mask, None, _stock_sdpa256, 96
+    )
+    ref = _dense_ref_bool(q, k, v, SCALE_256, mask)
+    mx.eval(out, ref)
+    assert not mx.any(mx.isnan(out)).item()
+    assert _max_abs(out, ref) < 2e-2
+
+
+def test_qsplit_bool_mask_slices_rows_and_keeps_keys_full(monkeypatch):
+    from omlx.patches.sdpa256_attention import _unfused_qsplit_sdpa
+
+    q_len, k_len, q_sub = 256, 1024, 96
+    q, _, _ = _qkv(q_len, q_len)
+    _, k, v = _qkv(k_len, k_len)
+    mask = _qsa_like_mask(q_len, k_len)
+    seen = []
+
+    def recording_sdpa(qs, ks, vs, cache, scale, m, sinks):
+        seen.append((qs.shape[-2], ks.shape[-2], m.shape[-2], m.shape[-1]))
+        return mx.fast.scaled_dot_product_attention(qs, ks, vs, scale=scale, mask=m)
+
+    out = _unfused_qsplit_sdpa(
+        q, k, v, None, SCALE_256, mask, None, recording_sdpa, q_sub
+    )
+    mx.eval(out)
+    assert out.shape == q.shape
+    assert len(seen) == (q_len + q_sub - 1) // q_sub
+    for q_rows, k_width, m_rows, m_cols in seen:
+        assert k_width == k_len  # never narrowed for array masks
+        assert m_rows == q_rows  # mask rows sliced to the sub-tile
+        assert m_cols == k_len
+
+
+def test_route_bool_mask_never_takes_qsplit(_sdpa256_provider_reset):
+    """Array-mask q-split cannot narrow keys to a causal end, so each
+    sub-call still spans full kv_len AND the hysteresis ratchet walks q_sub
+    down between calls, producing many distinct slab sizes the Metal pool
+    cannot reuse (measured live: +7.3GB pool growth by kv_len=14336 and a
+    guard rejection at 14k tokens). Bool masks go unfused when the full
+    call fits, else straight to tiled."""
+    from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    bool_mask = mx.ones((1, 1, 2048, 16384), dtype=mx.bool_)
+    owner = _HeadroomOwner(1 << 40)
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    assert sdpa256._should_route(q, k, None, bool_mask, None) == ("unfused", 0)
+
+    need = estimate_unfused_sdpa_call_bytes(24, 2048, 16384, 256, q.dtype.size)
+    # One byte short of the full call: causal would q-split here — bool
+    # masks must fall straight to tiled.
+    owner.value = need - 1
+    assert sdpa256._should_route(q, k, None, "causal", None)[0] == "qsplit"
+    assert sdpa256._should_route(q, k, None, bool_mask, None) == ("tiled", 0)
+
+
+def test_should_route_gate_bool_and_float_masks():
+    """Bool array masks are routable (memory-safe tiled default without a
+    provider); additive float masks remain unroutable."""
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    q, k, _ = _qkv(2048, 16384)
+    bool_mask = mx.ones((1, 1, 2048, 16384), dtype=mx.bool_)
+    assert sdpa256._should_route(q, k, None, bool_mask, None) == ("tiled", 0)
+    float_mask = mx.zeros((2048, 16384))
+    assert sdpa256._should_route(q, k, None, float_mask, None) == ("unfused", 0)
+    # bool mask + sinks still unroutable
+    assert sdpa256._should_route(q, k, None, bool_mask, mx.zeros((4,))) == (
+        "unfused",
+        0,
+    )
+    # bool mask + quantized cache still unroutable
+
+    class _QuantCache:
+        bits = 4
+
+    assert sdpa256._should_route(q, k, _QuantCache(), bool_mask, None) == (
+        "unfused",
+        0,
+    )
+
+
 def test_qsplit_calls_original_sdpa_per_subtile():
     """Confirms the loop actually shrinks each call's query axis instead of
     passing the full tensor through once -- a no-op wrapper would still

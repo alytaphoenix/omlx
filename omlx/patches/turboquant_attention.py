@@ -606,25 +606,29 @@ def apply_turboquant_attention_patch() -> bool:
                         "falling back to prefill paths",
                         exc_info=True,
                     )
-            # Prefill: try quantized fast path, fallback to dequantize+SDPA
-            result = real_cache.prefill_attention(
-                queries,
-                keys_state=keys,
-                values_state=values,
-                scale=scale,
-                mask=mask,
-            )
-            if result is not None:
-                return result
+            # Prefill routing. Above the long-prefill threshold the tiled
+            # online-softmax route (quantized_attention: query_block x
+            # key_chunk, T-bounded transient) must run FIRST:
+            # prefill_attention materializes the FULL (B*n_kv*n_rep, L, T)
+            # fp32 score + softmax slabs with no T-tiling, and — unlike the
+            # str-mask case, which bails out of it lazily — it ACCEPTS
+            # array masks, so trying it first turned every long array-mask
+            # prefill into an O(L*T) memory spike. That also silently
+            # contradicted the scheduler's estimator, which registers the
+            # tiled query_block/key_chunk cost for exactly this threshold
+            # (Scheduler._set_model_info_for_monitor's
+            # register_tiled_prefill_tile call). Short prefills keep the
+            # single-dispatch prefill_attention fast path unchanged.
             keys_state = getattr(keys, "_state", keys)
             try:
                 total_tokens = _state_length(keys_state)
             except Exception:
                 total_tokens = 0
-            if (
+            use_tiled_first = (
                 total_tokens > _LONG_PREFILL_QUANTIZED_THRESHOLD
                 and hasattr(real_cache, "quantized_attention")
-            ):
+            )
+            if use_tiled_first:
                 old_query_block_size = getattr(
                     real_cache, "prefill_query_block_size", None
                 )
@@ -646,7 +650,8 @@ def apply_turboquant_attention_patch() -> bool:
                 except Exception:
                     logger.debug(
                         "TurboQuant quantized prefill attention failed; "
-                        "falling back to dequantize+SDPA",
+                        "falling back to prefill_attention / "
+                        "dequantize+SDPA",
                         exc_info=True,
                     )
                 finally:
@@ -654,6 +659,16 @@ def apply_turboquant_attention_patch() -> bool:
                         real_cache.prefill_query_block_size = old_query_block_size
                     if old_key_chunk_size is not None:
                         real_cache.prefill_key_chunk_size = old_key_chunk_size
+            # Short prefills, and the fallback when the tiled route raised.
+            result = real_cache.prefill_attention(
+                queries,
+                keys_state=keys,
+                values_state=values,
+                scale=scale,
+                mask=mask,
+            )
+            if result is not None:
+                return result
             # Pass the request's own views, matching prefill_attention/
             # quantized_attention above -- dequantize() defaults to None,
             # which dequantizes the ENTIRE resident cache in one shot

@@ -1224,6 +1224,22 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "BatchTurboQuantKVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
+        # Qwen4-Exp QSA full-attention caches: their handlers declare
+        # supports_block_slicing=True with token axes for all four state
+        # members (keys/values/index_keys/index_position_ids), and
+        # _fill_boundary_placeholders_from_live_cache fills blanked
+        # layers from the live cache gated on that same registry flag.
+        # Omitting QSAKVCache here made EVERY boundary snapshot carry the
+        # full K/V+index prefix (~27.9KB/token x token_count, ~1.1GB per
+        # snapshot at 40k) — the #2551 quadratic-across-snapshots trap
+        # resurfacing for a new cache class, measured live as ~5GB of
+        # request-tied RAM at 47k tokens and a pre-chunk guard rejection,
+        # plus 532MB GDN sidecars that should be ~113MB. The lockstep
+        # test in tests/test_boundary_snapshot_qsa.py keeps this set in
+        # sync with the handler registry so the next sliceable cache
+        # class cannot regress the same way.
+        "QSAKVCache",
+        "QSAQuantizedKVCache",
     }
 )
 
@@ -1281,6 +1297,31 @@ def _first_leaf_cache_offset(cache_obj: Any) -> int | None:
         return int(offset)
     except Exception:
         return None
+
+
+def _snapshot_value_nbytes(value: Any) -> int:
+    """Best-effort byte size of an in-memory boundary snapshot value.
+
+    Walks lists/tuples/dicts summing ``nbytes`` of leaf arrays (mx or np).
+    Diagnostic only — returns what it can and never raises.
+    """
+    total = 0
+    try:
+        stack = [value]
+        seen = 0
+        while stack and seen < 100_000:
+            item = stack.pop()
+            seen += 1
+            nbytes = getattr(item, "nbytes", None)
+            if isinstance(nbytes, int):
+                total += nbytes
+            elif isinstance(item, dict):
+                stack.extend(item.values())
+            elif isinstance(item, (list, tuple)):
+                stack.extend(item)
+    except Exception:
+        pass
+    return total
 
 
 def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
@@ -6327,13 +6368,23 @@ class Scheduler:
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
             else:
-                self._boundary_cache_snapshots[request_id][token_count] = (
-                    _compact_boundary_snapshot_value(
-                        self._prefill_snapshot_value(snapshot_cache),
-                        token_count,
-                        block_size,
-                        self._stream,
-                    )
+                value = _compact_boundary_snapshot_value(
+                    self._prefill_snapshot_value(snapshot_cache),
+                    token_count,
+                    block_size,
+                    self._stream,
+                )
+                self._boundary_cache_snapshots[request_id][token_count] = value
+                # A silent RAM fallback is how snapshot residency creeps into
+                # the prefill memory budget unobserved (the Fix-4/qwen4_exp
+                # investigation needed live A/B to even see it). Surface it,
+                # with size, every time it happens.
+                logger.info(
+                    "Boundary snapshot SSD save failed for %s at %d tokens; "
+                    "keeping ~%.0fMB in RAM",
+                    request_id,
+                    token_count,
+                    _snapshot_value_nbytes(value) / 1024**2,
                 )
         else:
             self._boundary_cache_snapshots[request_id][token_count] = (
