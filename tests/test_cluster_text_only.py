@@ -35,12 +35,16 @@ def test_text_only_layout_excludes_vision_and_mtp(tmp_path):
     """Vision-tower and MTP tensors must not be sized into decoder layers.
 
     ``vision_tower.blocks.N`` collides with decoder layer N and
-    ``language_model.mtp.layers.0`` with layer 0; counting them inflated the
-    wrong stages. Vision exclusion is the caller's own ``text_only`` intent
-    (a VLM checkpoint sizes full unless a caller is specifically sizing a
-    text-only deployment of it -- see ``inspect_safetensors_layout``'s
-    docstring); MTP exclusion is unconditional (below).
-    """
+    ``language_model.mtp.layers.0`` with layer 0; counting them there would
+    inflate the wrong stages. Vision exclusion is the caller's own
+    ``text_only`` intent (a VLM checkpoint sizes full unless a caller is
+    specifically sizing a text-only deployment of it -- see
+    ``inspect_safetensors_layout``'s docstring); MTP exclusion from
+    ``layer_weight_bytes`` is unconditional, but (#2970) MTP heads are never
+    sharded by mlx-lm's native TP -- they're replicated on every rank just
+    like embed/norm -- so they land in ``fixed_weight_bytes`` instead of
+    being dropped outright (see ``test_cluster_planner.py``'s
+    ``fixed_weight_bytes`` tests for the rationale)."""
 
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -64,23 +68,28 @@ def test_text_only_layout_excludes_vision_and_mtp(tmp_path):
         ],
     )
 
-    # Un-flagged (catalogue) sizing: full size, vision included, MTP still
-    # excluded (unconditional).
+    # Un-flagged (catalogue) sizing: full size, vision included, MTP always
+    # routed to fixed_weight_bytes (never sharded, replicated on every rank
+    # -- #2970) rather than left in layer_weight_bytes.
     full = inspect_safetensors_layout(tmp_path)
     assert full.layer_weight_bytes == (1299, 1299)
-    assert full.fixed_weight_bytes == 150
+    assert full.fixed_weight_bytes == 150 + 777  # embed + norm + replicated MTP head
 
     # A caller sizing a concrete text-only deployment of this checkpoint
     # excludes vision too — only the two real decoder layers, equal-sized.
+    # MTP is unaffected by text_only -- it's excluded from layer sharding
+    # unconditionally, not because of a vision/text-only distinction.
     text_only = inspect_safetensors_layout(tmp_path, text_only=True)
     assert text_only.layer_weight_bytes == (300, 300)
-    assert text_only.fixed_weight_bytes == 150  # embed + norm only
+    assert text_only.fixed_weight_bytes == 150 + 777  # embed + norm + MTP head
 
 
 def test_pure_text_layout_keeps_vision_irrelevant_but_excludes_mtp(tmp_path):
     """A non-VLM checkpoint has no vision prefixes to exclude either way, but
     a pure-text ``-mtp`` checkpoint has the exact same layer-0 collision as a
-    VLM's MTP heads, so MTP exclusion must not be gated on VLM-ness."""
+    VLM's MTP heads, so MTP routing (unconditionally out of layer sharding,
+    into fixed_weight_bytes as replicated weight -- #2970) must not be gated
+    on VLM-ness."""
 
     (tmp_path / "config.json").write_text(
         json.dumps({"model_type": "qwen3", "num_hidden_layers": 2})
@@ -98,7 +107,7 @@ def test_pure_text_layout_keeps_vision_irrelevant_but_excludes_mtp(tmp_path):
 
     layout = inspect_safetensors_layout(tmp_path)
     assert layout.layer_weight_bytes == (300, 300)
-    assert layout.fixed_weight_bytes == 150
+    assert layout.fixed_weight_bytes == 150 + 777  # embed + norm + replicated MTP head
 
 
 def _assignment(start, end, *, tp=2):
