@@ -535,24 +535,6 @@ def _is_mtp_head_tensor(name: str) -> bool:
     return ".mtp." in name or name.startswith("mtp.")
 
 
-def _text_only_excluded_tensor(name: str) -> bool:
-    """A tensor a text-only distributed deployment of a VLM never loads.
-
-    ``language_model.mtp.layers.0`` (and the plain ``mtp.*`` spelling) lands
-    on decoder layer 0 under ``_tensor_layer_index``'s pattern, so counting
-    its bytes there inflates the wrong stage regardless of whether the
-    checkpoint is a VLM: a pure-text ``-mtp`` checkpoint has the exact same
-    layer-0 collision, and mlx-lm's ``sanitize`` drops the draft heads for
-    every text-only load, VLM or not.
-    """
-
-    from omlx.utils.model_loading import _VLM_VISION_PREFIXES
-
-    if name.startswith(_VLM_VISION_PREFIXES):
-        return True
-    return _is_mtp_head_tensor(name)
-
-
 def _is_vision_tensor(name: str) -> bool:
     """A vision-tower/projector tensor mlx-lm's ``sanitize`` drops when a
     VLM checkpoint is loaded text-only. Only meaningful for VLM checkpoints
