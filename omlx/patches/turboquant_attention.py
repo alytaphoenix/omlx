@@ -9,8 +9,8 @@ When TurboQuantKVCache is detected, routes attention to:
     are folded into the GQA repeat dimension so the codecs' decode kernels
     apply, with the causal tail mask injected between key scoring and the
     value weighted sum — one lazy pass over the KV, no dequantize
-  - Prefill (L>1): cache.prefill_attention() fast path, fallback to
-    dequantize + mx.fast.scaled_dot_product_attention
+  - Prefill (L>1): tiled quantized attention first for long contexts;
+    cache.prefill_attention() first for short contexts; then dequantized SDPA
 """
 
 import logging
@@ -650,8 +650,7 @@ def apply_turboquant_attention_patch() -> bool:
                 except Exception:
                     logger.debug(
                         "TurboQuant quantized prefill attention failed; "
-                        "falling back to prefill_attention / "
-                        "dequantize+SDPA",
+                        "falling back to prefill_attention / dequantize+SDPA",
                         exc_info=True,
                     )
                 finally:

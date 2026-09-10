@@ -21,8 +21,8 @@
             <!-- Status Main Tab -->
             {% include "dashboard/_status.html" %}
 
-            <!-- Cluster Main Tab -->
-            {% include "dashboard/_cluster.html" %}
+            <!-- Cluster Main Tab: the v2 wizard is the sole dashboard flow. -->
+            {% include "dashboard/_cluster_v2.html" %}
 
             <!-- Settings Main Tab -->
             {% include "dashboard/_settings.html" %}
@@ -122,5 +122,7 @@
      X-Omlx-Asset-Version header; a mismatch means this page is a stale
      cached bundle and must be reloaded. -->
 <script>window.OMLX_ASSET_VERSION = {{ asset_version() | tojson }};</script>
+<script src="{{ static('js/usage.js') }}"></script>
+<script src="{{ static('js/cluster_v2.js') }}"></script>
 <script src="{{ static('js/dashboard.js') }}"></script>
 {% endblock %}

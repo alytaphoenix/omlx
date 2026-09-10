@@ -7,6 +7,7 @@ import importlib
 
 NATIVE_KERNEL_PACKAGES = (
     "bonsai",
+    "decode_fast",
     "glm_moe_dsa",
     "minimax_m3",
     "qwen35_prefill",

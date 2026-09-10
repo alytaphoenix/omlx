@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Patch scaled_dot_product_attention to fix head_dim=256 long-context prefill.
+"""Keep head-dim-256 long-context prefill bounded on MLX 0.32.2.
 
-MLX's fused SDPA kernel supports head_dim in {64, 80, 128} only, so head_dim=256
-(e.g. Qwen3.6-27B) multi-token prefill falls back to an unfused path that
-materializes the full ``[n_q, query_len, kv_len]`` score matrix -> O(L^2) memory,
-OOMing / tripping the prefill guard far below the context window. Decode
-(query_len == 1) is unaffected (MLX has a fused vector kernel for 256).
+MLX 0.32.2 ships a fused full-attention kernel for head dimensions 192 and 256,
+but deliberately keeps the faster unfused path as the default on pre-NAX GPUs.
+That default materializes the full ``[n_q, query_len, kv_len]`` score matrix and
+can still exceed oMLX's memory-guard ceiling.
 
-This routes head_dim=256 causal prefill through three possible paths, picked
+This routes head_dim=256 causal prefill through four possible paths, picked
 per-call by ``_route_decision``:
 
 - **unfused** (stock MLX fallback): the fast path wherever its
@@ -15,31 +14,46 @@ per-call by ``_route_decision``:
 - **q-split** (``_unfused_qsplit_sdpa``): when the full unfused call doesn't
   fit, split the query axis into sub-tiles (keys/values narrowed to each
   sub-tile's causal end) and run the SAME fast stock kernel per sub-tile —
-  smaller transient, still the fast kernel, no accuracy cost.
-- **tiled** (``_flash_sdpa256``): a flash-style online-softmax pass in pure
-  MLX array ops (tiled over KV; running max/sum/accumulator) that never
-  materializes the score matrix -> true O(L) peak, at the cost of one
+  smaller transient, still the fast kernel, no accuracy cost. MLX itself only
+  prefers its native fused kernel on NAX GPUs, so on everything else (all
+  current Apple Silicon) the stock kernel per sub-tile stays faster than
+  forcing fused — q-split is the throughput-preserving middle tier, not a
+  historical artifact the fused kernel obsoletes. Disabled for array masks
+  (see ``_should_route``): measured live, array-mask q-split caused Metal
+  pool growth worse than the O(L^2) wall it replaced (Qwen3.8-Flash 40k
+  probe, +7.3GB by kv_len=14336).
+- **bounded** (``_flash_sdpa256``): once even a minimum-size q-split slice
+  wouldn't fit, or headroom info is unavailable (memory-safe #2025 default),
+  or the call carries an array mask that can't q-split. Tries MLX 0.32.2's
+  native fused kernel (``force_fused=True``) on Metal first — an upstream
+  win over the old hand-rolled tile loop for the shapes it supports — and
+  falls back to ``_array_tiled_sdpa256``, a flash-style online-softmax pass
+  in pure MLX array ops (tiled over KV; running max/sum/accumulator) that
+  never materializes the score matrix -> true O(L) peak, at the cost of one
   ``mx.eval`` per KV tile (real measured overhead, not "on par with the
-  fallback" — thousands of small CPU<->GPU syncs at long context). This is
-  now the last resort once even a minimum-size q-split slice wouldn't fit,
-  or when headroom info is unavailable (memory-safe #2025 default).
+  fallback" — thousands of small CPU<->GPU syncs at long context). The
+  fallback is also what CUDA always uses: MLX 0.32.2's CUDA fused kernel
+  does not support head_dim 256.
   ``register_tiled_prefill_head_dim`` flips the prefill-guard estimator to
   O(L) in lockstep so it prices this route instead of the O(L^2) unfused
-  formula (else the guard keeps rejecting requests the tiled route could
+  formula (else the guard keeps rejecting requests the bounded route could
   actually serve).
 
-The route is memory-aware (issue #2204, extended for q-split): unfused is
-faster everywhere its score matrix fits (on NAX GPUs its big GEMMs run on
-the tensor units), so when the Scheduler has registered a headroom provider
-the route only narrows to q-split, then finally tiled, as live headroom
-shrinks. Without a provider (no Scheduler, ceiling not propagated yet) the
-route keeps the memory-safe default: always tiled past the kv_len threshold.
-``OMLX_SDPA256_TILED=1`` forces the tiled pass whenever the shape gates
+The route is memory-aware (issue #2204, extended for q-split and the native
+fused kernel): unfused is faster everywhere its score matrix fits, so when
+the Scheduler has registered a headroom provider the route only narrows to
+q-split, then finally bounded, as live headroom shrinks. Without a provider
+(no Scheduler, ceiling not propagated yet) the route keeps the memory-safe
+default: always bounded past the kv_len threshold.
+``OMLX_SDPA256_TILED=1`` forces the bounded pass whenever the shape gates
 match (pre-#2204 behavior, also skips q-split); ``OMLX_SDPA256_TILED=0``
-never engages tiled OR q-split (restores the O(L^2) memory wall —
-benchmarking only). ``OMLX_SDPA256_QSPLIT=0`` disables q-split specifically,
-falling straight to tiled once unfused doesn't fit (pre-q-split behavior,
+never engages the bounded route OR q-split (restores the O(L^2) memory wall
+— benchmarking only). ``OMLX_SDPA256_QSPLIT=0`` disables q-split specifically,
+falling straight to bounded once unfused doesn't fit (pre-q-split behavior,
 for rollback without touching the tiled/unfused override).
+``OMLX_SDPA256_FUSED=0`` disables the native fused kernel specifically,
+keeping the bounded route on the array-tiled implementation (rollback lever
+for the least-tested tier, without touching q-split or the unfused override).
 
 Install mechanics mirror turboquant_attention.py (patch the module attr + rebind
 already-imported model modules). The route is strictly gated (see _should_route);
@@ -48,62 +62,68 @@ everything else passes through to the original SDPA unchanged.
 
 import logging
 import os
+import threading
 import weakref
 
 import mlx.core as mx
 
-from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+from omlx.memory_monitor import (
+    SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
+    estimate_unfused_sdpa_call_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
 
 HEAD_DIM = 256
-# Engage the tiled kernel only once the context is long enough that the unfused
-# fallback's O(L^2) score matrix becomes a memory problem. Below this, the
-# fused-GEMM fallback is faster and fits comfortably. Tunable.
+# Force the bounded kernel only once the context is long enough that the
+# default unfused route's O(L^2) score matrix becomes a memory problem.
 _SDPA256_MIN_KV_LEN = 8192
 # Decode-shaped multi-row calls (MTP verify: q_len = 1 + draft depth <= 9)
-# must not take this route: the per-KV-tile eval sync only amortizes over
-# prefill-sized q tiles, and at tiny q_len it costs O(kv_len/tile) sequential
-# dispatches per call — 8-22x slower than stock SDPA, collapsing long-context
-# MTP throughput (issue #2127). Below this floor the stock path's score
-# matrix is at most n_q * 15 * kv_len, which is never a memory problem.
+# do not need the forced full-attention route. Below this floor the stock path's
+# score matrix is at most n_q * 15 * kv_len and is not a memory problem.
 _SDPA256_MIN_Q_LEN = 16
-# Tile sizes for the online-softmax kernel (tuned on M2 Max).
 _Q_TILE = 512
+# A deliberately conservative score-tile width used only by the admission
+# estimate. MLX's fused kernel keeps a smaller on-chip block, so this does not
+# understate the bounded route's score working set.
 _KV_TILE = 1024
-
-_NEG_INF = -1e30  # fp32 sentinel for masked logits (exp -> 0)
+_NEG_INF = -1e30
 
 # Live guard-headroom provider for memory-aware routing (issue #2204).
-# Registered by Scheduler.__init__ as a bound method returning the bytes left
-# under the adaptive-prefill-throttle target (hard ceiling x headroom safety,
-# clamped by the abort cap), or a negative value when no ceiling is active.
-# Held as a WeakMethod so a torn-down Scheduler auto-unregisters and the route
-# falls back to the memory-safe always-tiled default.
-_HEADROOM_PROVIDER: "weakref.WeakMethod | None" = None
-# OMLX_SDPA256_TILED override, parsed at apply time: True = always tiled,
-# False = never tiled, None = memory-aware auto.
+# Scheduler.step registers the active Scheduler on its execution thread. Each
+# engine uses its own worker, so thread-local storage keeps concurrent engines
+# from replacing one another's provider. The bound method is weakly held so a
+# torn-down Scheduler leaves that worker on the memory-bounded native fused
+# default.
+_HEADROOM_PROVIDER_LOCAL = threading.local()
+# Backward-compatible override: True = always force bounded, False = never force,
+# None = memory-aware auto.
 _FORCE_TILED: bool | None = None
 # OMLX_SDPA256_QSPLIT override, parsed at apply time: False disables the
-# q-split route (falls straight to tiled once unfused doesn't fit, restoring
+# q-split route (falls straight to bounded once unfused doesn't fit, restoring
 # pre-q-split behavior for rollback); True/None (default) leaves it enabled.
 _QSPLIT_ENABLED: bool = True
 # Minimum query rows per q-split sub-call. Below this the per-call overhead
 # stops paying for itself and genuinely tight headroom is better served by
-# the tiled path's true O(L) floor.
+# the bounded path's true O(L) floor.
 _QSPLIT_MIN_Q = 128
+# OMLX_SDPA256_FUSED override, parsed at apply time: False disables MLX
+# 0.32.2's native fused kernel inside the bounded route, keeping it on the
+# array-tiled fallback (rollback lever for the least-tested tier); True/None
+# (default) leaves the native kernel enabled where its shape gates match.
+_FUSED_ENABLED: bool = True
 # Route decisions round-trip through here so callers branch on one value.
 _ROUTE_UNFUSED = "unfused"
 _ROUTE_QSPLIT = "qsplit"
-_ROUTE_TILED = "tiled"
+_ROUTE_BOUNDED = "bounded"
 # Last route decision, so we log every *transition* (not just the
 # first-ever engagement) at INFO — cheap, and lets a live server log show a
 # request flapping between routes as guard headroom rises and falls
 # mid-prefill (see the docstring on
 # omlx.scheduler.Scheduler._sdpa256_unfused_headroom for why that happens).
-# The tiled/qsplit pass trades substantial prefill throughput at long
+# The bounded/qsplit pass trades substantial prefill throughput at long
 # kv_len for safer memory, and nothing surfaced the route decision before
 # (issue #2283 took an A/B repro to diagnose), so this stays at INFO rather
 # than DEBUG.
@@ -145,7 +165,9 @@ def _note_route(cache, decision: str, detail) -> None:
         detail = detail()
     logger.info(
         "sdpa256: route -> %s (%s). OMLX_SDPA256_TILED=1/0 forces "
-        "unfused/tiled; OMLX_SDPA256_QSPLIT=0 disables the q-split route.",
+        "unfused/bounded; OMLX_SDPA256_QSPLIT=0 disables the q-split route; "
+        "OMLX_SDPA256_FUSED=0 disables the native fused kernel within the "
+        "bounded route.",
         decision,
         detail,
     )
@@ -165,14 +187,29 @@ def _max_q_sub_for_headroom(
 
 
 def set_unfused_headroom_provider(method) -> None:
-    """Register a bound method(kv_len) -> live headroom in bytes (negative
-    when no ceiling is active). Lets ``_should_route`` prefer the faster
-    unfused fallback whenever its O(L^2) transient fits. ``kv_len`` lets the
-    provider tell a same-shape repeat call (safe to credit pooled memory
-    against) from the first call at a new, larger kv_len (not safe -- see
+    """Bind the active Scheduler's headroom provider to this worker thread.
+
+    ``method`` is a bound method(kv_len) -> live headroom in bytes (negative
+    when no ceiling is active). Lets ``_route_decision`` prefer the faster
+    unfused fallback whenever its O(L^2) transient fits, and size q-split
+    sub-calls when it doesn't. ``kv_len`` lets the provider tell a same-shape
+    repeat call (safe to credit pooled memory against) from the first call at
+    a new, larger kv_len (not safe -- see
     Scheduler._sdpa256_unfused_headroom)."""
-    global _HEADROOM_PROVIDER
-    _HEADROOM_PROVIDER = weakref.WeakMethod(method)
+    ref = getattr(_HEADROOM_PROVIDER_LOCAL, "ref", None)
+    current = ref() if ref is not None else None
+    if (
+        current is not None
+        and current.__self__ is method.__self__
+        and current.__func__ is method.__func__
+    ):
+        return
+    _HEADROOM_PROVIDER_LOCAL.ref = weakref.WeakMethod(method)
+
+
+def _get_unfused_headroom_provider():
+    ref = getattr(_HEADROOM_PROVIDER_LOCAL, "ref", None)
+    return ref() if ref is not None else None
 
 
 def _parse_force_tiled_env() -> bool | None:
@@ -188,6 +225,21 @@ def _parse_qsplit_env() -> bool:
     return os.environ.get("OMLX_SDPA256_QSPLIT", "").strip() != "0"
 
 
+def _parse_fused_env() -> bool:
+    return os.environ.get("OMLX_SDPA256_FUSED", "").strip() != "0"
+
+
+def _notify_bounded_route(provider, active: bool) -> None:
+    """Let the scheduler retire measurements from the previous route."""
+    try:
+        owner = getattr(provider, "__self__", None)
+        callback = getattr(owner, "_sdpa256_bounded_route_changed", None)
+        if callable(callback):
+            callback(active)
+    except Exception:
+        logger.debug("sdpa256 route notification failed", exc_info=True)
+
+
 def _route_decision(
     queries,
     keys,
@@ -195,7 +247,7 @@ def _route_decision(
     q_sub_ceiling: int | None = None,
     allow_qsplit: bool = True,
 ) -> tuple[str, int]:
-    """Decide unfused / q-split / tiled for a shape-matched prefill call.
+    """Decide unfused / q-split / bounded for a shape-matched prefill call.
 
     Returns ``(route, q_sub)`` — ``q_sub`` is only meaningful for
     ``_ROUTE_QSPLIT`` (query rows per sub-call), 0 otherwise.
@@ -204,9 +256,9 @@ def _route_decision(
     (issues #2155 / #2204): take it whole when the full call fits, split
     the query axis into sub-calls that individually fit when the full call
     doesn't (still the fast kernel, just narrower), and fall back to the
-    true O(L) tiled pass only once even a minimum-size q-split slice
-    wouldn't fit, or when headroom info is unavailable (memory-safe
-    #2025 default).
+    bounded route (native fused kernel, else the true O(L) array-tiled pass)
+    only once even a minimum-size q-split slice wouldn't fit, or when
+    headroom info is unavailable (memory-safe #2025 default).
 
     ``q_sub_ceiling`` is this request's hysteresis floor (set by
     ``_should_route`` once a call has ever needed a smaller transient than
@@ -218,44 +270,54 @@ def _route_decision(
     was verified live to reproduce byte-for-byte the same full-size
     transient as plain unfused, just labeled qsplit, moments before the
     reactive guard aborted a request. ``q_sub_ceiling == 0`` means a
-    previous call already needed tiled -- never try qsplit or unfused
-    again this request."""
+    previous call already needed the bounded route -- never try qsplit or
+    unfused again this request."""
+    provider = _get_unfused_headroom_provider()
     if _FORCE_TILED is not None:
         if _FORCE_TILED:
-            _note_route(cache, _ROUTE_TILED, "forced by OMLX_SDPA256_TILED=1")
-            return _ROUTE_TILED, 0
+            _note_route(cache, _ROUTE_BOUNDED, "forced by OMLX_SDPA256_TILED=1")
+            _notify_bounded_route(provider, True)
+            return _ROUTE_BOUNDED, 0
         _note_route(cache, _ROUTE_UNFUSED, "forced by OMLX_SDPA256_TILED=0")
+        _notify_bounded_route(provider, False)
         return _ROUTE_UNFUSED, 0
     try:
         if q_sub_ceiling == 0:
             _note_route(
                 cache,
-                _ROUTE_TILED,
-                "held at tiled by this request's hysteresis floor",
+                _ROUTE_BOUNDED,
+                "held at bounded by this request's hysteresis floor",
             )
-            return _ROUTE_TILED, 0
-        provider = _HEADROOM_PROVIDER() if _HEADROOM_PROVIDER is not None else None
+            _notify_bounded_route(provider, True)
+            return _ROUTE_BOUNDED, 0
         if provider is None:
             _note_route(
                 cache,
-                _ROUTE_TILED,
+                _ROUTE_BOUNDED,
                 "no guard headroom provider registered "
                 "(engine without a scheduler, or scheduler gone)",
             )
-            return _ROUTE_TILED, 0
+            return _ROUTE_BOUNDED, 0
         batch, n_q, q_len, _ = queries.shape
         kv_len = keys.shape[-2]
         n_q_heads = batch * n_q
-        dtype_size = queries.dtype.size
+        # The unfused fallback materializes fp32 scores even for bf16 inputs
+        # (issue #2204 follow-up): pricing it at the query dtype halves the
+        # predicted matrix and admits OOM spikes at long context. Shared
+        # with the guard via the memory_monitor constant, and with
+        # _max_q_sub_for_headroom below so q-split sizing never drifts from
+        # what actually gets charged.
+        dtype_size = SDPA256_UNFUSED_SCORE_DTYPE_SIZE
         headroom = provider(kv_len)
         if headroom is None or headroom < 0:
             _note_route(
                 cache,
-                _ROUTE_TILED,
+                _ROUTE_BOUNDED,
                 "memory ceiling not available (enforcer state not yet "
                 "propagated)",
             )
-            return _ROUTE_TILED, 0
+            _notify_bounded_route(provider, True)
+            return _ROUTE_BOUNDED, 0
         transient = estimate_unfused_sdpa_call_bytes(
             n_q_heads, q_len, kv_len, HEAD_DIM, score_dtype_size=dtype_size
         )
@@ -266,6 +328,7 @@ def _route_decision(
                 lambda: f"full call ~{transient / 2**20:.0f}MiB fits "
                 f"~{headroom / 2**20:.0f}MiB headroom at kv_len={kv_len}",
             )
+            _notify_bounded_route(provider, False)
             return _ROUTE_UNFUSED, 0
         if _QSPLIT_ENABLED and allow_qsplit:
             q_sub = _max_q_sub_for_headroom(
@@ -283,24 +346,26 @@ def _route_decision(
                     f"~{headroom / 2**20:.0f}MiB headroom at kv_len={kv_len} "
                     f"(full-call transient ~{transient / 2**20:.0f}MiB)",
                 )
+                _notify_bounded_route(provider, True)
                 return _ROUTE_QSPLIT, q_sub
         _note_route(
             cache,
-            _ROUTE_TILED,
+            _ROUTE_BOUNDED,
             lambda: f"unfused transient ~{transient / 2**20:.0f}MiB exceeds "
             f"~{headroom / 2**20:.0f}MiB headroom at kv_len={kv_len} even "
             f"at the q-split floor ({_QSPLIT_MIN_Q} rows)",
         )
-        return _ROUTE_TILED, 0
+        _notify_bounded_route(provider, True)
+        return _ROUTE_BOUNDED, 0
     except Exception:
         logger.debug("sdpa256 headroom probe failed", exc_info=True)
-        _note_route(cache, _ROUTE_TILED, "guard headroom probe failed")
-        return _ROUTE_TILED, 0  # headroom info unavailable -> memory-safe default
+        _note_route(cache, _ROUTE_BOUNDED, "guard headroom probe failed")
+        _notify_bounded_route(provider, True)
+        return _ROUTE_BOUNDED, 0  # headroom info unavailable -> memory-safe default
 
 
 def _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len):
-    """Reshape a boolean attention mask so it broadcasts against the tiled
-    kernel's 5-D ``[batch, n_kv, group, q, k]`` layout.
+    """Reshape an array mask for the tiled GQA attention layout.
 
     Accepts the shapes model code actually emits: ``[B, 1, L, T]`` (QSA's
     per-layer sparse mask, and most create_causal_mask outputs), a full
@@ -309,42 +374,47 @@ def _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len):
     Qwen3_5Attention narrows the mask to kv_seq_len before SDPA.
     """
     if mask.ndim == 4:
-        if mask.shape[1] == 1:
-            return mask[:, :, None]  # [B, 1, 1, L, T]
-        # Per-head mask: fold heads into (n_kv, group).
-        return mask.reshape(batch, n_kv, group_size, q_len, k_len)
-    if mask.ndim == 3:
-        return mask[:, None, None]
-    if mask.ndim == 2:
-        return mask[None, None, None]
-    raise ValueError(f"unsupported attention mask ndim: {mask.ndim}")
+        pass
+    elif mask.ndim == 3:
+        # Preserve mlx-lm's convention: [batch, query, key].
+        mask = mask[:, None, :, :]
+    elif mask.ndim == 2:
+        mask = mask[None, None, :, :]
+    elif mask.ndim == 1:
+        mask = mask[None, None, None, :]
+    else:
+        raise ValueError(f"unsupported attention mask ndim: {mask.ndim}")
+    n_q = n_kv * group_size
+    mask = mx.broadcast_to(mask, (batch, n_q, q_len, k_len))
+    return mask.reshape(batch, n_kv, group_size, q_len, k_len)
 
 
-def _flash_sdpa256(queries, keys, values, scale, mask):
-    """Flash-style online-softmax attention for head_dim=256 prefill.
+def _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks=None):
+    """Portable bounded fallback for shapes without a native fused kernel.
 
     queries: [batch, n_q, q_len, head_dim]
     keys/values: [batch, n_kv, k_len, head_dim]   (n_q % n_kv == 0)
-    mask: "causal", None, or a BOOLEAN mx.array (e.g. Qwen4-Exp QSA's
-    block-sparse selection mask). Returns [batch, n_q, q_len, head_dim] in
-    queries.dtype.
+    mask: "causal", None, or an mx.array (boolean, e.g. Qwen4-Exp QSA's
+    block-sparse selection mask, or additive float). Returns
+    [batch, n_q, q_len, head_dim] in queries.dtype.
 
     Tiles over Q and KV, keeping a running (max m, sum denom, accumulator acc) per
     query row so the [q x full_kv] score matrix is never materialized. fp32
     accumulators; output cast back to the input dtype. GQA via reshape+broadcast.
 
-    Boolean masks are sliced per (q, kv) tile and applied with the same
-    finite ``_NEG_INF`` sentinel the causal branch uses. A query row whose
-    LEADING tiles are fully masked transiently accumulates uniform exp(0)
-    weight, but the first tile containing a real score raises the running
-    max from ``_NEG_INF`` so ``corr = exp(_NEG_INF - real) == 0.0`` wipes
-    the accumulators exactly — the online softmax self-corrects, and QSA
+    Array masks are sliced per (q, kv) tile. Boolean masks are applied with
+    the same finite ``_NEG_INF`` sentinel the causal branch uses; additive
+    float masks are added directly to the scores. A query row whose LEADING
+    tiles are fully masked transiently accumulates uniform exp(0) weight,
+    but the first tile containing a real score raises the running max from
+    ``_NEG_INF`` so ``corr = exp(_NEG_INF - real) == 0.0`` wipes the
+    accumulators exactly — the online softmax self-corrects, and QSA
     guarantees every row at least one visible key (its tail term always
     includes the query's own position). A row masked EVERYWHERE degrades to
     uniform weights over the row — the same degenerate output the stock
     unfused fallback produces for such rows (softmax over equal finfo-min
     scores), with no NaN in either path. For array masks the causal
-    early-exit on the KV loop is skipped: an arbitrary bool mask may permit
+    early-exit on the KV loop is skipped: an arbitrary mask may permit
     keys past the causal diagonal, and with a cached prefix the truncation
     saves almost nothing anyway.
 
@@ -355,21 +425,16 @@ def _flash_sdpa256(queries, keys, values, scale, mask):
     """
     batch, n_q, q_len, head_dim = queries.shape
     _, n_kv, k_len, _ = keys.shape
+    value_dim = values.shape[-1]
     group_size = n_q // n_kv
     causal = isinstance(mask, str) and mask == "causal"
-    bool_mask = None
+    array_mask = None
     if isinstance(mask, mx.array):
-        if mask.dtype != mx.bool_:
-            raise ValueError("_flash_sdpa256 only supports boolean array masks")
-        bool_mask = _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len)
+        array_mask = _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len)
 
     qr = queries.reshape(batch, n_kv, group_size, q_len, head_dim)
     kr = keys.reshape(batch, n_kv, 1, k_len, head_dim)
-    vr = values.reshape(batch, n_kv, 1, k_len, head_dim)
-
-    # MLX 'causal' aligns queries to the END of the key axis: with a cached
-    # prefix (k_len > q_len, chunked prefill) local query i is global position
-    # i + offset and attends keys 0..(i + offset). offset == 0 for square.
+    vr = values.reshape(batch, n_kv, 1, k_len, value_dim)
     offset = k_len - q_len
 
     out_q_tiles = []
@@ -379,9 +444,15 @@ def _flash_sdpa256(queries, keys, values, scale, mask):
         qt = qi1 - qi0
         q_pos = mx.arange(qi0 + offset, qi1 + offset).reshape(1, 1, 1, qt, 1)
 
-        m = mx.full((batch, n_kv, group_size, qt, 1), _NEG_INF, dtype=mx.float32)
-        denom = mx.zeros((batch, n_kv, group_size, qt, 1), dtype=mx.float32)
-        acc = mx.zeros((batch, n_kv, group_size, qt, head_dim), dtype=mx.float32)
+        state_shape = (batch, n_kv, group_size, qt, 1)
+        if sinks is None:
+            m = mx.full(state_shape, _NEG_INF, dtype=mx.float32)
+            denom = mx.zeros(state_shape, dtype=mx.float32)
+        else:
+            sink_logits = sinks.astype(mx.float32).reshape(1, n_kv, group_size, 1, 1)
+            m = mx.broadcast_to(sink_logits, state_shape)
+            denom = mx.ones(state_shape, dtype=mx.float32)
+        acc = mx.zeros((batch, n_kv, group_size, qt, value_dim), dtype=mx.float32)
 
         kv_end = min(qi1 + offset, k_len) if causal else k_len
         for kj0 in range(0, kv_end, _KV_TILE):
@@ -390,28 +461,61 @@ def _flash_sdpa256(queries, keys, values, scale, mask):
             vb = vr[:, :, :, kj0:kj1, :].astype(mx.float32)
             kt = kj1 - kj0
 
-            s = (qb @ mx.swapaxes(kb, -1, -2)) * scale
+            scores = (qb @ mx.swapaxes(kb, -1, -2)) * scale
             if causal:
                 k_pos = mx.arange(kj0, kj1).reshape(1, 1, 1, 1, kt)
-                s = mx.where(k_pos > q_pos, _NEG_INF, s)
-            elif bool_mask is not None:
-                s = mx.where(bool_mask[..., qi0:qi1, kj0:kj1], s, _NEG_INF)
+                scores = mx.where(k_pos > q_pos, _NEG_INF, scores)
+            elif array_mask is not None:
+                tile_mask = array_mask[..., qi0:qi1, kj0:kj1]
+                if tile_mask.dtype == mx.bool_:
+                    scores = mx.where(tile_mask, scores, _NEG_INF)
+                else:
+                    scores = scores + tile_mask.astype(mx.float32)
 
-            m_tile = mx.max(s, axis=-1, keepdims=True)
-            m_new = mx.maximum(m, m_tile)
-            p = mx.exp(s - m_new)
-            corr = mx.exp(m - m_new)
-            denom = denom * corr + mx.sum(p, axis=-1, keepdims=True)
-            acc = acc * corr + (p @ vb)
-            m = m_new
-            mx.eval(m, denom, acc)  # bound the live graph -> O(L) peak
+            tile_max = mx.max(scores, axis=-1, keepdims=True)
+            new_max = mx.maximum(m, tile_max)
+            probabilities = mx.exp(scores - new_max)
+            correction = mx.exp(m - new_max)
+            denom = denom * correction + mx.sum(probabilities, axis=-1, keepdims=True)
+            acc = acc * correction + (probabilities @ vb)
+            m = new_max
+            mx.eval(m, denom, acc)
 
         out_tile = (acc / denom).astype(queries.dtype)
         mx.eval(out_tile)
         out_q_tiles.append(out_tile)
 
     out = mx.concatenate(out_q_tiles, axis=3)
-    return out.reshape(batch, n_q, q_len, head_dim)
+    return out.reshape(batch, n_q, q_len, value_dim)
+
+
+def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
+    """Use MLX 0.32.2 native fused SDPA on Metal, portable tiling elsewhere.
+
+    Explicit array masks never take the native fused call: MLX's fused
+    array-mask support is unproven and may silently fall back to the
+    unfused fp32 score matrix, which is exactly the O(L^2) spike this patch
+    exists to bound. The array-tiled implementation already handles bool and
+    additive masks, so route them there directly. ``OMLX_SDPA256_FUSED=0``
+    skips the native call unconditionally (rollback lever for this tier)."""
+    if isinstance(mask, mx.array):
+        return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
+    native_shape = values.shape[-1] == HEAD_DIM and not (
+        isinstance(mask, str)
+        and mask == "causal"
+        and queries.shape[-2] > keys.shape[-2]
+    )
+    if _FUSED_ENABLED and mx.metal.is_available() and native_shape:
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            sinks=sinks,
+            force_fused=True,
+        )
+    return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
 
 
 def _unfused_qsplit_sdpa(
@@ -431,7 +535,9 @@ def _unfused_qsplit_sdpa(
     sub-tile's true global offset -- so no manual position masking is
     needed. This also does less wasted compute than a single full call:
     each sub-tile's GEMM only covers the KV prefix its own causal window
-    can see, not the full kv_len every time.
+    can see, not the full kv_len every time. Sink logits are per-row
+    constants independent of the query axis split, so softmax rows stay
+    exact across sub-calls when ``sinks`` is set.
 
     Memory: each sub-tile's keys/values window grows with ``qi1`` (a later
     sub-tile sees a wider causal prefix than an earlier one), so without
@@ -488,27 +594,25 @@ def _should_route(queries, keys, cache, mask, sinks) -> tuple[str, int]:
             return _ROUTE_UNFUSED, 0
         if keys.shape[-2] < _SDPA256_MIN_KV_LEN:
             return _ROUTE_UNFUSED, 0
-        if sinks is not None:
-            return _ROUTE_UNFUSED, 0
         # Quantized KV cache (TurboQuant etc.): keys/values are packed state,
         # not plain [.., kv, hd] arrays. MLX's own dispatcher detects this via
         # hasattr(cache, "bits"); let the quant-aware path handle it.
         if cache is not None and hasattr(cache, "bits"):
             return _ROUTE_UNFUSED, 0
-        # Boolean array masks are routable: Qwen4-Exp QSA replaces the
-        # "causal" string with a [B, 1, L, T] block-sparse bool mask on
-        # every long-context prefill, which previously forced the stock
-        # unfused O(L*T) fallback here — the head_dim-256 memory wall this
-        # patch exists to fix, resurfacing through the mask gate. The
-        # q-split route row-slices such masks; the tiled route applies them
-        # per (q, kv) tile. Additive float masks stay unroutable (nothing
-        # on the hd-256 prefill path emits them; keeping them out narrows
-        # the blast radius of this process-wide wrapper).
-        mask_is_bool = isinstance(mask, mx.array) and mask.dtype == mx.bool_
+        # Array masks are routable: Qwen4-Exp QSA replaces the "causal"
+        # string with a [B, 1, L, T] block-sparse bool mask on every
+        # long-context prefill, which previously forced the stock unfused
+        # O(L*T) fallback here — the head_dim-256 memory wall this patch
+        # exists to fix, resurfacing through the mask gate. The bounded
+        # route's array-tiled fallback applies bool or additive masks per
+        # (q, kv) tile; the native fused kernel refuses array masks
+        # entirely (see _flash_sdpa256). q-split is never used with an
+        # array mask (see the note on ``allow_qsplit`` below).
+        is_array_mask = isinstance(mask, mx.array)
         if not (
             mask is None
             or (isinstance(mask, str) and mask == "causal")
-            or mask_is_bool
+            or (is_array_mask and 1 <= mask.ndim <= 4)
         ):
             return _ROUTE_UNFUSED, 0
         n_q = queries.shape[-3]
@@ -528,12 +632,13 @@ def _should_route(queries, keys, cache, mask, sinks) -> tuple[str, int]:
         # full-attention layers -- each layer's ratchet is independently
         # self-consistent (kv_len is still monotone per-layer), just not a
         # single request-wide floor (docs/qwen35-hardening-and-optimization.md
-        # E5). ``cache._sdpa256_q_sub_ceiling = 0`` (tiled) is a latch that's
-        # never cleared once set, which is intentional, not a leak: memory
-        # pressure that forced tiled doesn't spontaneously relax within a
-        # request, and the cache (hence the latch) dies with the request.
+        # E5). ``cache._sdpa256_q_sub_ceiling = 0`` (bounded) is a latch
+        # that's never cleared once set, which is intentional, not a leak:
+        # memory pressure that forced the bounded route doesn't
+        # spontaneously relax within a request, and the cache (hence the
+        # latch) dies with the request.
         ceiling = getattr(cache, "_sdpa256_q_sub_ceiling", None)
-        # Bool-array masks (QSA) must never take q-split: unlike the causal
+        # Array masks (QSA) must never take q-split: unlike the causal
         # route, array-mask sub-calls cannot narrow keys/values to a causal
         # end, so each sub-call still materializes an n_q x q_sub x kv_len
         # slab — and the hysteresis ratchet walks q_sub DOWN between calls,
@@ -541,18 +646,18 @@ def _should_route(queries, keys, cache, mask, sinks) -> tuple[str, int]:
         # cannot reuse. Measured live (Qwen3.8-Flash 40k probe): +7.3GB pool
         # growth by kv_len=14336 and a pre-chunk guard rejection at 14k —
         # worse than the unfused O(L*T) wall it replaced. Unfused (single
-        # reusable slab) when it fits, else straight to tiled (uniform
-        # O(tile) buffers), nothing in between.
+        # reusable slab) when it fits, else straight to bounded (uniform
+        # O(tile) buffers or the native fused kernel), nothing in between.
         route, q_sub = _route_decision(
             queries,
             keys,
             cache,
             q_sub_ceiling=ceiling,
-            allow_qsplit=not mask_is_bool,
+            allow_qsplit=not is_array_mask,
         )
         if cache is not None:
             try:
-                if route == _ROUTE_TILED:
+                if route == _ROUTE_BOUNDED:
                     cache._sdpa256_q_sub_ceiling = 0
                 elif route == _ROUTE_QSPLIT:
                     cache._sdpa256_q_sub_ceiling = (
@@ -565,15 +670,36 @@ def _should_route(queries, keys, cache, mask, sinks) -> tuple[str, int]:
         return _ROUTE_UNFUSED, 0
 
 
+def _register_bounded_route(min_kv_len: int) -> bool:
+    """Publish only a runtime guarantee that is actually enabled."""
+    if _FORCE_TILED is False:
+        return False
+    try:
+        from .. import memory_monitor
+
+        memory_monitor.register_tiled_prefill_head_dim(
+            HEAD_DIM,
+            min_query_len=_SDPA256_MIN_Q_LEN,
+            min_kv_len=min_kv_len,
+            kv_tile=_KV_TILE,
+            supports_array_mask=True,
+        )
+    except Exception:
+        logger.debug("could not register sdpa256 with memory_monitor", exc_info=True)
+        return False
+    return True
+
+
 def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool:
     """Monkey-patch mlx-lm's scaled_dot_product_attention for head_dim=256
     long-context prefill, and register the O(L) cost with the memory monitor."""
-    global _PATCHED, _SDPA256_MIN_KV_LEN, _FORCE_TILED, _QSPLIT_ENABLED
+    global _PATCHED, _SDPA256_MIN_KV_LEN, _FORCE_TILED, _QSPLIT_ENABLED, _FUSED_ENABLED
     if _PATCHED:
         return False
     _SDPA256_MIN_KV_LEN = min_kv_len
     _FORCE_TILED = _parse_force_tiled_env()
     _QSPLIT_ENABLED = _parse_qsplit_env()
+    _FUSED_ENABLED = _parse_fused_env()
 
     try:
         from mlx_lm.models import base as mlx_base
@@ -598,8 +724,8 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
                     queries, keys, values, cache, scale, mask, sinks,
                     original_sdpa, q_sub,
                 )
-            if route == _ROUTE_TILED:
-                return _flash_sdpa256(queries, keys, values, scale, mask)
+            if route == _ROUTE_BOUNDED:
+                return _flash_sdpa256(queries, keys, values, scale, mask, sinks)
         except Exception:
             logger.warning(
                 "sdpa256 prefill kernel failed; falling back to MLX SDPA",
@@ -655,8 +781,10 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
                             queries, keys, values, cache, scale, mask, sinks,
                             original_vlm_sdpa, q_sub,
                         )
-                    if route == _ROUTE_TILED:
-                        return _flash_sdpa256(queries, keys, values, scale, mask)
+                    if route == _ROUTE_BOUNDED:
+                        return _flash_sdpa256(
+                            queries, keys, values, scale, mask, sinks
+                        )
                 except Exception:
                     logger.warning(
                         "sdpa256 prefill kernel failed; falling back to "
@@ -678,24 +806,23 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
                     mod.scaled_dot_product_attention = patched_vlm_sdpa
 
     # Keep the prefill memory guard in lockstep: tell the monitor head_dim 256
-    # prefill is now O(L), so it stops charging the O(L^2) score matrix.
-    try:
-        from .. import memory_monitor
-
-        memory_monitor.register_tiled_prefill_head_dim(
-            HEAD_DIM, min_kv_len=min_kv_len, kv_tile=_KV_TILE
-        )
-    except Exception:
-        logger.debug("could not register sdpa256 with memory_monitor", exc_info=True)
+    # prefill is now O(L), so it stops charging the O(L^2) score matrix. The
+    # explicit benchmark override disables this guarantee, so registering it
+    # in that mode would under-estimate the same unfused path the user forced.
+    _register_bounded_route(min_kv_len)
 
     _PATCHED = True
     if _FORCE_TILED is None:
         qsplit_note = "q-split then " if _QSPLIT_ENABLED else ""
-        routing = f"{qsplit_note}tiled only when unfused exceeds guard headroom"
+        fused_note = "" if _FUSED_ENABLED else " (native fused kernel disabled)"
+        routing = (
+            f"{qsplit_note}bounded only when unfused exceeds guard "
+            f"headroom{fused_note}"
+        )
     elif _FORCE_TILED:
-        routing = "always tiled (OMLX_SDPA256_TILED=1)"
+        routing = "always force bounded (OMLX_SDPA256_TILED=1)"
     else:
-        routing = "never tiled or q-split (OMLX_SDPA256_TILED=0)"
+        routing = "never bounded or q-split (OMLX_SDPA256_TILED=0)"
     logger.info(
         "sdpa256 attention patch applied (head_dim=256 prefill, kv_len>=%d, %s)",
         min_kv_len,

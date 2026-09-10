@@ -445,6 +445,9 @@ def apply() -> bool:
         def patched_bg_next(self, *args, **kwargs):
             gen_batch = getattr(self, "_generation_batch", None)
             if gen_batch is not None:
+                # Reconcile runs on GenerationBatch, which upstream creates
+                # without the owning generator's prefill configuration.
+                gen_batch.prefill_step_size = getattr(self, "prefill_step_size", 512)
                 gen_batch._omlx_mtp_activation_safe = (
                     _batch_generator_allows_mtp_activation(self)
                 )
@@ -1251,6 +1254,7 @@ def _make_row_batch(
     next_logprobs = getattr(gen_batch, "_next_logprobs", None)
     row = SimpleNamespace(
         model=gen_batch.model,
+        prefill_step_size=getattr(gen_batch, "prefill_step_size", 512),
         uids=[gen_batch.uids[idx]],
         prompt_cache=prompt_cache,
         tokens=[gen_batch.tokens[idx]],
@@ -1437,7 +1441,13 @@ def _set_singleton_mrope_delta(gen_batch: Any) -> None:
         import mlx.core as mx
 
         delta = model._uid_rope_deltas.get(uids[0], 0.0)
-        model.set_batch_rope_deltas(mx.array([delta]))
+        # uid-aware seam keeps a text-proven request on Qwen4's rank-two
+        # positions for the verify window (gathered-QSA eligibility).
+        step_setter = getattr(type(model), "set_step_rope_deltas", None)
+        if callable(step_setter):
+            step_setter(model, mx.array([delta]), list(uids))
+        else:
+            model.set_batch_rope_deltas(mx.array([delta]))
 
 
 def _rebuild_singleton_cache(model: Any) -> Optional[List[Any]]:
@@ -3418,7 +3428,16 @@ def _chain_rollback(
         except Exception as exc:
             logger.debug("rollback_speculative_cache failed: %s", exc)
             return False
-    rollback = getattr(model, "mtp_partial_rollback", None)
+    # VLM adapters keep the rollback hook on the inner language model.
+    rollback = None
+    for candidate in (
+        model,
+        getattr(model, "language_model", None),
+        getattr(model, "_language_model", None),
+    ):
+        rollback = getattr(candidate, "mtp_partial_rollback", None)
+        if callable(rollback):
+            break
     if callable(rollback):
         try:
             return bool(rollback(prompt_cache, accepted, num_drafts))
