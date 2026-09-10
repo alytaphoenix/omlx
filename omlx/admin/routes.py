@@ -2661,20 +2661,19 @@ async def update_model_settings(
         enabled = bool(request.qwen35_ane_prefill_enabled)
         config_type = str(getattr(entry, "config_model_type", "") or "")
         config_type = config_type.lower().replace("-", "_")
-        if enabled and not config_type.startswith(
-            ("qwen3_5", "qwen3_6", "qwen3_8")
-        ):
+        if enabled and ane_backend is None:
             raise HTTPException(
                 status_code=400,
-                detail="ANE prefill is available only for Qwen3.5/3.6/3.8 models.",
+                detail="ANE prefill is unavailable for this model.",
             )
-        # The prefix check above lets MoE variants (qwen3_5_moe, ...) slip
-        # through, but the ANE patch offloads *dense* MLPs only — on a MoE
-        # model it silently corrupts output while running at plausible
-        # speed (verified live: pure "!!!" garbage on any prompt long
-        # enough to engage the fixed-shape ANE path, with the corrupted
-        # prefill then persisted into the SSD prefix cache).
-        if enabled and "moe" in config_type:
+        # The qwen backend's family match lets MoE variants (qwen3_5_moe,
+        # ...) slip through, but the ANE patch offloads *dense* MLPs only —
+        # on a MoE model it silently corrupts output while running at
+        # plausible speed (verified live: pure "!!!" garbage on any prompt
+        # long enough to engage the fixed-shape ANE path, with the corrupted
+        # prefill then persisted into the SSD prefix cache). The k2 backend
+        # has no MoE variant, so this is scoped to qwen only.
+        if enabled and ane_backend == "qwen" and "moe" in config_type:
             raise HTTPException(
                 status_code=400,
                 detail=(

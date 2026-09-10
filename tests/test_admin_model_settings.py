@@ -362,7 +362,7 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
     entry.config_model_type = "gemma4"
 
     with pytest.raises(
-        admin_routes.HTTPException, match="ANE prefill is available only for"
+        admin_routes.HTTPException, match="ANE prefill is unavailable"
     ):
         await _update_settings(
             pool,

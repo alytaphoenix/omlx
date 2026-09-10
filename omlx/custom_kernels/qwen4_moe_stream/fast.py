@@ -36,7 +36,7 @@ def _verify_abi() -> bool:
     """One-shot nanobind-ABI canary: pass an mx.array through the native
     boundary. A mismatched nanobind isolates the ``mlx`` NB_DOMAIN and this
     raises, so we disable the native path instead of risking a hard crash."""
-    global _ABI_OK
+    global _ABI_OK, _IMPORT_ERROR
     if _ABI_OK is not None:
         return _ABI_OK
     if _ext is None:
@@ -50,6 +50,7 @@ def _verify_abi() -> bool:
     except Exception as exc:  # noqa: BLE001
         logger.warning("qwen4_moe_stream ABI probe failed; disabling: %s", exc)
         _ABI_OK = False
+        _IMPORT_ERROR = exc
     return _ABI_OK
 
 

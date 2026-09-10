@@ -71,7 +71,7 @@ def test_bool_mask_uses_tiled_sdpa_and_matches_dense(monkeypatch):
     mask[..., 64:] = True
     mx.eval(queries, keys, values, mask)
 
-    assert sdpa256._should_route(queries, keys, None, mask, None) is True
+    assert sdpa256._should_route(queries, keys, None, mask, None) == ("bounded", 0)
     tiled = sdpa256._flash_sdpa256(queries, keys, values, 256**-0.5, mask)
     dense = mx.fast.scaled_dot_product_attention(
         queries, keys, values, scale=256**-0.5, mask=mask
