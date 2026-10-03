@@ -116,4 +116,8 @@ class TestSsdCacheClearFallbackSweep:
         ):
             result = _run_clear()
 
-        assert result == {"status": "ok", "total_deleted": 0}
+        assert result == {
+            "status": "ok",
+            "total_deleted": 0,
+            "distributed_ranks": 0,
+        }

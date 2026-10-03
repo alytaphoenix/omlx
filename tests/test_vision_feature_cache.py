@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for VisionFeatureSSDCache (memory LRU + SSD persistence)."""
 
+import logging
 import os
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -41,6 +43,21 @@ def ssd_cache(tmp_cache_dir):
     )
     yield cache
     cache.close()
+
+
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def _write_finished(cache, image_hash, model_name):
+    key = _composite_key(model_name, image_hash)
+    with cache._pending_lock:
+        return key not in cache._pending_write_keys
 
 
 class TestCompositeKey:
@@ -145,8 +162,7 @@ class TestSSDCache:
         mx.eval(features)
         ssd_cache.put("img_hash", "model_a", features)
 
-        # Wait for background writer
-        time.sleep(0.5)
+        assert _wait_until(lambda: _write_finished(ssd_cache, "img_hash", "model_a"))
 
         # Clear memory cache to force SSD read
         with ssd_cache._memory_lock:
@@ -161,7 +177,8 @@ class TestSSDCache:
         mx.eval(features)
         ssd_cache.put("img_hash", "model_a", features)
 
-        time.sleep(0.5)
+        file_path = ssd_cache._file_path_for_key(_composite_key("model_a", "img_hash"))
+        assert _wait_until(file_path.exists)
 
         # Check safetensors file exists
         safetensors_files = list(tmp_cache_dir.rglob("*.safetensors"))
@@ -182,7 +199,10 @@ class TestSSDCache:
             features = mx.ones((4, 8))
             mx.eval(features)
             ssd_cache.put("img_hash", "model_a", features)
-            time.sleep(0.5)
+            file_path = ssd_cache._file_path_for_key(
+                _composite_key("model_a", "img_hash")
+            )
+            assert _wait_until(file_path.exists)
 
         safetensors_files = list(tmp_cache_dir.rglob("*.safetensors"))
         assert len(safetensors_files) == 1
@@ -194,7 +214,8 @@ class TestSSDCache:
         features = mx.ones((4, 8))
         mx.eval(features)
         cache1.put("img_hash", "model_a", features)
-        time.sleep(0.5)
+        file_path = cache1._file_path_for_key(_composite_key("model_a", "img_hash"))
+        assert _wait_until(file_path.exists)
         cache1.close()
 
         # Phase 2: create new cache instance — should scan existing files
@@ -220,7 +241,9 @@ class TestSSDCache:
             mx.eval(f)
             cache.put(f"img_{i}", "model", f)
 
-        time.sleep(0.5)
+        assert _wait_until(
+            lambda: all(_write_finished(cache, f"img_{i}", "model") for i in range(3))
+        )
 
         # SSD index should have evicted older entries
         assert cache._ssd_total_size <= 100 or len(cache._ssd_index) <= 1
@@ -230,7 +253,8 @@ class TestSSDCache:
         features = mx.ones((4, 8))
         mx.eval(features)
         ssd_cache.put("img_hash", "model_a", features)
-        time.sleep(0.5)
+        file_path = ssd_cache._file_path_for_key(_composite_key("model_a", "img_hash"))
+        assert _wait_until(file_path.exists)
 
         # Clear memory cache
         with ssd_cache._memory_lock:
@@ -320,6 +344,67 @@ class TestSSDCache:
 
         assert not bad_file.exists()
 
+    @pytest.mark.parametrize("operation", ["evict", "load"])
+    def test_cleanup_unlink_failure(self, ssd_cache, caplog, operation):
+        key = _composite_key("model", "image")
+        ssd_cache.put("image", "model", mx.ones((2, 2)))
+        assert _wait_until(lambda: _write_finished(ssd_cache, "image", "model"))
+        file_path = ssd_cache._ssd_index[key].file_path
+        assert file_path.exists()
+
+        with patch.object(Path, "unlink", side_effect=OSError("unlink denied")):
+            if operation == "evict":
+                with ssd_cache._ssd_lock:
+                    ssd_cache._max_size_bytes = 0
+                    ssd_cache._evict_ssd_if_needed()
+                message = "Failed to remove evicted vision cache file"
+            else:
+                file_path.write_bytes(b"corrupted")
+                with ssd_cache._memory_lock:
+                    ssd_cache._memory_cache.clear()
+                assert ssd_cache.get("image", "model") is None
+                message = "Failed to remove unusable vision cache file"
+
+        assert key not in ssd_cache._ssd_index
+        assert ssd_cache._ssd_total_size == 0
+        assert file_path.exists()
+        assert any(
+            r.levelno == logging.WARNING
+            and message in r.getMessage()
+            and str(file_path) in r.getMessage()
+            and "unlink denied" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_writer_cleanup_unlink_failure(self, ssd_cache, caplog):
+        key = _composite_key("model", "image")
+        file_path = ssd_cache._file_path_for_key(key)
+        temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+
+        def fail_write(path, *args):
+            Path(path).write_bytes(b"partial")
+            file_path.write_bytes(b"old")
+            raise OSError("write failed")
+
+        with (
+            patch.object(vfc_mod, "_write_safetensors_no_mx", side_effect=fail_write),
+            patch.object(Path, "unlink", side_effect=OSError("unlink denied")),
+        ):
+            ssd_cache.put("image", "model", mx.ones((2, 2)))
+            assert _wait_until(lambda: _write_finished(ssd_cache, "image", "model"))
+
+        assert key not in ssd_cache._ssd_index
+        assert ssd_cache._ssd_total_size == 0
+        for path in (temp_path, file_path):
+            assert path.exists()
+            assert any(
+                r.levelno == logging.WARNING
+                and "Failed to clean up vision cache file" in r.getMessage()
+                and str(path) in r.getMessage()
+                and "unlink denied" in r.getMessage()
+                for r in caplog.records
+            )
+
     def test_close_flushes_writes(self, tmp_cache_dir):
         cache = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
         features = mx.ones((4, 8))
@@ -359,7 +444,8 @@ class TestMultiTensorFeatures:
         for f in features:
             mx.eval(f)
         ssd_cache.put("multi_img", "model", features)
-        time.sleep(0.5)
+        file_path = ssd_cache._file_path_for_key(_composite_key("model", "multi_img"))
+        assert _wait_until(file_path.exists)
 
         # Clear memory to force SSD load
         with ssd_cache._memory_lock:
@@ -621,3 +707,45 @@ class TestVLMEngineIntegration:
             "mm_token_type_ids": mm_token_type_ids,
             "token_type_ids": token_type_ids,
         }
+
+
+class TestMemoryByteLRU:
+    """Byte-budgeted memory LRU (sessions with 20+ screenshots must not
+    evict their own hot set every turn)."""
+
+    def test_evicts_by_bytes(self):
+        # 32-byte entries (16 bf16), budget for exactly 3.
+        cache = VisionFeatureSSDCache(
+            cache_dir=None,
+            max_memory_entries=1000,
+            max_memory_bytes=3 * 32,
+        )
+        try:
+            for i, h in enumerate(["h0", "h1", "h2", "h3"]):
+                cache.put(h, "m", mx.zeros((16,), dtype=mx.bfloat16))
+            assert cache.get("h0", "m") is None
+            assert cache.get("h1", "m") is not None
+            assert cache.get("h3", "m") is not None
+            assert cache._memory_bytes == 3 * 32
+        finally:
+            cache.close()
+
+    def test_overwrite_reaccounts_bytes(self):
+        cache = VisionFeatureSSDCache(
+            cache_dir=None,
+            max_memory_entries=1000,
+            max_memory_bytes=2 * 32,
+        )
+        try:
+            cache.put("h0", "m", mx.zeros((16,), dtype=mx.bfloat16))
+            # Growing the same entry past budget must not double-count.
+            cache.put("h0", "m", mx.zeros((32,), dtype=mx.bfloat16))
+            assert cache._memory_bytes == 64
+            assert cache.get("h0", "m") is not None
+            cache.put("h1", "m", mx.zeros((16,), dtype=mx.bfloat16))
+            # Budget 64: h0(64)+h1(32) overflows -> oldest (h0) evicted.
+            assert cache._memory_bytes == 32
+            assert cache.get("h0", "m") is None
+            assert cache.get("h1", "m") is not None
+        finally:
+            cache.close()
