@@ -4,7 +4,7 @@
 import json
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_serializer, model_validator
 
 from .shared_models import IDPrefix, generate_id, get_unix_timestamp
 
@@ -41,15 +41,16 @@ class InputItem(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _serialize_complex_output(cls, data: Any) -> Any:
-        """Serialize list/dict output to JSON string for compatibility.
+        """Serialize dict output to JSON string for compatibility.
 
-        Agent frameworks may send multimodal tool outputs (e.g. images) as
-        lists or dicts. Convert them to JSON strings so downstream code that
-        expects ``str`` keeps working.
+        Agent frameworks may send dict tool outputs. Convert them to JSON
+        strings so downstream code that expects ``str`` keeps working. List
+        outputs pass through unchanged so multimodal parts (e.g. images)
+        stay extractable for VLM processing during message conversion.
         """
         if isinstance(data, dict):
             output = data.get("output")
-            if isinstance(output, (list, dict)):
+            if isinstance(output, dict):
                 data = {**data, "output": json.dumps(output)}
         return data
 
@@ -165,8 +166,19 @@ class OutputItem(BaseModel):
     call_id: Optional[str] = None
     name: Optional[str] = None
     arguments: Optional[str] = None
+    # Set when the call came from a "namespace" tool group; clients resolve
+    # such a call by (namespace, name).
+    namespace: Optional[str] = None
     # reasoning fields
     summary: Optional[List[ReasoningSummaryPart]] = None
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_namespace(self, handler):
+        """Keep ``namespace`` off the items that have none; other fields as-is."""
+        data = handler(self)
+        if data.get("namespace") is None:
+            data.pop("namespace", None)
+        return data
 
 
 class InputTokensDetails(BaseModel):
