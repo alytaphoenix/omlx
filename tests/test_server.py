@@ -1162,16 +1162,22 @@ class TestExposedProfileModels:
         _base_id, merged = manager.get_exposed_profile_runtime_settings_for_request(
             "qwen-base:thinking"
         )
-        expected_signature = pool._engine_runtime_signature("qwen-base", merged)
-        pool._entries["qwen-base"] = EngineEntry(
+        entry = EngineEntry(
             model_id="qwen-base",
             model_path="/fake/qwen-base",
             model_type="vlm",
             engine_type="vlm",
             estimated_size=1,
             engine=object(),
-            runtime_settings_signature=expected_signature,
         )
+        pool._entries["qwen-base"] = entry
+        # The runtime signature includes entry-derived forced-offload keys
+        # (qwen4_ple_ssd_offload, deepseek_v41_engram_ssd_offload, ...) that
+        # are only appended when the entry is resident, so it must be
+        # snapshotted after registration -- the same order production uses
+        # (entry exists, engine built, signature paired with the engine).
+        expected_signature = pool._engine_runtime_signature("qwen-base", merged)
+        entry.runtime_settings_signature = expected_signature
         server_module._server_state.engine_pool = pool
 
         status = server_module._with_exposed_profile_status(
