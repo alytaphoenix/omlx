@@ -28,6 +28,7 @@ from omlx.api.responses_utils import (
     convert_stored_response_to_messages,
     format_sse_event,
     normalize_response_output_to_messages,
+    split_namespace_tool_name,
 )
 from omlx.api.shared_models import IDPrefix, generate_id
 
@@ -370,7 +371,7 @@ class TestConvertResponsesInput:
                 ],
             ),
         ]
-        messages = convert_responses_input_to_messages(items)
+        messages = convert_responses_input_to_messages(items, preserve_images=True)
         content = messages[0]["content"]
         # Content should be a list (not flattened to string) when images present
         assert isinstance(content, list)
@@ -393,11 +394,26 @@ class TestConvertResponsesInput:
                 ],
             ),
         ]
-        messages = convert_responses_input_to_messages(items)
+        messages = convert_responses_input_to_messages(items, preserve_images=True)
         content = messages[0]["content"]
         assert isinstance(content, list)
         assert content[1]["image_url"] == "https://example.com/img.png"
         assert content[1]["detail"] == "auto"  # default
+
+    def test_input_image_dropped_without_preserve_images(self):
+        """Text engines get a string, as /v1/chat/completions does (#4069)."""
+        items = [
+            InputItem(
+                type="message",
+                role="user",
+                content=[
+                    {"type": "input_text", "text": "Reply OK."},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+                ],
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert messages[0]["content"] == "Reply OK."
 
     def test_text_only_content_parts_flattened(self):
         """Content with only text parts should still be flattened to string."""
@@ -538,6 +554,126 @@ class TestConvertResponsesInput:
         assert messages[0]["reasoning_content"] == "thinking"
 
 
+IMAGE_URI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+
+
+class TestFunctionCallOutputMultimodal:
+    """Images in function_call_output lists route to VLM, not the prompt (#2989)."""
+
+    def _tool_round(self, outputs):
+        items = [InputItem(type="message", role="user", content="take screenshots")]
+        for i in range(len(outputs)):
+            items.append(
+                InputItem(
+                    type="function_call",
+                    call_id=f"call_{i}",
+                    name="screenshot",
+                    arguments="{}",
+                )
+            )
+        for i, output in enumerate(outputs):
+            items.append(
+                InputItem(
+                    type="function_call_output",
+                    call_id=f"call_{i}",
+                    output=output,
+                )
+            )
+        return items
+
+    def test_image_extracted_to_user_message(self):
+        output = [
+            {"type": "input_text", "text": "screenshot result"},
+            {"type": "input_image", "detail": "auto", "image_url": IMAGE_URI},
+        ]
+        messages = convert_responses_input_to_messages(
+            self._tool_round([output]), preserve_images=True
+        )
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool", "user"]
+        assert messages[2]["content"] == "screenshot result"
+        assert messages[3]["content"] == [
+            {"type": "input_image", "image_url": IMAGE_URI, "detail": "auto"}
+        ]
+
+    def test_parallel_outputs_keep_tool_messages_contiguous(self):
+        output = [
+            {"type": "input_text", "text": "shot"},
+            {"type": "input_image", "detail": "auto", "image_url": IMAGE_URI},
+        ]
+        messages = convert_responses_input_to_messages(
+            self._tool_round([output, output]), preserve_images=True
+        )
+        # Images flush once after the tool run, never between tool messages
+        assert [m["role"] for m in messages] == [
+            "user",
+            "assistant",
+            "tool",
+            "tool",
+            "user",
+        ]
+        assert len(messages[4]["content"]) == 2
+        for msg in messages[2:4]:
+            assert IMAGE_URI not in msg["content"]
+
+    def test_images_flush_before_next_tool_round(self):
+        items = self._tool_round(
+            [[{"type": "input_image", "detail": "auto", "image_url": IMAGE_URI}]]
+        )
+        items.extend(
+            [
+                InputItem(
+                    type="function_call",
+                    call_id="call_next",
+                    name="lookup",
+                    arguments="{}",
+                ),
+                InputItem(
+                    type="function_call_output",
+                    call_id="call_next",
+                    output="done",
+                ),
+            ]
+        )
+        messages = convert_responses_input_to_messages(items, preserve_images=True)
+        assert [m["role"] for m in messages] == [
+            "user",
+            "assistant",
+            "tool",
+            "user",
+            "assistant",
+            "tool",
+        ]
+        assert messages[3]["content"][0]["type"] == "input_image"
+        assert messages[5]["content"] == "done"
+
+    def test_placeholder_without_preserve_images(self):
+        output = [
+            {"type": "input_text", "text": "screenshot result"},
+            {"type": "input_image", "detail": "auto", "image_url": IMAGE_URI},
+        ]
+        messages = convert_responses_input_to_messages(self._tool_round([output]))
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool"]
+        assert messages[2]["content"] == "screenshot result\n(see attached image)"
+        assert IMAGE_URI not in json.dumps(messages)
+
+    def test_plain_json_list_falls_back_to_dumps(self):
+        messages = convert_responses_input_to_messages(
+            self._tool_round([[1, 2, 3]]), preserve_images=True
+        )
+        assert messages[2]["content"] == "[1, 2, 3]"
+        messages = convert_responses_input_to_messages(
+            self._tool_round([["a", "b"]]), preserve_images=True
+        )
+        assert messages[2]["content"] == '["a", "b"]'
+
+    def test_text_only_typed_list_extracted(self):
+        messages = convert_responses_input_to_messages(
+            self._tool_round([[{"type": "input_text", "text": "hello"}]]),
+            preserve_images=True,
+        )
+        assert messages[2]["content"] == "hello"
+
+
 # =============================================================================
 # Tool Conversion Tests
 # =============================================================================
@@ -598,6 +734,102 @@ class TestConvertResponsesTools:
         result = convert_responses_tools(tools)
         assert result is None
 
+    def test_namespace_tools_are_expanded(self):
+        """Namespace groups hold client-executed function tools (#3371)."""
+        aliases = {}
+        tools = [
+            ResponsesTool(
+                type="namespace",
+                name="mcp__demo__",
+                description="Demo MCP server",
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "description": "Get the current weather for a city.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    },
+                    {"type": "function", "name": "get_time"},
+                ],
+            )
+        ]
+        result = convert_responses_tools(tools, aliases)
+        assert result is not None
+        # Wire names join the namespace like Codex's join_tool_name().
+        assert [t["function"]["name"] for t in result] == [
+            "mcp__demo__get_weather",
+            "mcp__demo__get_time",
+        ]
+        assert result[0]["type"] == "function"
+        assert result[0]["function"]["description"] == (
+            "Get the current weather for a city."
+        )
+        assert result[0]["function"]["parameters"]["required"] == ["city"]
+        assert aliases == {
+            "mcp__demo__get_weather": ("mcp__demo__", "get_weather"),
+            "mcp__demo__get_time": ("mcp__demo__", "get_time"),
+        }
+
+    def test_namespace_wire_name_survives_collision(self):
+        """A flat tool already holding the joined name must not be shadowed."""
+        aliases = {}
+        tools = [
+            ResponsesTool(type="function", name="mcp__demo__get_weather"),
+            ResponsesTool(
+                type="namespace",
+                name="mcp__demo__",
+                tools=[{"type": "function", "name": "get_weather"}],
+            ),
+        ]
+        result = convert_responses_tools(tools, aliases)
+        assert [t["function"]["name"] for t in result] == [
+            "mcp__demo__get_weather",
+            "mcp__demo__get_weather_2",
+        ]
+        assert aliases == {"mcp__demo__get_weather_2": ("mcp__demo__", "get_weather")}
+
+    def test_split_namespace_tool_name(self):
+        aliases = {"mcp__demo__get_weather": ("mcp__demo__", "get_weather")}
+        assert split_namespace_tool_name("mcp__demo__get_weather", aliases) == (
+            "mcp__demo__",
+            "get_weather",
+        )
+        # Flat calls, and calls the model invented, pass through unchanged.
+        assert split_namespace_tool_name("get_weather", aliases) == (
+            None,
+            "get_weather",
+        )
+        assert split_namespace_tool_name("get_weather") == (None, "get_weather")
+
+    def test_namespace_serializes_only_when_set(self):
+        namespaced = build_function_call_output_item(
+            name="get_weather",
+            arguments='{"city": "Paris"}',
+            call_id="call_1",
+            namespace="mcp__demo__",
+        ).model_dump()
+        assert namespaced["name"] == "get_weather"
+        assert namespaced["namespace"] == "mcp__demo__"
+        flat = build_function_call_output_item(
+            name="get_weather", arguments="{}", call_id="call_2"
+        ).model_dump()
+        assert "namespace" not in flat
+        # Other optional fields keep serializing as null, as before.
+        assert flat["role"] is None and flat["summary"] is None
+
+    def test_namespace_without_usable_members_contributes_nothing(self):
+        tools = [
+            ResponsesTool(type="namespace", name="empty__"),
+            ResponsesTool(type="namespace", name="junk__", tools=["not-a-tool"]),
+            ResponsesTool(type="function", name="fn_a"),
+        ]
+        result = convert_responses_tools(tools)
+        assert [t["function"]["name"] for t in result] == ["fn_a"]
+
 
 # =============================================================================
 # InputItem Validation Tests
@@ -605,17 +837,17 @@ class TestConvertResponsesTools:
 
 
 class TestInputItemOutputSerialization:
-    """InputItem should accept list/dict in output and serialize to JSON string."""
+    """InputItem should accept list/dict output; dict serializes, list survives."""
 
-    def test_list_output_serialized_to_json(self):
+    def test_list_output_preserved(self):
+        # Lists pass through so multimodal parts stay extractable (#2989)
         item = InputItem(
             type="function_call_output",
             call_id="call_123",
             output=[{"type": "input_image", "image_url": "data:image/jpeg;base64,abc"}],
         )
-        assert isinstance(item.output, str)
-        parsed = json.loads(item.output)
-        assert parsed[0]["type"] == "input_image"
+        assert isinstance(item.output, list)
+        assert item.output[0]["type"] == "input_image"
 
     def test_dict_output_serialized_to_json(self):
         item = InputItem(
@@ -718,6 +950,26 @@ class TestResponseObject:
         )
         assert len(resp.output) == 1
         assert resp.usage.total_tokens == 15
+
+    def test_incomplete_details_on_truncation(self):
+        # A max_output_tokens truncation must surface as status="incomplete"
+        # with incomplete_details.reason, so clients can distinguish an
+        # incomplete turn from a natural stop (the Responses API has no
+        # finish_reason field).
+        resp = ResponseObject(
+            model="test-model",
+            status="incomplete",
+            incomplete_details={"reason": "max_output_tokens"},
+        )
+        assert resp.status == "incomplete"
+        assert resp.incomplete_details == {"reason": "max_output_tokens"}
+        dumped = resp.model_dump(exclude_none=True)
+        assert dumped["incomplete_details"] == {"reason": "max_output_tokens"}
+
+    def test_completed_response_omits_incomplete_details(self):
+        resp = ResponseObject(model="test-model")
+        dumped = resp.model_dump(exclude_none=True)
+        assert "incomplete_details" not in dumped
 
 
 # =============================================================================

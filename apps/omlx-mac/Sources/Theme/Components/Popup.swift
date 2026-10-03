@@ -1,4 +1,5 @@
-// PR 3 — dropdown picker styled to match the JSX `Popup`.
+// PR 3 — dropdown picker. Renders the native macOS menu picker so selects
+// share one bezel, height, and font with the rest of the system controls.
 
 import SwiftUI
 
@@ -37,7 +38,11 @@ struct Popup<Value: Hashable>: View {
         }
         .labelsHidden()
         .pickerStyle(.menu)
-        .frame(maxWidth: width)
+        // The native popup bezel hugs its label, and a bare `maxWidth` frame
+        // would center it — leaving air on both sides. Pin it trailing so
+        // select bezels end flush with the other controls in the column;
+        // `width` stays the cap that keeps long labels from sprawling.
+        .frame(maxWidth: width, alignment: .trailing)
     }
 }
 
@@ -46,13 +51,13 @@ struct Popup<Value: Hashable>: View {
     @Previewable @State var quant = "q4"
 
     VStack(alignment: .leading, spacing: 14) {
-        Popup(selection: $host, width: 220, options: [
+        Popup(selection: $host, width: .controlMedium, options: [
             ("127.0.0.1", "127.0.0.1 (Local only)"),
             ("0.0.0.0", "0.0.0.0 (IPv4 only)"),
             ("::", "0.0.0.0 & :: (All Networks)"),
             ("localhost", "localhost"),
         ])
-        Popup(selection: $quant, width: 120, options: [
+        Popup(selection: $quant, width: .controlCompact, options: [
             ("auto", "Auto"), ("q4", "q4"), ("q5", "q5"), ("q6", "q6"), ("q8", "q8"), ("fp16", "fp16"),
         ])
     }

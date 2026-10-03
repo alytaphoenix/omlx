@@ -302,6 +302,9 @@ def test_manifest_reads_the_exact_model_path_on_local_and_remote(tmp_path, monke
         }
 
     monkeypatch.setattr("omlx.cluster.staging.remote_file_sizes", fake_remote)
+    monkeypatch.setattr(
+        "omlx.cluster.staging.remote_model_dir", lambda _host, path: path
+    )
     manifest = stage_manifest(
         root,
         [A("mbp", 0, 4), A("studio", 0, 4)],
@@ -327,6 +330,9 @@ def test_manifest_is_not_ready_when_a_remote_sidecar_is_missing(
     monkeypatch.setattr(
         "omlx.cluster.staging.remote_file_sizes",
         lambda host, directory: weights,
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.staging.remote_model_dir", lambda _host, path: path
     )
 
     manifest = stage_manifest(root, [A()], {"studio": "studio.local"})
@@ -439,6 +445,50 @@ def test_remote_staging_resumes_without_recopying_verified_files(
     assert result.copied == ()
 
 
+def test_remote_staging_probes_the_peer_destination_dir_not_the_source(
+    tmp_path,
+    monkeypatch,
+):
+    # A cross-user cluster: the source lives under the coordinator's home, but
+    # the peer holds its copy under a different $HOME. The present-file probe
+    # and scp destination must use the peer path, otherwise the probe reads an
+    # empty directory and re-copies the whole model.
+    from omlx.cluster.staging import stage_remote_files
+
+    root = _model(tmp_path / "source", layers=2, per_file=2)
+    peer_dir = "/Users/peer/.omlx/models/m"
+    plan = plan_staging(root, node_id="studio", start_layer=0, end_layer=2)
+    landed = {
+        name: (root / name).stat().st_size
+        for name in (*plan.required, *sidecar_files(root))
+    }
+    seen_paths = []
+    monkeypatch.setattr(
+        "omlx.cluster.staging.check_disk_for_staging",
+        lambda *args, **kwargs: 100 * 1024**3,
+    )
+
+    def present_reader(_host, path):
+        seen_paths.append(path)
+        return dict(landed)
+
+    result = stage_remote_files(
+        plan,
+        model_path=root,
+        destination_host="studio.local",
+        destination_dir=peer_dir,
+        sidecars=sidecar_files(root),
+        transfer=lambda **_kwargs: pytest.fail(
+            "files already on the peer must not be copied"
+        ),
+        present_reader=present_reader,
+    )
+
+    assert seen_paths == [peer_dir]
+    assert result.ok
+    assert result.copied == ()
+
+
 def test_peer_owned_model_stages_from_the_holder_not_the_coordinator(monkeypatch):
     from omlx.cluster import staging
     from omlx.cluster.staging import StagingPlan, stage_files_from_source
@@ -470,6 +520,13 @@ def test_peer_owned_model_stages_from_the_holder_not_the_coordinator(monkeypatch
         "check_disk_for_staging",
         lambda *args, **kwargs: 100 * 1024**3,
     )
+    resolved = []
+
+    def fake_remote_model_dir(host, path, **_kwargs):
+        resolved.append((host, path))
+        return "/Users/peeruser/models/m"
+
+    monkeypatch.setattr(staging, "remote_model_dir", fake_remote_model_dir)
 
     result = stage_files_from_source(
         plan,
@@ -483,6 +540,10 @@ def test_peer_owned_model_stages_from_the_holder_not_the_coordinator(monkeypatch
     assert result.ok
     assert copies[0]["source_host"] == "studio"
     assert copies[0]["destination_host"] == "macbook"
+    # The scp source must be the path resolved in the SOURCE peer's own home,
+    # not the coordinator's absolute form.
+    assert resolved == [("studio", "/models/m")]
+    assert copies[0]["source_dir"] == "/Users/peeruser/models/m"
 
 
 def test_manifest_can_be_built_from_a_peer_shard_index(tmp_path, monkeypatch):
@@ -501,6 +562,9 @@ def test_manifest_can_be_built_from_a_peer_shard_index(tmp_path, monkeypatch):
         staging,
         "remote_model_staging_inventory",
         lambda _host, _path, **_kwargs: (shards, {"config.json": 2}),
+    )
+    monkeypatch.setattr(
+        staging, "remote_model_dir", lambda _host, path: path
     )
     monkeypatch.setattr(
         staging,
@@ -553,6 +617,7 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
     app = FastAPI()
     app.include_router(routes.router)
     monkeypatch.setattr(routes, "remote_file_sizes", lambda _host, _path: {})
+    monkeypatch.setattr(routes, "remote_model_dir", lambda _host, path: path)
     monkeypatch.setattr(
         routes,
         "complete_model_layout",
@@ -571,6 +636,7 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
         source_host,
         destination_host,
         expected_sizes,
+        destination_dir,
         parallel,
         progress,
     ):
@@ -716,3 +782,144 @@ def test_free_space_is_readable_for_a_path_that_does_not_exist_yet(tmp_path):
     from omlx.cluster.staging import free_disk_bytes
 
     assert free_disk_bytes(tmp_path / "not" / "created" / "yet") > 0
+
+
+def test_remote_default_uses_published_worker_shim(monkeypatch):
+    from omlx.cluster.staging import run_remote_python
+    from omlx.cluster.worker_shim import CLUSTER_PYTHON_SHIM
+
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert (
+        run_remote_python(
+            "worker@example.invalid", "print('{}')", "model", description="test"
+        )
+        == {}
+    )
+    assert commands[0][-1].startswith(CLUSTER_PYTHON_SHIM + " -c ")
+
+
+@pytest.mark.parametrize(
+    "source_local,destination_local", [(True, False), (False, True), (False, False)]
+)
+def test_copy_paths_with_spaces_use_sftp_without_shell_quotes(
+    tmp_path, monkeypatch, source_local, destination_local
+):
+    source = tmp_path / "source with spaces"
+    source.mkdir()
+    (source / "config.json").write_bytes(b"{}")
+    destination = tmp_path / "destination with spaces"
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        if command[0] == "scp" and destination_local:
+            Path(command[-1]).write_bytes(b"{}")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    scp_copy(
+        source_host="127.0.0.1" if source_local else "source.example",
+        destination_host="127.0.0.1" if destination_local else "destination.example",
+        source_dir=str(source),
+        destination_dir=str(destination),
+        filename="config.json",
+    )
+    copy = next(c for c in commands if c[0] == "scp")
+    assert "-s" in copy
+    if not source_local:
+        assert f"source.example:{source}/config.json" in copy
+    if not destination_local:
+        assert copy[-1].startswith(f"destination.example:{destination}/")
+    assert (
+        "-3" in copy if not source_local and not destination_local else "-3" not in copy
+    )
+
+
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("direction", ["push", "pull", "relay"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "with spaces",
+        "model[1]",
+        "model*",
+        "model?",
+        "back\\slash",
+        "single'quote",
+        'double"quote',
+    ],
+)
+def test_real_sftp_copies_literal_paths(
+    tmp_path, monkeypatch, direction, name, missing
+):
+    import shutil
+
+    from omlx.cluster import staging
+
+    scp = shutil.which("scp")
+    server = next(
+        (
+            str(p)
+            for p in (
+                Path("/usr/libexec/sftp-server"),
+                Path("/usr/lib/openssh/sftp-server"),
+            )
+            if p.is_file()
+        ),
+        None,
+    )
+    if not scp or not server:
+        pytest.skip("OpenSSH scp and local sftp-server are required")
+    source = tmp_path / ("source " + name)
+    destination = tmp_path / ("destination " + name)
+    source.mkdir()
+    filename = name + ".safetensors"
+    content = b"the exact requested file\x00\xff"
+    (source / filename).write_bytes(content)
+    # Neighbors must never substitute for a literal glob-bearing name.
+    (source / "model1.safetensors").write_bytes(b"wrong file")
+    (source / "modelOTHER.safetensors").write_bytes(b"wrong file")
+    decoy = tmp_path / "source model1"
+    decoy.mkdir()
+    (decoy / "model1.safetensors").write_bytes(b"wrong directory and file")
+    destination.mkdir()
+    (destination / filename).write_bytes(b"previous contents")
+    if missing:
+        (source / filename).unlink()
+    real_run = subprocess.run
+
+    def run(command, **kwargs):
+        if command[0] == "scp":
+            command = [scp, "-D", server, *command[1:]]
+        elif command[0] == "ssh":
+            command = ["/bin/sh", "-c", command[-1]]
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(staging, "is_local_host", lambda host: host == "local")
+    monkeypatch.setattr(staging, "cluster_ssh_options", lambda **kwargs: [])
+    monkeypatch.setattr(staging.subprocess, "run", run)
+
+    def copy():
+        scp_copy(
+            source_host="local" if direction == "push" else "source.invalid",
+            destination_host="local" if direction == "pull" else "destination.invalid",
+            source_dir=str(source),
+            destination_dir=str(destination),
+            filename=filename,
+        )
+
+    if missing:
+        with pytest.raises(RuntimeError):
+            copy()
+    else:
+        copy()
+    assert (destination / filename).read_bytes() == (
+        b"previous contents" if missing else content
+    )
+    assert sorted(p.name for p in destination.iterdir()) == [filename]

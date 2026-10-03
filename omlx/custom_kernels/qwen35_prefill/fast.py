@@ -72,6 +72,17 @@ def _verify_abi(ext, import_error):
 _ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 
 
+def set_command_buffer_caps(ops: int, mb: int) -> tuple[int, int] | None:
+    """Set MLX's per-command-buffer caps and return the previous pair.
+
+    Returns None when the native extension is unavailable; MLX keeps its caps.
+    """
+    setter = getattr(_ext, "set_command_buffer_caps", None)
+    if setter is None:
+        return None
+    return tuple(setter(int(ops), int(mb)))
+
+
 NATIVE_SYMBOLS = (
     "qwen35_fa256_attention",
     "qwen35_q2_affine_qmm_t",
@@ -80,16 +91,269 @@ NATIVE_SYMBOLS = (
     "qwen35_q6_affine_qmm_t",
     "qwen35_q8_affine_qmm_t",
     "qwen35_moe_weighted_sum",
+    "qwen35_gather_qmm_rhs_t",
     "qwen35_ane_q4_affine_qmm_t",
     "qwen35_ane_affine_qmm_t",
     "qwen35_ane_q4_swiglu_t",
     "qwen35_ane_affine_swiglu_t",
+    "qwen35_ane_cpu_fp16_affine_qmm_t",
+    "qwen35_ane_cpu_fp16_swiglu_t",
+    "qwen35_ane_cpu_fp16_q4_swiglu_t",
     "qwen35_ane_compile_linear_bank",
+    "qwen35_ane_compile_swiglu_down_bank",
+    "qwen35_cpu_fp16_affine_qmm_t",
     "qwen35_ane_dual_affine_qmm_t",
+    "qwen35_ane_dual_cpu_fp16_affine_qmm_t",
+    "qwen35_ane_dual_cpu_fp16_swiglu_t",
     "qwen35_ane_dual_q4_swiglu_t",
     "qwen35_ane_dual_affine_swiglu_t",
+    "qwen35_ane_dual_cpu_fp16_q4_swiglu_t",
     "qwen35_ane_q4_swiglu_down_t",
+    "qwen35_ane_dual_q4_swiglu_down_t",
+    "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t",
+    "oq_a8_kernels_available",
+    "qwen35_oq_a8_quantize",
+    "qwen35_oq_a8_qmm_t",
+    "qwen35_oq_a8_decode_weights",
+    "qwen35_oq_a8_stage_a_v8",
 )
+
+
+def qwen35_cpu_fp16_affine_qmm_t(
+    x: mx.array,
+    cpu_weight: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    bits: int,
+    variant: int = 8,
+    group_size: int = 128,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_cpu_fp16_affine_qmm_t"):
+        raise RuntimeError("CPU/GPU fp16 hybrid qmm native kernel is unavailable")
+    args = (
+        x,
+        cpu_weight,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        bits,
+        variant,
+        group_size,
+        cpu_threads,
+    )
+    if hasattr(_ext, "qwen35_cpu_shared_resource_available"):
+        return _ext.qwen35_cpu_fp16_affine_qmm_t(
+            *args, cpu_shared_resource
+        )
+    return _ext.qwen35_cpu_fp16_affine_qmm_t(*args)
+
+
+def qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
+    x: mx.array,
+    cpu_weight: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    variant: int = 8,
+    group_size: int = 128,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(
+        _ext, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"
+    ):
+        raise RuntimeError("ANE/CPU/GPU fp16 hybrid SwiGLU is unavailable")
+    args = (
+        x,
+        cpu_weight,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model0,
+        ane_model1,
+        variant,
+        group_size,
+        cpu_threads,
+    )
+    if hasattr(_ext, "qwen35_cpu_shared_resource_available"):
+        return _ext.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
+            *args, cpu_shared_resource
+        )
+    return _ext.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(*args)
+
+
+def qwen35_ane_cpu_fp16_q4_swiglu_t(
+    x: mx.array,
+    cpu_weight: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model,
+    variant: int = 8,
+    group_size: int = 128,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_ane_cpu_fp16_q4_swiglu_t"):
+        raise RuntimeError("Single-ANE/CPU/GPU fp16 q4 SwiGLU is unavailable")
+    return _ext.qwen35_ane_cpu_fp16_q4_swiglu_t(
+        x,
+        cpu_weight,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model,
+        variant,
+        group_size,
+        cpu_threads,
+        cpu_shared_resource,
+    )
+
+
+def qwen35_ane_cpu_fp16_swiglu_t(
+    x: mx.array,
+    cpu_weight: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model,
+    bits: int,
+    variant: int = 8,
+    group_size: int = 128,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_ane_cpu_fp16_swiglu_t"):
+        raise RuntimeError("Single-ANE/CPU/GPU fp16 SwiGLU is unavailable")
+    return _ext.qwen35_ane_cpu_fp16_swiglu_t(
+        x,
+        cpu_weight,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model,
+        bits,
+        variant,
+        group_size,
+        cpu_threads,
+        cpu_shared_resource,
+    )
+
+
+def qwen35_ane_cpu_fp16_affine_qmm_t(
+    x: mx.array,
+    cpu_weight: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model,
+    bits: int,
+    variant: int = 8,
+    group_size: int = 128,
+    profile_category: int = 1,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_ane_cpu_fp16_affine_qmm_t"):
+        raise RuntimeError("Single-ANE/CPU/GPU fp16 affine qmm is unavailable")
+    return _ext.qwen35_ane_cpu_fp16_affine_qmm_t(
+        x,
+        cpu_weight,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model,
+        bits,
+        variant,
+        group_size,
+        profile_category,
+        cpu_threads,
+        cpu_shared_resource,
+    )
+
+
+def qwen35_ane_dual_cpu_fp16_swiglu_t(
+    x: mx.array,
+    cpu_weight: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    bits: int,
+    variant: int = 8,
+    group_size: int = 128,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(
+        _ext, "qwen35_ane_dual_cpu_fp16_swiglu_t"
+    ):
+        raise RuntimeError("ANE/CPU/GPU fp16 hybrid SwiGLU is unavailable")
+    return _ext.qwen35_ane_dual_cpu_fp16_swiglu_t(
+        x,
+        cpu_weight,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model0,
+        ane_model1,
+        bits,
+        variant,
+        group_size,
+        cpu_threads,
+        cpu_shared_resource,
+    )
+
+
+def qwen35_ane_dual_cpu_fp16_affine_qmm_t(
+    x: mx.array,
+    cpu_weight: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    bits: int,
+    variant: int = 8,
+    group_size: int = 128,
+    profile_category: int = 1,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(
+        _ext, "qwen35_ane_dual_cpu_fp16_affine_qmm_t"
+    ):
+        raise RuntimeError("ANE/CPU/GPU fp16 hybrid affine qmm is unavailable")
+    return _ext.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
+        x,
+        cpu_weight,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model0,
+        ane_model1,
+        bits,
+        variant,
+        group_size,
+        profile_category,
+        cpu_threads,
+        cpu_shared_resource,
+    )
+
+
+def qwen35_cpu_shared_resource_available() -> bool:
+    """Whether dispatch_apply supports shared-resource scheduling attributes."""
+    return bool(
+        _ext is not None
+        and hasattr(_ext, "qwen35_cpu_shared_resource_available")
+        and _ext.qwen35_cpu_shared_resource_available()
+    )
 
 
 def qwen35_ane_available() -> bool:
@@ -98,6 +362,15 @@ def qwen35_ane_available() -> bool:
         _ext is not None
         and hasattr(_ext, "qwen35_ane_available")
         and _ext.qwen35_ane_available()
+    )
+
+
+def qwen35_ane_hybrid_nax_enabled() -> bool:
+    """Whether ANE hybrid GPU suffixes currently select bundled NAX QMM."""
+    return bool(
+        _ext is not None
+        and hasattr(_ext, "qwen35_ane_hybrid_nax_enabled")
+        and _ext.qwen35_ane_hybrid_nax_enabled()
     )
 
 
@@ -110,6 +383,9 @@ _ANE_PROFILE_KEYS = (
     "ane0_launch_ns",
     "ane1_launch_ns",
     "gpu_qmm_ns",
+    "gpu_completion_ns",
+    "cpu_matmul_ns",
+    "cpu_completion_ns",
     "ane_last",
     "gpu_last",
     "gap_before_ns",
@@ -157,16 +433,48 @@ def qwen35_ane_compile_linear(
         return _ext.qwen35_ane_compile_linear(weight, sequence_length)
 
 
+def qwen35_ane_bank_compiler_available() -> bool:
+    """True when both the private ANE runtime and the procedure-bank compiler
+    entry point are present. Callers that would otherwise discover
+    unavailability via the RuntimeError below (the ANE tuner in particular)
+    can probe this up front instead of failing deep inside a compile ladder
+    (#3044)."""
+    return (
+        qwen35_ane_available()
+        and _ext is not None
+        and hasattr(_ext, "qwen35_ane_compile_linear_bank")
+    )
+
+
 def qwen35_ane_compile_linear_bank(
     weights: list[mx.array], sequence_length: int, ane_instance: int
 ):
-    if not qwen35_ane_available() or _ext is None or not hasattr(
-        _ext, "qwen35_ane_compile_linear_bank"
-    ):
+    if not qwen35_ane_bank_compiler_available():
         raise RuntimeError("Private ANE procedure-bank compiler is unavailable")
     return _ext.qwen35_ane_compile_linear_bank(
         weights, sequence_length, ane_instance
     )
+
+
+def qwen35_ane_linear_bank_builder(sequence_length: int):
+    """Incremental bank builder: add() converts one fp32 slice at a time so
+    the caller can release each staging array immediately (issue #2781)."""
+    if not qwen35_ane_available() or _ext is None or not hasattr(
+        _ext, "AneLinearBankBuilder"
+    ):
+        raise RuntimeError("Private ANE procedure-bank builder is unavailable")
+    return _ext.AneLinearBankBuilder(sequence_length)
+
+
+def qwen35_ane_fused_bank_builder(sequence_length: int):
+    """Incremental fused SwiGLU/down bank builder: add() converts one fp32
+    gate/up/down triple at a time so the caller can release each staging
+    array immediately (the issue #2781 recipe applied to fused banks)."""
+    if not qwen35_ane_available() or _ext is None or not hasattr(
+        _ext, "AneFusedBankBuilder"
+    ):
+        raise RuntimeError("Private ANE procedure-bank builder is unavailable")
+    return _ext.AneFusedBankBuilder(sequence_length)
 
 
 def qwen35_ane_affine_qmm_t(
@@ -178,6 +486,7 @@ def qwen35_ane_affine_qmm_t(
     bits: int,
     variant: int = 8,
     group_size: int = 128,
+    profile_category: int = 1,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "qwen35_ane_affine_qmm_t"):
         raise RuntimeError("ANE hybrid affine qmm native kernel is unavailable")
@@ -190,6 +499,7 @@ def qwen35_ane_affine_qmm_t(
         bits,
         variant,
         group_size,
+        profile_category,
     )
 
 
@@ -214,11 +524,30 @@ def qwen35_ane_compile_swiglu_down(
     up_weight: mx.array,
     down_weight: mx.array,
     sequence_length: int,
+    ane_instance: int = 0,
 ):
     if not qwen35_ane_swiglu_down_available():
         raise RuntimeError("Private ANE SwiGLU/down runtime is unavailable")
     return _ext.qwen35_ane_compile_swiglu_down(
-        gate_weight, up_weight, down_weight, sequence_length
+        gate_weight, up_weight, down_weight, sequence_length, ane_instance
+    )
+
+
+def qwen35_ane_compile_swiglu_down_bank(
+    gate_weights: list[mx.array],
+    up_weights: list[mx.array],
+    down_weights: list[mx.array],
+    sequence_length: int,
+    ane_instance: int,
+):
+    if _ext is None or not hasattr(_ext, "qwen35_ane_compile_swiglu_down_bank"):
+        raise RuntimeError("Private ANE SwiGLU/down bank compiler is unavailable")
+    return _ext.qwen35_ane_compile_swiglu_down_bank(
+        gate_weights,
+        up_weights,
+        down_weights,
+        sequence_length,
+        ane_instance,
     )
 
 
@@ -300,6 +629,7 @@ def qwen35_ane_dual_affine_qmm_t(
     bits: int,
     variant: int = 8,
     group_size: int = 128,
+    profile_category: int = 1,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "qwen35_ane_dual_affine_qmm_t"):
         raise RuntimeError("Dual ANE hybrid affine qmm native kernel is unavailable")
@@ -313,6 +643,7 @@ def qwen35_ane_dual_affine_qmm_t(
         bits,
         variant,
         group_size,
+        profile_category,
     )
 
 
@@ -396,6 +727,78 @@ def qwen35_ane_q4_swiglu_down_t(
     )
 
 
+def qwen35_ane_dual_q4_swiglu_down_t(
+    x: mx.array,
+    gpu_gate_up_weight: mx.array,
+    gpu_gate_up_scales: mx.array,
+    gpu_gate_up_biases: mx.array,
+    gpu_down_weight: mx.array,
+    gpu_down_scales: mx.array,
+    gpu_down_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    variant: int = 8,
+    group_size: int = 128,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_ane_dual_q4_swiglu_down_t"):
+        raise RuntimeError("Dual-ANE hybrid SwiGLU/down native kernel is unavailable")
+    return _ext.qwen35_ane_dual_q4_swiglu_down_t(
+        x,
+        gpu_gate_up_weight,
+        gpu_gate_up_scales,
+        gpu_gate_up_biases,
+        gpu_down_weight,
+        gpu_down_scales,
+        gpu_down_biases,
+        ane_model0,
+        ane_model1,
+        variant,
+        group_size,
+    )
+
+
+def qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t(
+    x: mx.array,
+    cpu_gate_up_weight: mx.array,
+    cpu_down_weight: mx.array,
+    gpu_gate_up_weight: mx.array,
+    gpu_gate_up_scales: mx.array,
+    gpu_gate_up_biases: mx.array,
+    gpu_down_weight: mx.array,
+    gpu_down_scales: mx.array,
+    gpu_down_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    variant: int = 8,
+    group_size: int = 128,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(
+        _ext, "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t"
+    ):
+        raise RuntimeError(
+            "Dual-ANE/CPU fused SwiGLU/down native kernel is unavailable"
+        )
+    return _ext.qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t(
+        x,
+        cpu_gate_up_weight,
+        cpu_down_weight,
+        gpu_gate_up_weight,
+        gpu_gate_up_scales,
+        gpu_gate_up_biases,
+        gpu_down_weight,
+        gpu_down_scales,
+        gpu_down_biases,
+        ane_model0,
+        ane_model1,
+        variant,
+        group_size,
+        cpu_threads,
+        cpu_shared_resource,
+    )
+
+
 # Extensions built before the NAX split reject the use_nax/nax_variant kwargs,
 # so only pass them when the rebuilt binding is present.
 _EXT_HAS_NAX = _ext is not None and hasattr(_ext, "is_nax_available")
@@ -438,7 +841,34 @@ _nax_available_cache: bool | None = None
 _stock_nax_cache: bool | None = None
 _qmm_nax_cache: bool | None = None
 
-QMM_NAX_VARIANT = int(os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT", "0"))
+# Bundled NAX tiles (must match qwen_q_affine_nax_variant in qwen35_prefill.cpp):
+#   0: 64x64x64 wm2 wn2 (stock MLX tile, default)   1: bm 32   2: bm 128
+#   3: bn 128   4: bk 32   5: wm4 wn1
+NAX_QMM_VARIANTS = range(6)
+_qmm_nax_variant_warned = False
+
+
+def _resolve_qmm_nax_variant() -> int:
+    global _qmm_nax_variant_warned
+    raw = os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT", "0").strip()
+    try:
+        variant = int(raw)
+    except ValueError:
+        variant = -1
+    if variant in NAX_QMM_VARIANTS:
+        return variant
+    if not _qmm_nax_variant_warned:
+        _qmm_nax_variant_warned = True
+        logger.warning(
+            "OMLX_QWEN35_QMM_NAX_VARIANT=%r is not a bundled NAX tile "
+            "(valid: 0-%d); using variant 0",
+            raw,
+            NAX_QMM_VARIANTS[-1],
+        )
+    return 0
+
+
+QMM_NAX_VARIANT = _resolve_qmm_nax_variant()
 
 
 def _nax_available_fallback(
@@ -777,6 +1207,203 @@ def qwen35_moe_weighted_sum(
             stream=stream or mx.gpu,
         )
     raise RuntimeError("qwen35_moe_weighted_sum native kernel is unavailable")
+
+
+def gather_qmm_rhs_available() -> bool:
+    """True when the NAX sorted-expert gather kernel loaded on this machine."""
+    ready = getattr(_ext, "qwen35_gather_qmm_rhs_nax_ready", None)
+    if ready is None:
+        return False
+    try:
+        return bool(ready())
+    except Exception:
+        return False
+
+
+def qwen35_gather_qmm_rhs_t(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    indices: mx.array,
+    bits: int,
+    group_size: int,
+    *,
+    stream=None,
+) -> mx.array:
+    """Sorted-expert ``gather_qmm(x, w, rhs_indices=indices, transpose=True)``.
+
+    One dispatch for any row count; raises ValueError for layouts the kernel
+    does not cover (the caller keeps its own fallback).
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_gather_qmm_rhs_t"):
+        raise RuntimeError("qwen35_gather_qmm_rhs_t native kernel is unavailable")
+    return _ext.qwen35_gather_qmm_rhs_t(
+        x,
+        weight,
+        scales,
+        biases,
+        indices,
+        bits,
+        group_size,
+        **_native_stream_kwargs(stream),
+    )
+
+
+# --- oQ mixed-bit QxA8 (Q4/Q5, GS64, affine) on the M5 tensor units ---------
+
+OQ_A8_VARIANT = int(os.environ.get("OMLX_OQ_A8_VARIANT", "0"))
+OQ_A8_ACT_MODE = int(os.environ.get("OMLX_OQ_A8_ACT_MODE", "0"))
+
+
+def oq_a8_available() -> bool:
+    """True when the INT8 NAX GEMM can actually run on this machine.
+
+    Distinct from ``has_symbol``: the binding can exist in a build whose NAX
+    metallib was skipped (SDK < 26.2) or on hardware without tensor units.
+    """
+    if _ext is None or not hasattr(_ext, "oq_a8_kernels_available"):
+        return False
+    try:
+        return bool(_ext.oq_a8_kernels_available())
+    except Exception:
+        return False
+
+
+def qwen35_oq_a8_quantize(
+    x: mx.array,
+    act_mode: int = 0,
+    *,
+    stream=None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Stage A: BF16/FP16 activations -> (Qa int8, Sa float32, Ra int16).
+
+    Run this once per shared activation and feed the result to every
+    projection that consumes it, whatever their bit widths.
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_quantize"):
+        raise RuntimeError("qwen35_oq_a8_quantize native kernel is unavailable")
+    qa, sa, ra = _ext.qwen35_oq_a8_quantize(
+        x,
+        act_mode,
+        **_native_stream_kwargs(stream),
+    )
+    return qa, sa, ra
+
+
+def qwen35_oq_a8_qmm_t(
+    qa: mx.array,
+    sa: mx.array,
+    ra: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    bits: int,
+    act_mode: int = 0,
+    variant: int = 800,
+    *,
+    packed: bool = False,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_qmm_t"):
+        raise RuntimeError("qwen35_oq_a8_qmm_t native kernel is unavailable")
+    return _ext.qwen35_oq_a8_qmm_t(
+        qa,
+        sa,
+        ra,
+        weight,
+        scales,
+        biases,
+        bits,
+        act_mode,
+        variant,
+        packed=packed,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen35_oq_a8_linear(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    bits: int,
+    act_mode: int = 0,
+    variant: int = 800,
+    *,
+    stream=None,
+) -> mx.array:
+    """Convenience Stage-A + GEMM for a projection with no shared activation."""
+    qa, sa, ra = qwen35_oq_a8_stage_a_v8(x, act_mode, stream=stream)
+    return qwen35_oq_a8_qmm_t(
+        qa,
+        sa,
+        ra,
+        weight,
+        mx.contiguous(scales.T),
+        mx.contiguous(biases.T),
+        bits,
+        act_mode,
+        variant,
+        stream=stream,
+    )
+
+
+def qwen35_oq_a8_stage_a_v8(
+    x: mx.array,
+    act_mode: int = 0,
+    *,
+    stream=None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Reorder activations for the native GEMM and transpose group metadata.
+
+    Within each GS64 group, slot ``16c + 4t + j`` holds
+    ``k = 16c + 8*(t>>1) + 2j + (t&1)``. This permutation preserves the
+    group sum and requires a temporary contiguous INT8 activation copy.
+    """
+    qa, sa, ra = qwen35_oq_a8_quantize(x, act_mode, stream=stream)
+    shape = qa.shape
+    k = shape[-1]
+    m = qa.size // k
+    # Reshaped back to the input's own rank, not to [M, K]: the op derives the
+    # output shape from Qa, so flattening a [B, S, K] activation here would
+    # hand the caller a [B*S, N] result. With B == 1 that broadcasts against
+    # the residual and hides; with B > 1 it is silently wrong.
+    qa = mx.contiguous(
+        qa.reshape(m, k // 64, 4, 2, 4, 2).transpose(0, 1, 2, 3, 5, 4).reshape(shape)
+    )
+    # Flattened to [M, groups] before transposing, not transposed in place:
+    # mx.transpose reverses *every* axis, so a [B, S, groups] Ra would come
+    # back as [groups, S, B] -- which is the layout the kernel wants only when
+    # B == 1, and silently interleaves the sequences when it is not.
+    ra = mx.contiguous(ra.reshape(m, -1).T)
+    if act_mode != 0:
+        sa = mx.contiguous(sa.reshape(m, -1).T)
+    return qa, sa, ra
+
+
+def qwen35_oq_a8_decode_weights(
+    weight: mx.array,
+    bits: int,
+    group_count: int,
+    *,
+    stream=None,
+) -> mx.array:
+    """Unpack Q4/Q5 codes to INT8.
+
+    Test helper only: the production path never materializes unpacked weights
+    in device memory.
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_decode_weights"):
+        raise RuntimeError(
+            "qwen35_oq_a8_decode_weights native kernel is unavailable"
+        )
+    return _ext.qwen35_oq_a8_decode_weights(
+        weight,
+        bits,
+        group_count,
+        **_native_stream_kwargs(stream),
+    )
 
 
 def __getattr__(name: str) -> Any:

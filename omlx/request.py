@@ -61,6 +61,10 @@ class SamplingParams:
     xtc_probability: float = 0.0
     xtc_threshold: float = 0.1
     repetition_penalty: float = 1.0
+    # Look-back window (tokens) for the repetition penalty. None = engine
+    # default (mlx-lm uses 20). Loop units longer than the window never
+    # overlap their own penalty context.
+    repetition_context_size: Optional[int] = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     stop: Optional[List[str]] = None
@@ -145,6 +149,14 @@ class Request:
     # This is never set by ordinary API traffic.
     benchmark_trace: bool = False
     benchmark_ane_sequence_length: int = 0
+    # Effective prefill widths observed by the scheduler. These are populated
+    # only for benchmark_trace requests so the benchmark summary can distinguish
+    # a requested scheduler step from the model calls actually delivered after
+    # cache-boundary and memory clamps.
+    benchmark_prefill_chunks: List[int] = field(default_factory=list)
+    benchmark_requested_steps: List[int] = field(default_factory=list)
+    benchmark_boundary_enabled: bool = False
+    benchmark_cache_block_size: int = 0
 
     # Multimodal content (images, video)
     images: Optional[List[Any]] = None
@@ -194,7 +206,10 @@ class Request:
 
     # Reasoning model support (for models with <think> tags)
     needs_think_prefix: bool = False  # True if prompt ends with <think> token
+    preserve_reasoning: bool = False  # history keeps the <think> output, so output tokens are cacheable
     think_prefix_sent: bool = False  # Track if prefix already sent
+    # Close-think token matched to the prompt's opener for multi-marker parsers
+    think_end_token_id: int | None = None
 
     # Harmony model support (gpt-oss models)
     is_harmony_model: bool = False  # True if model uses Harmony format
@@ -204,6 +219,11 @@ class Request:
     specprefill_total_tokens: int = 0  # Original total token count (M)
     specprefill_position_offset: int = 0  # RoPE offset = M - N
     specprefill_system_end: int = 0  # Token index where system prompt ends
+
+    # Chat template suffix after the last message; the tail snapshot ends before it.
+    generation_prompt_text: Optional[str] = None
+    generation_prompt_start: int = 0  # Token index where the generation prompt starts
+    generation_prompt_persists: bool = False  # History keeps the generation prompt
 
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter
@@ -309,6 +329,11 @@ class RequestOutput:
     # Structured internal error classification for API-layer mapping.
     error_code: Optional[str] = None
     error_metadata: Optional[Dict[str, Any]] = None
+    # Internal benchmark instrumentation copied from the originating request.
+    benchmark_prefill_chunks: List[int] = field(default_factory=list)
+    benchmark_requested_steps: List[int] = field(default_factory=list)
+    benchmark_boundary_enabled: bool = False
+    benchmark_cache_block_size: int = 0
 
     @property
     def usage(self) -> Dict[str, int]:

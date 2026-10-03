@@ -1,5 +1,8 @@
 #include "dsa_indexer.h"
 
+#include "kernels/mma_dsa_indexer_score.h"
+
+#include <cmath>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
@@ -256,6 +259,268 @@ class DSAIndexerScoresPrimitive : public Primitive {
   int mask_q_offset_;
 };
 
+class Qwen4QSAIndexerScoresPrimitive : public Primitive {
+ public:
+  Qwen4QSAIndexerScoresPrimitive(
+      Stream stream,
+      int mask_ratio,
+      int mask_q_offset)
+      : Primitive(stream),
+        mask_ratio_(mask_ratio),
+        mask_q_offset_(mask_q_offset) {}
+
+  static bool unsupported(const array& q, const array& k, Stream s) {
+    if (s.device == Device::cpu || q.dtype() != k.dtype()) {
+      return true;
+    }
+    if (q.dtype() != float16 && q.dtype() != bfloat16) {
+      return true;
+    }
+    if (!row_contiguous(q) || !row_contiguous(k)) {
+      return true;
+    }
+    if (q.ndim() != 4 || k.ndim() != 4) {
+      return true;
+    }
+    // This is intentionally the production Qwen4-Exp geometry only. A stale
+    // config or generalized caller must stay on qsa_fast's fp32 MLX path.
+    return q.shape(0) != 1 || k.shape(0) != 1 || q.shape(1) != 4 ||
+        k.shape(1) != 1 || q.shape(2) <= 0 || k.shape(2) <= 0 ||
+        q.shape(3) != 128 || k.shape(3) != 128;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error(
+        "Qwen4QSAIndexerScoresPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+    const auto& q = inputs[0];
+    const auto& k = inputs[1];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int bm = 64;
+    constexpr int bn = 64;
+    constexpr int bk = 16;
+    constexpr int wm = 2;
+    constexpr int wn = 2;
+    const int B = q.shape(0);
+    const int H = q.shape(1);
+    const int M = q.shape(2);
+    const int N = k.shape(2);
+    const int D = q.shape(3);
+    const int tiles_m = (M + bm - 1) / bm;
+    const int tiles_n = (N + bn - 1) / bn;
+
+    mlx::steel::GEMMParams params{
+        /* const int M = */ M,
+        /* const int N = */ N,
+        /* const int K = */ D,
+        /* const int lda = */ D,
+        /* const int ldb = */ D,
+        /* const int ldd = */ N,
+        /* const int tiles_n = */ tiles_n,
+        /* const int tiles_m = */ tiles_m,
+        /* const int64_t batch_stride_a = */ int64_t(H) * M * D,
+        /* const int64_t batch_stride_b = */ int64_t(N) * D,
+        /* const int64_t batch_stride_d = */ int64_t(M) * N,
+        /* const int swizzle_log = */ 0,
+        /* const int gemm_k_iterations_aligned = */ D / bk,
+        /* const int batch_ndim = */ 1};
+
+    std::string base_name;
+    concatenate(
+        base_name,
+        "qwen4_qsa_indexer_score_",
+        type_to_name(q),
+        "_bm",
+        bm,
+        "_bn",
+        bn,
+        "_bk",
+        bk,
+        "_wm",
+        wm,
+        "_wn",
+        wn);
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel(base_name, lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(q, 0);
+    encoder.set_input_array(k, 1);
+    encoder.set_output_array(out, 2);
+    encoder.set_bytes(params, 3);
+    encoder.set_bytes(mask_ratio_, 4);
+    encoder.set_bytes(mask_q_offset_, 5);
+    const float score_divisor = std::sqrt(static_cast<float>(D));
+    encoder.set_bytes(score_divisor, 6);
+    encoder.dispatch_threadgroups(
+        MTL::Size(tiles_n, tiles_m, B),
+        MTL::Size(wm * wn * 32, 1, 1));
+  }
+
+  DEFINE_NAME(OMLXQwen4QSAIndexerScores)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs =
+        static_cast<const Qwen4QSAIndexerScoresPrimitive&>(other);
+    return mask_ratio_ == rhs.mask_ratio_ &&
+        mask_q_offset_ == rhs.mask_q_offset_;
+  }
+  auto state() const {
+    return std::make_tuple(mask_ratio_, mask_q_offset_);
+  }
+
+ private:
+  int mask_ratio_;
+  int mask_q_offset_;
+};
+
+// ── v25 M2 MMA score kernel (mma_dsa_indexer_score.h) ───────────────────────
+// Split dispatch: the interior instantiation runs the unmodified hot loop on
+// fully-interior tiles; the boundary instantiation handles partial edge tiles
+// with clamped loads. Both write disjoint regions of ONE output allocation.
+// M/N/mask offsets are runtime params — a recompile per chunk would otherwise
+// stall prefill (N grows and mask_q_offset changes every chunk).
+// The kernel source is compiled ONCE at runtime by the macOS Metal compiler
+// (get_library builder path) instead of shipping in the metallib: the Xcode
+// CLI toolchain's codegen for this kernel measures 3.4 %-points slower (see
+// the header comment).
+class MMADSAIndexerScoresPrimitive : public Primitive {
+ public:
+  static constexpr int kBM = 64;
+  static constexpr int kBN = 64;
+  static constexpr int kThreads = 128; // WM=2, WN=2
+  static constexpr int kSwizzleLog = 2;
+
+  MMADSAIndexerScoresPrimitive(Stream stream, int mask_ratio, int mask_q_offset)
+      : Primitive(stream),
+        mask_ratio_(mask_ratio),
+        mask_q_offset_(mask_q_offset) {}
+
+  static bool unsupported(
+      const array& q,
+      const array& k,
+      const array& weights,
+      Stream s) {
+    if (s.device == Device::cpu) {
+      return true;
+    }
+    // The kernel is instantiated for bf16 / H=64 / D=128 / weights-LH only.
+    if (q.dtype() != bfloat16 || k.dtype() != bfloat16 ||
+        weights.dtype() != bfloat16) {
+      return true;
+    }
+    if (!row_contiguous(q) || !row_contiguous(k) ||
+        !row_contiguous(weights)) {
+      return true;
+    }
+    if (q.ndim() != 4 || k.ndim() != 4 || weights.ndim() != 3) {
+      return true;
+    }
+    if (q.shape(1) != 64 || k.shape(1) != 1) {
+      return true;
+    }
+    if (weights.shape(1) != q.shape(2) || weights.shape(2) != q.shape(1)) {
+      return true;
+    }
+    if (q.shape(3) != 128 || k.shape(3) != 128) {
+      return true;
+    }
+    return k.shape(2) < 64;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("MMADSAIndexerScoresPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+
+    const auto& q = inputs[0];
+    const auto& k = inputs[1];
+    const auto& weights = inputs[2];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    const int B = q.shape(0);
+    const int M = q.shape(2);
+    const int N = k.shape(2);
+
+    const int tiles_m_full = M / kBM;
+    const int tiles_n_full = N / kBN;
+    const int tiles_m = (M + kBM - 1) / kBM;
+    const int tiles_n = (N + kBN - 1) / kBN;
+
+    OMLXMMADSAScoreParamsHost params{
+        /* int M = */ M,
+        /* int N = */ N,
+        /* int mask_ratio = */ mask_ratio_,
+        /* int mask_q_offset = */ mask_q_offset_};
+
+    // Swizzled threadgroup grid identical to the measured harness form.
+    const int tg_x = tiles_n << kSwizzleLog;
+    const int tg_y =
+        (tiles_m + (1 << kSwizzleLog) - 1) >> kSwizzleLog;
+    MTL::Size group_dims = MTL::Size(kThreads, 1, 1);
+    MTL::Size grid_dims = MTL::Size(tg_x, tg_y, B);
+
+    auto lib = d.get_library("omlx_glm_mma_dsa_v25", []() {
+      return std::string(kMMADSAScoreKernelSource);
+    });
+    auto& compute_encoder = metal::get_command_encoder(s);
+
+    auto dispatch = [&](const char* name) {
+      auto kernel = d.get_kernel(name, lib);
+      compute_encoder.set_compute_pipeline_state(kernel);
+      compute_encoder.set_input_array(q, 0);
+      compute_encoder.set_input_array(k, 1);
+      compute_encoder.set_input_array(weights, 2);
+      compute_encoder.set_output_array(out, 3);
+      compute_encoder.set_bytes(params, 4);
+      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    };
+
+    if (tiles_m_full > 0 && tiles_n_full > 0) {
+      dispatch("mma_dsa_indexer_score_bfloat16_interior");
+    }
+    if (tiles_m > tiles_m_full || tiles_n > tiles_n_full) {
+      dispatch("mma_dsa_indexer_score_bfloat16_boundary");
+    }
+  }
+
+  DEFINE_NAME(OMLXMMADSAIndexerScores)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const MMADSAIndexerScoresPrimitive&>(other);
+    return mask_ratio_ == rhs.mask_ratio_ &&
+        mask_q_offset_ == rhs.mask_q_offset_;
+  }
+  auto state() const {
+    return std::make_tuple(mask_ratio_, mask_q_offset_);
+  }
+
+ private:
+  int mask_ratio_;
+  int mask_q_offset_;
+};
+
 class DSATopKIndicesPrimitive : public Primitive {
  public:
   DSATopKIndicesPrimitive(
@@ -421,6 +686,57 @@ class DSparkFP32TopKIndicesPrimitive : public Primitive {
   }
 };
 
+class Qwen4QSAFP32TopKIndicesPrimitive : public Primitive {
+ public:
+  explicit Qwen4QSAFP32TopKIndicesPrimitive(Stream stream)
+      : Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("Qwen4 QSA FP32 top-k has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    const auto& scores = inputs[0];
+    auto& out = outputs[0];
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int topk = 512;
+    constexpr int threads = 256;
+    const int rows = scores.shape(1);
+    DSATopKParams params{
+        /* int rows = */ rows,
+        /* int L = */ rows,
+        /* int K = */ scores.shape(2),
+        /* int topk = */ topk,
+        /* bool causal_valid_prefix = */ false};
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel =
+        d.get_kernel("qwen4_qsa_fp32_topk_indices_topk512_t256", lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(scores, 0);
+    encoder.set_output_array(out, 1);
+    encoder.set_bytes(params, 2);
+    encoder.dispatch_threadgroups(
+        MTL::Size(rows, 1, 1), MTL::Size(threads, 1, 1));
+  }
+
+  DEFINE_NAME(OMLXQwen4QSAFP32TopKIndices)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& /* other */) const override {
+    return true;
+  }
+  auto state() const {
+    return std::make_tuple(nullptr);
+  }
+};
 // ── DC-1: fused decode indexer scan ─────────────────────────────────────────
 // One kernel computes the head-summed indexer scores for a single query position
 // (s == 1) directly into [B,1,1,S] with fp32 accumulation, replacing the decode
@@ -689,6 +1005,111 @@ array dsa_indexer_scores(
       std::move(inputs));
 }
 
+array qwen4_qsa_indexer_scores(
+    const array& queries,
+    const array& pooled_keys,
+    int mask_ratio,
+    int mask_q_offset,
+    StreamOrDevice s) {
+  if (queries.ndim() != 4 || pooled_keys.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.qwen4_qsa_indexer_scores] expected q/k rank "
+        << "4, got " << queries.shape() << " and " << pooled_keys.shape()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.dtype() != pooled_keys.dtype() ||
+      (queries.dtype() != float16 && queries.dtype() != bfloat16)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.qwen4_qsa_indexer_scores] q/k must have matching "
+        "float16 or bfloat16 dtype.");
+  }
+  if (mask_ratio != 4 || mask_q_offset < 0) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.qwen4_qsa_indexer_scores] requires "
+        << "mask_ratio=4 and a non-negative mask_q_offset, got "
+        << mask_ratio << " and " << mask_q_offset << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  auto q = ensure_row_contiguous(queries, stream);
+  auto k = ensure_row_contiguous(pooled_keys, stream);
+  if (Qwen4QSAIndexerScoresPrimitive::unsupported(q, k, stream)) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.qwen4_qsa_indexer_scores] unsupported shape "
+        << "or layout; expected q [1,4,M,128] and k [1,1,N,128], got "
+        << q.shape() << " and " << k.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  Shape out_shape{1, q.shape(2), k.shape(2)};
+  return array(
+      std::move(out_shape),
+      float32,
+      std::make_shared<Qwen4QSAIndexerScoresPrimitive>(
+          stream, mask_ratio, mask_q_offset),
+      std::vector<array>{q, k});
+}
+
+array dsa_indexer_scores_mma(
+    const array& queries,
+    const array& keys,
+    const array& weights,
+    int mask_ratio,
+    int mask_q_offset,
+    StreamOrDevice s) {
+  if (queries.ndim() != 4 || keys.ndim() != 4 || weights.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_mma] expected q/k rank 4 "
+        << "and weights rank 3 ([B, L, H]), got " << queries.shape() << ", "
+        << keys.shape() << ", " << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (keys.shape(1) != 1) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.dsa_indexer_scores_mma] keys must have a "
+        "singleton indexer head axis.");
+  }
+  if (mask_ratio < 0) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_mma] mask_ratio must be "
+        << "non-negative (0 disables the fused pooled-causal mask), got "
+        << mask_ratio << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (mask_ratio > 0 && mask_q_offset < 0) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_mma] mask_q_offset must "
+        << "be non-negative when mask_ratio > 0, got " << mask_q_offset
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  auto q = ensure_row_contiguous(queries, stream);
+  auto k = ensure_row_contiguous(keys, stream);
+  auto w = ensure_row_contiguous(weights, stream);
+
+  std::vector<array> inputs = {q, k, w};
+  if (MMADSAIndexerScoresPrimitive::unsupported(q, k, w, stream)) {
+    // Deliberately a hard error, not a silent Steel fallback: the caller's
+    // gate must already have routed unsupported configurations (fp16, H!=64,
+    // causal, weights rank 4, GLM shapes) to dsa_indexer_scores.
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.dsa_indexer_scores_mma] unsupported shape/dtype "
+        "(kernel serves bf16, H=64, D=128, weights [B, L, H] only).");
+  }
+
+  Shape out_shape{q.shape(0), 1, q.shape(2), k.shape(2)};
+  return array(
+      std::move(out_shape),
+      bfloat16,
+      std::make_shared<MMADSAIndexerScoresPrimitive>(
+          stream, mask_ratio, mask_q_offset),
+      std::move(inputs));
+}
+
 array dsa_topk_indices(
     const array& scores,
     int topk,
@@ -723,6 +1144,31 @@ array dspark_fp32_topk_indices(
       std::vector<array>{contiguous_scores});
 }
 
+array qwen4_qsa_topk_indices(
+    const array& scores,
+    int topk,
+    StreamOrDevice s) {
+  if (scores.ndim() != 3 || scores.shape(0) != 1 ||
+      scores.shape(1) < 1 || scores.dtype() != float32 || topk != 512 ||
+      scores.shape(2) < topk) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.qwen4_qsa_topk_indices] expected FP32 "
+        << "scores [1, M>=1, N>=512] and topk=512, got " << scores.shape()
+        << ", topk=" << topk << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  auto stream = to_stream(s);
+  if (stream.device == Device::cpu) {
+    throw std::invalid_argument("Qwen4 QSA FP32 top-k requires Metal.");
+  }
+  auto contiguous_scores = ensure_row_contiguous(scores, stream);
+  Shape out_shape{1, contiguous_scores.shape(1), topk};
+  return array(
+      std::move(out_shape),
+      uint32,
+      std::make_shared<Qwen4QSAFP32TopKIndicesPrimitive>(stream),
+      std::vector<array>{contiguous_scores});
+}
 array dsa_decode_scores(
     const array& queries,
     const array& keys,

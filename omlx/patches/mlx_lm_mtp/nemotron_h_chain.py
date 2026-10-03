@@ -18,7 +18,7 @@ the qwen35_model chain contract to the Nemotron-H hybrid trunk:
   bit-identical to the original forward for those positions (same stock
   ssm path, same single-chunk math).
 - Stamps ``_omlx_mtp_chain`` / ``_omlx_mtp_depth`` (from ``get_mtp_depth()``,
-  i.e. the ``mtp_num_draft_tokens`` model setting; nemotron_h defaults to a
+  i.e. the ``mtp_adaptive_max_depth`` model setting; nemotron_h defaults to a
   fixed depth-1 cycle — the stock head is depth-1 trained) on MTP-bearing
   instances, plus ``_omlx_mtp_head_hidden_normed`` — nemotron's
   ``return_hidden`` hidden is already post-``norm_f``, so
@@ -54,16 +54,31 @@ def apply() -> bool:
         logger.debug("nemotron_h base MTP patch missing; chain patch skipped")
         return False
 
+    # Every sub-patch below guards itself per surface, so re-running them is
+    # a cheap no-op when nothing changed. Do NOT early-return on the class
+    # flag alone: a single flag cannot know that some surface was reinstalled
+    # underneath us (a module reload, a monkeypatched teardown, the base
+    # patch re-applying), and skipping the sub-patches then leaves that
+    # surface permanently unwrapped. Run them and let the per-surface
+    # markers decide; only the log is gated, which is what the planner's
+    # every-10s autoconfigure tick actually needed quieted.
+    already_applied = (
+        getattr(nh.Model, "_omlx_nh_chain_init", False)
+        and _is_ours(nh.Model, "mtp_forward")
+        and _is_ours(nh.NemotronHMamba2Mixer, "__call__")
+    )
+
     _patch_mixer(nh)
     _patch_ssm_sequential()
     _patch_conv_capture(nh)
     _patch_mtp_forward(nh)
     _patch_partial_rollback(nh)
     _patch_init_markers(nh)
-    logger.info(
-        "nemotron_h MTP chain patch applied "
-        "(depth-k drafting, sequential fused verify, replay-free rollback)"
-    )
+    if not already_applied:
+        logger.info(
+            "nemotron_h MTP chain patch applied "
+            "(depth-k drafting, sequential fused verify, replay-free rollback)"
+        )
     return True
 
 
@@ -376,10 +391,11 @@ def _patch_init_markers(nh):
     def __init__(self, args):
         orig_init(self, args)
         if hasattr(self, "mtp"):
-            from . import get_mtp_depth
+            from . import get_mtp_depth, is_mtp_depth_fixed
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             # return_hidden hidden is post-norm_f already: the chain's
             # trunk-norm hook must be identity for this model.
             self._omlx_mtp_head_hidden_normed = True

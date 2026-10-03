@@ -129,6 +129,27 @@ class TestBenchmarkRequest:
         )
         assert req.warmup_mode is BenchmarkWarmupMode.ANE_2048
 
+    def test_ane_aligned_prompt_adds_one_to_single_trials(self):
+        from omlx.admin.benchmark import _single_prompt_lengths
+
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[4096, 8192],
+            align_prompt_to_ane=True,
+        )
+
+        assert _single_prompt_lengths(req) == [4097, 8193]
+
+    def test_standard_prompt_lengths_remain_unchanged(self):
+        from omlx.admin.benchmark import _single_prompt_lengths
+
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[4096, 8192],
+        )
+
+        assert _single_prompt_lengths(req) == [4096, 8192]
+
     def test_unknown_warmup_mode_is_rejected(self):
         with pytest.raises(ValueError, match="warmup_mode"):
             BenchmarkRequest(
@@ -567,6 +588,40 @@ class TestRunSingleTest:
             )
 
         assert metrics["ttft_ms"] == pytest.approx(200.0)
+        assert metrics["gen_tps"] is None
+        assert metrics["tpot_ms"] is None
+
+    @pytest.mark.asyncio
+    async def test_early_stop_burst_has_no_decode_rate(self):
+        """Two queued MTP tokens then EOS must not report a burst rate as tg."""
+
+        class EarlyStopEngine:
+            async def stream_generate(self, **kwargs):
+                for count, at in ((1, 1.0), (2, 1.0004)):
+                    yield SimpleNamespace(
+                        completion_tokens=count,
+                        prompt_tokens=1024,
+                        cached_tokens=0,
+                        generated_at=at,
+                        generated_until=at,
+                    )
+                yield SimpleNamespace(
+                    completion_tokens=2,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    finished=True,
+                    finish_reason="stop",
+                )
+
+        with patch("omlx.admin.benchmark.time.perf_counter", side_effect=[0.0, 1.05]):
+            metrics = await _run_single_test(
+                EarlyStopEngine(),
+                prompt=[0] * 1024,
+                max_tokens=128,
+                pp_len=1024,
+            )
+
+        assert metrics["completion_tokens"] == 2
         assert metrics["gen_tps"] is None
         assert metrics["tpot_ms"] is None
 
@@ -1033,7 +1088,7 @@ class TestFilterUploadedSettings:
                 turboquant_kv_enabled=True,
                 turboquant_kv_bits=4,
                 mtp_enabled=True,
-                mtp_num_draft_tokens=3,
+                mtp_adaptive_max_depth=3,
                 index_cache_freq=4,
                 guided_grammar_enabled=True,
                 qwen35_ane_prefill_enabled=True,
@@ -1047,7 +1102,7 @@ class TestFilterUploadedSettings:
             )
         )
         assert out["turboquant_kv_bits"] == 4
-        assert out["mtp_num_draft_tokens"] == 3
+        assert out["mtp_adaptive_max_depth"] == 3
         assert out["index_cache_freq"] == 4
         assert out["guided_grammar_enabled"] is True
         assert out["qwen35_ane_prefill_enabled"] is True
@@ -1058,6 +1113,72 @@ class TestFilterUploadedSettings:
         assert out["qwen35_ane_prefill_gdn"] is True
         assert out["qwen35_ane_prefill_gdn_fraction"] == 0.5
         assert out["qwen35_ane_prefill_gdn_max_layers"] == 48
+
+    def test_shareable_performance_fields_are_kept(self):
+        out = _filter_uploaded_settings(
+            self._settings(
+                qwen35_oq_a8_enabled=True,
+                qwen35_oq_a8_min_tokens=64,
+                moe_expert_offload_enabled=True,
+                moe_expert_offload_resident_fraction=0.5,
+                dflash_in_memory_cache_max_bytes=123,
+                dflash_ssd_cache_max_bytes=456,
+            )
+        )
+        assert out["qwen35_oq_a8_enabled"] is True
+        assert out["qwen35_oq_a8_min_tokens"] == 64
+        assert out["moe_expert_offload_enabled"] is True
+        assert out["moe_expert_offload_resident_fraction"] == 0.5
+        assert out["dflash_in_memory_cache_max_bytes"] == 123
+        assert out["dflash_ssd_cache_max_bytes"] == 456
+
+    def test_full_snapshot_stays_under_the_size_cap(self):
+        from omlx.admin import benchmark as bench
+
+        out = _filter_uploaded_settings(
+            self._settings(
+                max_context_window=262144,
+                max_tokens=32768,
+                temperature=0.6,
+                top_p=0.95,
+                top_k=20,
+                min_p=0.0,
+                repetition_penalty=1.0,
+                presence_penalty=0.0,
+                enable_thinking=True,
+                thinking_budget_enabled=True,
+                thinking_budget_tokens=8192,
+                reasoning_parser="qwen3",
+                model_type_override="vlm",
+                index_cache_freq=4,
+                turboquant_kv_enabled=True,
+                turboquant_kv_bits=4,
+                specprefill_draft_model="/models/org/Qwen3-0.6B-specprefill-draft",
+                specprefill_keep_pct=0.5,
+                specprefill_threshold=2048,
+                dflash_enabled=True,
+                dflash_draft_model="/models/z-lab/Qwen3.8-27B-DFlash2-b16",
+                dflash_draft_quant_enabled=True,
+                dflash_draft_quant_weight_bits=4,
+                dflash_draft_quant_activation_bits=8,
+                dflash_draft_quant_group_size=64,
+                dflash_max_ctx=131072,
+                dflash_draft_window_size=4096,
+                dflash_draft_sink_size=4,
+                dflash_block_size=16,
+                dflash_verify_mode="adaptive",
+                vlm_mtp_draft_model="gemma-4-26B-A4B-it-assistant",
+                vlm_mtp_draft_block_size=8,
+                qwen35_ane_prefill_max_layers=64,
+            )
+        )
+        assert "temperature" in out, "must not fall back to accelerator flags only"
+        assert (
+            len(json.dumps(out, separators=(",", ":")))
+            <= bench._MAX_UPLOADED_SETTINGS_BYTES
+        )
+        # The site prepends the benchmark_context label; keep headroom for it.
+        assert bench._MAX_UPLOADED_SETTINGS_BYTES + 64 <= 8192
 
     def test_free_text_and_organization_fields_are_dropped(self):
         out = _filter_uploaded_settings(
@@ -2113,6 +2234,58 @@ class TestRunExternalBenchmark:
 
 
 class TestAneBenchmarkTrace:
+    def test_summary_reports_observed_scheduler_calls_not_implied_prompt_width(
+        self, caplog
+    ):
+        with caplog.at_level(logging.INFO):
+            _log_ane_benchmark_trace(
+                pp_len=4097,
+                prefill_duration_s=1.0,
+                config={"sequence_length": 2048, "mlp_layers": 2},
+                profile={"mlp": {"operations": 4}},
+                scheduler_trace={
+                    "chunk_tokens": [2048, 2048],
+                    "requested_steps": [4096, 4096],
+                    "boundary_enabled": True,
+                    "cache_block_size": 2048,
+                },
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        summary = next(m for m in messages if "[benchmark-ane-summary]" in m)
+        assert "model_calls=2" in summary
+        assert "model_call_widths=2048x2" in summary
+        assert "requested_steps=4096x2" in summary
+        assert "boundary_enabled=True" in summary
+        assert "cache_block_size=2048" in summary
+        assert "accounting=observed" in summary
+        assert "full_ane_tiles=2" in summary
+        assert "gpu_tail_tokens=0" in summary
+
+    def test_summary_distinguishes_one_wide_call_from_two_tiles(self, caplog):
+        with caplog.at_level(logging.INFO):
+            _log_ane_benchmark_trace(
+                pp_len=4097,
+                prefill_duration_s=1.0,
+                config={"sequence_length": 2048, "mlp_layers": 2},
+                profile={"mlp": {"operations": 4}},
+                scheduler_trace={
+                    "chunk_tokens": [4096],
+                    "requested_steps": [4096],
+                    "boundary_enabled": False,
+                    "cache_block_size": 0,
+                },
+            )
+
+        summary = next(
+            record.getMessage()
+            for record in caplog.records
+            if "[benchmark-ane-summary]" in record.getMessage()
+        )
+        assert "model_calls=1" in summary
+        assert "model_call_widths=4096x1" in summary
+        assert "full_ane_tiles=2" in summary
+
     def test_expectations_follow_compiled_layers(self, caplog):
         with caplog.at_level(logging.INFO):
             _log_ane_benchmark_trace(

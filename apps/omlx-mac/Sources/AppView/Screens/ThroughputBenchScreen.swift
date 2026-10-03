@@ -64,6 +64,7 @@ struct ThroughputBenchScreen: View {
                 selectedModelId: $vm.selectedModelId,
                 contextProfile: $vm.contextProfile,
                 warmupMode: $vm.warmupMode,
+                alignPromptToAne: $vm.alignPromptToAne,
                 promptLengths: $vm.promptLengths,
                 genLength: $vm.genLength,
                 batchSizes: $vm.batchSizes,
@@ -128,7 +129,7 @@ private struct DeviceChip: View {
                 .foregroundStyle(theme.textSecondary)
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, 2)
         .padding(.bottom, 8)
     }
@@ -161,6 +162,7 @@ private struct ConfigurationSection: View {
     @Binding var selectedModelId: String
     @Binding var contextProfile: BenchmarkContextProfile
     @Binding var warmupMode: BenchmarkWarmupMode
+    @Binding var alignPromptToAne: Bool
     @Binding var promptLengths: Set<Int>
     @Binding var genLength: String
     @Binding var batchSizes: Set<Int>
@@ -195,7 +197,7 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Throughput Bench model picker")) {
                 Popup(
                     selection: $selectedModelId,
-                    width: 320,
+                    width: .controlWide,
                     options: modelOptions
                 )
             }
@@ -208,7 +210,7 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Throughput Bench context picker")) {
                 Popup(
                     selection: $contextProfile,
-                    width: 220,
+                    width: .controlMedium,
                     options: BenchmarkContextProfile.allCases.map {
                         PopupOption(value: $0, label: $0.localizedLabel)
                     }
@@ -230,22 +232,31 @@ private struct ConfigurationSection: View {
                                      defaultValue: "Full · 2,048",
                                      comment: "Full 2048-token ANE benchmark warm-up option")),
                 ])
-                .frame(width: 260)
                 .disabled(running)
             }
 
-            FreeRow {
-                ChipRow(
-                    title: String(localized: "bench.throughput.row.context_lengths.title",
-                                  defaultValue: "Context lengths",
-                                  comment: "Inline title above the prompt-length chip row"),
-                    sublabel: String(localized: "bench.throughput.row.context_lengths.sub",
-                                     defaultValue: "Prompt tokens to feed for each single-request trial",
-                                     comment: "Sublabel under the prompt-length chip row"),
+            Row(label: String(localized: "bench.throughput.row.ane_alignment.label",
+                              defaultValue: "ANE-aligned prompts",
+                              comment: "Row label for aligned throughput benchmark prompts"),
+                sublabel: String(localized: "bench.throughput.row.ane_alignment.sub",
+                                 defaultValue: "Add one prompt token so PP4097 produces exactly 4,096 prefill rows. Aligned results remain local.",
+                                 comment: "Explanation of the ANE-aligned throughput benchmark option")) {
+                RowSwitch(isOn: $alignPromptToAne)
+                    .disabled(running)
+            }
+
+            Row(label: String(localized: "bench.throughput.row.context_lengths.title",
+                              defaultValue: "Context lengths",
+                              comment: "Inline title above the prompt-length chip row"),
+                sublabel: String(localized: "bench.throughput.row.context_lengths.sub",
+                                 defaultValue: "Prompt tokens to feed for each single-request trial",
+                                 comment: "Sublabel under the prompt-length chip row")) {
+                ChipGroup(
                     options: Self.promptLengthOptions,
                     selection: $promptLengths,
                     format: Self.formatPromptLength
                 )
+                .disabled(running)
             }
 
             Row(label: String(localized: "bench.throughput.row.gen_length.label",
@@ -258,22 +269,22 @@ private struct ConfigurationSection: View {
                     text: $genLength,
                     placeholder: "128",
                     mono: true,
-                    width: 110
+                    width: .controlCompact
                 )
             }
 
-            FreeRow {
-                ChipRow(
-                    title: String(localized: "bench.throughput.row.batch_sizes.title",
-                                  defaultValue: "Batch sizes",
-                                  comment: "Inline title above the batch-size chip row"),
-                    sublabel: String(localized: "bench.throughput.row.batch_sizes.sub",
-                                     defaultValue: "Concurrent requests per batch in the continuous-batching phase",
-                                     comment: "Sublabel under the batch-size chip row"),
+            Row(label: String(localized: "bench.throughput.row.batch_sizes.title",
+                              defaultValue: "Batch sizes",
+                              comment: "Inline title above the batch-size chip row"),
+                sublabel: String(localized: "bench.throughput.row.batch_sizes.sub",
+                                 defaultValue: "Concurrent requests per batch in the continuous-batching phase",
+                                 comment: "Sublabel under the batch-size chip row")) {
+                ChipGroup(
                     options: Self.batchSizeOptions,
                     selection: $batchSizes,
                     format: { "\($0)" }
                 )
+                .disabled(running)
             }
 
             Row(isLast: true) {
@@ -343,36 +354,24 @@ private struct ConfigurationSection: View {
     }
 }
 
-// MARK: - Chip row
+// MARK: - Chip group
 
-private struct ChipRow: View {
-    let title: String
-    let sublabel: String
+/// Multi-select strip of toggle chips, used as a `Row` trailing. Styled to
+/// echo the segmented control — quiet fill, accent when selected — but with
+/// detached segments and gaps because multiple values can be active at once.
+private struct ChipGroup: View {
     let options: [Int]
     @Binding var selection: Set<Int>
     let format: (Int) -> String
 
-    @Environment(\.omlxTheme) private var theme
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.omlxText(13, weight: .medium))
-                    .foregroundStyle(theme.text)
-                Text(sublabel)
-                    .font(.omlxText(11.5))
-                    .foregroundStyle(theme.textSecondary)
-            }
-            HStack(spacing: 6) {
-                ForEach(options, id: \.self) { value in
-                    Chip(
-                        label: format(value),
-                        isSelected: selection.contains(value),
-                        onTap: { toggle(value) }
-                    )
-                }
-                Spacer(minLength: 0)
+        HStack(spacing: 5) {
+            ForEach(options, id: \.self) { value in
+                Chip(
+                    label: format(value),
+                    isSelected: selection.contains(value),
+                    onTap: { toggle(value) }
+                )
             }
         }
     }
@@ -397,19 +396,16 @@ private struct Chip: View {
         Button(action: onTap) {
             Text(label)
                 .font(.omlxText(11.5, weight: .medium))
-                .foregroundStyle(isSelected ? theme.accentText : theme.textSecondary)
+                // Chips must never compress: under width pressure SwiftUI
+                // would otherwise wrap "128K" to "12/8K". The label column
+                // absorbs the squeeze instead.
+                .fixedSize()
+                .foregroundStyle(isSelected ? theme.accentText : theme.text)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
                 .background(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(isSelected ? theme.accent : theme.controlBg)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .strokeBorder(
-                                    isSelected ? Color.clear : theme.inputBorder,
-                                    lineWidth: 0.5
-                                )
-                        )
+                        .fill(isSelected ? theme.accent : theme.hoverBg)
                 )
                 .contentShape(Rectangle())
         }
@@ -903,7 +899,7 @@ private struct OwnerHashRow: View {
             }
             .buttonStyle(.omlx(.plain, size: .small))
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, 4)
         .padding(.bottom, 10)
     }

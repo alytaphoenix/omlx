@@ -96,6 +96,7 @@ class MockRerankerEngineImpl(RerankerEngine):
         # Don't call super().__init__ to avoid loading real model
         self._model_name = model_name
         self._model = None  # Set as None but present
+        self.calls: List[Dict[str, Any]] = []
 
     @property
     def model_name(self) -> str:
@@ -110,6 +111,7 @@ class MockRerankerEngineImpl(RerankerEngine):
     async def rerank(
         self, query: str, documents: List[str], top_n: Optional[int] = None, **kwargs
     ) -> MockRerankOutput:
+        self.calls.append({"documents": list(documents), "kwargs": dict(kwargs)})
         n_docs = len(documents)
         scores = [0.9 - i * 0.2 for i in range(n_docs)]
         indices = list(range(n_docs))
@@ -470,6 +472,34 @@ class TestResponsesEndpoint:
         assert data["output"][1]["content"][0]["text"] == "Hello!"
         assert data["usage"]["output_tokens_details"]["reasoning_tokens"] == 3
 
+    def test_response_endpoint_marks_length_as_incomplete(
+        self, client, mock_llm_engine
+    ):
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(
+                text="Partial response",
+                prompt_tokens=2,
+                completion_tokens=3,
+                finish_reason="length",
+                finished=True,
+            )
+        )
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "max_output_tokens": 3,
+                "store": False,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "incomplete"
+        assert data["incomplete_details"] == {"reason": "max_output_tokens"}
+
     def test_responses_forwards_request_chat_template_kwargs(
         self, client, mock_llm_engine
     ):
@@ -552,6 +582,45 @@ class TestResponsesEndpoint:
         assert output[1]["content"][0]["text"] == "Hello!"
         usage = completed["response"]["usage"]
         assert usage["output_tokens_details"]["reasoning_tokens"] == 3
+
+    def test_response_stream_emits_incomplete_event_on_length(
+        self, client, mock_llm_engine
+    ):
+        async def stream_chat(messages, **kwargs):
+            yield MockGenerationOutput(
+                text="Partial response",
+                new_text="Partial response",
+                prompt_tokens=2,
+                completion_tokens=3,
+                finish_reason="length",
+                finished=True,
+            )
+
+        mock_llm_engine.stream_chat = stream_chat
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "max_output_tokens": 3,
+                "stream": True,
+                "store": False,
+            },
+        )
+
+        assert response.status_code == 200
+        terminal_block = response.text.strip().split("\n\n")[-1]
+        assert terminal_block.startswith("event: response.incomplete\n")
+        data_line = next(
+            line for line in terminal_block.splitlines() if line.startswith("data: ")
+        )
+        event = json.loads(data_line.removeprefix("data: "))
+        assert event["type"] == "response.incomplete"
+        assert event["response"]["status"] == "incomplete"
+        assert event["response"]["incomplete_details"] == {
+            "reason": "max_output_tokens"
+        }
 
     def test_response_stream_summary_log_names_model(self, client, caplog):
         with caplog.at_level("INFO", logger="omlx.server"):
@@ -1106,6 +1175,32 @@ class TestChatCompletionEndpoint:
         )
 
         assert response.status_code == 200
+
+    def test_zero_thinking_budget_does_not_enable_template_thinking(
+        self, client, mock_llm_engine
+    ):
+        """Zero is forwarded as a clamp, not as a request to turn thinking on."""
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(text="Chat response.")
+
+        mock_llm_engine.chat = chat
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "thinking_budget": 0,
+            },
+        )
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs[0]["thinking_budget"] == 0
+        assert "enable_thinking" not in recorded_chat_kwargs[0].get(
+            "chat_template_kwargs", {}
+        )
 
     def test_chat_completion_includes_cached_tokens_on_cache_hit(
         self, client, mock_llm_engine
@@ -1718,6 +1813,22 @@ class TestRerankEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert len(data["results"]) == 2
+
+    def test_rerank_forwards_max_length(self, client, mock_engine_pool):
+        """Request max_length must reach the engine; omitted means model default."""
+        mock_engine_pool._models.append(
+            {"id": "test-rerank-model", "loaded": True, "pinned": False, "size": 500000}
+        )
+        body = {"model": "test-rerank-model", "query": "q", "documents": ["d"]}
+
+        statuses = [
+            client.post("/v1/rerank", json={**body, **extra}).status_code
+            for extra in ({}, {"max_length": 8192}, {"max_length": 0})
+        ]
+        assert statuses == [200, 200, 422]
+
+        calls = mock_engine_pool._reranker_engine.calls
+        assert [call["kwargs"]["max_length"] for call in calls] == [None, 8192]
 
     def test_rerank_response_format(self, client, mock_engine_pool):
         """Test rerank response format."""
@@ -2370,3 +2481,47 @@ class TestJsonOutputParsing:
         data = response.json()
         output_text = data["output"][0]["content"][0]["text"]
         assert "Hello" in output_text
+
+
+@pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
+def test_nonstream_thinking_length_channels(client, mock_llm_engine, api):
+    mock_llm_engine.chat = AsyncMock(
+        return_value=MockGenerationOutput(
+            text="<think>unfinished", finish_reason="length"
+        )
+    )
+    body = {"model": "test-model", "max_tokens": 64}
+    if api == "responses":
+        body["input"] = "Reply OK"
+    else:
+        body["messages"] = [{"role": "user", "content": "Reply OK"}]
+    response = client.post(f"/v1/{api}", json=body)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    if api == "chat/completions":
+        message = data["choices"][0]["message"]
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        assert data["choices"][0]["finish_reason"] == "length"
+    elif api == "messages":
+        content = "".join(b["text"] for b in data["content"] if b["type"] == "text")
+        reasoning = "".join(
+            b["thinking"] for b in data["content"] if b["type"] == "thinking"
+        )
+        assert data["stop_reason"] == "max_tokens"
+    else:
+        content = "".join(
+            b["text"]
+            for item in data["output"]
+            if item["type"] == "message"
+            for b in item["content"]
+            if b["type"] == "output_text"
+        )
+        reasoning = "".join(
+            b["text"]
+            for item in data["output"]
+            if item["type"] == "reasoning"
+            for b in item["summary"]
+        )
+    assert content == ""
+    assert reasoning == "unfinished"
