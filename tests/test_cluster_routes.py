@@ -2363,7 +2363,7 @@ def test_forget_cluster_with_unreachable_peer(monkeypatch, local_only):
     prepared = []
 
     class Pool:
-        def resolve_cluster_model_id(self, model):
+        def resolve_cluster_model_id(self, model, *, text_only=False):
             return "model"
 
         async def prepare_cluster_reload(self, model_id, **kwargs):
@@ -2404,7 +2404,7 @@ def test_forget_cluster_preserves_setup_when_local_stop_fails(monkeypatch):
     removed = []
 
     class Pool:
-        def resolve_cluster_model_id(self, model):
+        def resolve_cluster_model_id(self, model, *, text_only=False):
             return "model"
 
         async def prepare_cluster_reload(self, model_id, **kwargs):
