@@ -7,7 +7,7 @@ import logging
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .responses_models import (
     InputItem,
@@ -45,6 +45,69 @@ def _try_parse_json(s: str):
         return json.loads(s)
     except (json.JSONDecodeError, ValueError):
         return s
+
+
+_TOOL_OUTPUT_TEXT_TYPES = ("input_text", "text", "output_text")
+
+
+def _extract_tool_output_text(
+    output: List[Any],
+    image_parts: Optional[List[Dict[str, Any]]],
+) -> Optional[str]:
+    """Extract text from a multimodal function_call_output list.
+
+    Returns None when the list has no recognized content parts so the
+    caller can fall back to JSON serialization. Image parts are appended
+    to ``image_parts`` for VLM processing when provided; otherwise they
+    become a placeholder so base64 payloads never reach the prompt.
+    """
+    recognized = any(
+        isinstance(part, dict)
+        and part.get("type") in (*_TOOL_OUTPUT_TEXT_TYPES, "input_image")
+        for part in output
+    )
+    if not recognized:
+        return None
+
+    text_parts: List[str] = []
+    for part in output:
+        if isinstance(part, str):
+            text_parts.append(part)
+        elif isinstance(part, dict):
+            part_type = part.get("type")
+            if part_type in _TOOL_OUTPUT_TEXT_TYPES:
+                text_parts.append(part.get("text", ""))
+            elif part_type == "input_image":
+                if image_parts is not None:
+                    image_url = part.get("image_url", part.get("url", ""))
+                    image_parts.append(
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": part.get("detail", "auto"),
+                        }
+                    )
+                else:
+                    text_parts.append("(see attached image)")
+            else:
+                text_parts.append(json.dumps(part))
+        else:
+            text_parts.append(str(part))
+    return "\n".join(p for p in text_parts if p)
+
+
+def _flush_pending_tool_images(
+    messages: List[Dict[str, Any]],
+    pending_images: List[Dict[str, Any]],
+) -> None:
+    """Flush tool-output images as a user message after a tool run.
+
+    Emitted only once the consecutive function_call_output items end so
+    tool messages stay contiguous for strict chat templates.
+    """
+    if pending_images:
+        messages.append({"role": "user", "content": list(pending_images)})
+        pending_images.clear()
 
 
 def _flush_pending_tool_calls(
@@ -115,6 +178,7 @@ def convert_responses_input_to_messages(
     instructions: Optional[str] = None,
     previous_messages: Optional[List[Dict[str, Any]]] = None,
     consolidate_system_messages: bool = True,
+    preserve_images: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert Responses API input to internal messages format.
 
@@ -126,6 +190,10 @@ def convert_responses_input_to_messages(
             into one leading system message for strict templates. Server code can
             set this to False and resolve placement after the target template is
             known.
+        preserve_images: If True, images in function_call_output lists are
+            preserved as a user message following the tool run so VLM engines
+            can extract them. If False, they become a text placeholder, and
+            message image parts are dropped so the content stays a string.
 
     Returns:
         List of message dicts compatible with chat template.
@@ -170,12 +238,18 @@ def convert_responses_input_to_messages(
     pending_tool_calls: List[Dict[str, Any]] = []
     # Track reasoning content to attach to the next assistant message
     pending_reasoning: str = ""
+    # Track images extracted from function_call_output lists; flushed as a
+    # user message once the consecutive tool-output run ends
+    pending_tool_images: List[Dict[str, Any]] = []
 
     for item in input_data:
         # Resolve effective type: EasyInputMessage has no type field
         item_type = item.type
         if item_type is None and item.role is not None:
             item_type = "message"
+
+        if item_type != "function_call_output":
+            _flush_pending_tool_images(messages, pending_tool_images)
 
         if item_type == "message":
             # Flush pending tool calls before a new message. Reasoning
@@ -220,7 +294,7 @@ def convert_responses_input_to_messages(
                     elif isinstance(part, str):
                         text_parts.append(part)
                         converted_parts.append({"type": "text", "text": part})
-                if has_image:
+                if has_image and preserve_images:
                     # Keep as content list so VLM can extract images
                     content = converted_parts
                 else:
@@ -260,6 +334,7 @@ def convert_responses_input_to_messages(
         elif item.type == "function_call":
             # Assistant's tool call — accumulate for grouping
             call_id = item.call_id or item.id or f"call_{uuid.uuid4().hex[:8]}"
+            namespace = getattr(item, "namespace", None)
             pending_tool_calls.append(
                 {
                     "id": call_id,
@@ -267,6 +342,7 @@ def convert_responses_input_to_messages(
                     "function": {
                         "name": item.name or "",
                         "arguments": _try_parse_json(item.arguments or "{}"),
+                        **({"namespace": namespace} if namespace else {}),
                     },
                 }
             )
@@ -281,16 +357,27 @@ def convert_responses_input_to_messages(
                 pending_reasoning=pending_reasoning,
             )
 
+            output_content = item.output or ""
+            if isinstance(item.output, list):
+                extracted = _extract_tool_output_text(
+                    item.output,
+                    pending_tool_images if preserve_images else None,
+                )
+                output_content = (
+                    extracted if extracted is not None else json.dumps(item.output)
+                )
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": item.call_id or "",
-                    "content": item.output or "",
+                    "content": output_content,
                 }
             )
 
-    # Flush remaining pending tool calls. If reasoning survived without
-    # a trailing message, attach it to the synthesized tool_calls message.
+    # Flush images from a trailing tool-output run, then any remaining
+    # pending tool calls. If reasoning survived without a trailing
+    # message, attach it to the synthesized tool_calls message.
+    _flush_pending_tool_images(messages, pending_tool_images)
     _flush_pending_tool_calls(
         messages,
         pending_tool_calls,
@@ -314,13 +401,50 @@ def convert_responses_input_to_messages(
 # =============================================================================
 
 
+def _namespace_wire_name(namespace: str, name: str, taken: set) -> str:
+    """Join a namespace and a child name the way Codex's join_tool_name() does.
+
+    A name a flat tool already holds is suffixed rather than shadowing it.
+    """
+    joined = f"{namespace.rstrip('_')}__{name.lstrip('_')}"
+    wire = joined
+    suffix = 2
+    while wire in taken:
+        wire = f"{joined}_{suffix}"
+        suffix += 1
+    return wire
+
+
+def _convert_function_tool(
+    tool: ResponsesTool, name: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Convert one flat function tool, or None if it is not one."""
+    if tool.type != "function" or not tool.name:
+        return None
+    func_def: Dict[str, Any] = {"name": name or tool.name}
+    if tool.description:
+        func_def["description"] = tool.description
+    if tool.parameters:
+        func_def["parameters"] = tool.parameters
+    if tool.strict is not None:
+        func_def["strict"] = tool.strict
+    return {"type": "function", "function": func_def}
+
+
 def convert_responses_tools(
     tools: Optional[List[ResponsesTool]],
+    aliases: Optional[Dict[str, Tuple[str, str]]] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """Convert Responses API flat tool format to Chat Completions nested format.
 
     Responses: {"type": "function", "name": "fn", "parameters": {...}}
     Chat Completions: {"type": "function", "function": {"name": "fn", "parameters": {...}}}
+
+    A "namespace" tool is a container of ordinary client-executed function
+    tools (the shape Codex uses for each MCP server), so its members are
+    expanded under a joined wire name instead of being skipped. When
+    ``aliases`` is given it is filled with ``wire_name -> (namespace, name)``
+    so a resulting call can be returned with its namespace intact (#3371).
 
     Non-function tool types (local_shell, mcp, web_search, etc.) are skipped
     since they are not supported by local model chat templates.
@@ -329,19 +453,60 @@ def convert_responses_tools(
         return None
 
     result = []
+    taken = {tool.name for tool in tools if tool.type == "function" and tool.name}
     for tool in tools:
-        if tool.type == "function" and tool.name:
-            func_def: Dict[str, Any] = {"name": tool.name}
-            if tool.description:
-                func_def["description"] = tool.description
-            if tool.parameters:
-                func_def["parameters"] = tool.parameters
-            if tool.strict is not None:
-                func_def["strict"] = tool.strict
-            result.append({"type": "function", "function": func_def})
+        if tool.type == "namespace" and tool.name:
+            for member in getattr(tool, "tools", None) or []:
+                if isinstance(member, dict):
+                    member = ResponsesTool(**member)
+                if not isinstance(member, ResponsesTool) or not member.name:
+                    continue
+                wire = _namespace_wire_name(tool.name, member.name, taken)
+                converted = _convert_function_tool(member, name=wire)
+                if converted:
+                    taken.add(wire)
+                    if aliases is not None:
+                        aliases[wire] = (tool.name, member.name)
+                    result.append(converted)
+            continue
+        converted = _convert_function_tool(tool)
+        if converted:
+            result.append(converted)
         # Non-function tools (local_shell, mcp, web_search, etc.) are
         # silently skipped — local models can't execute them.
     return result if result else None
+
+
+def split_namespace_tool_name(
+    name: str,
+    aliases: Optional[Dict[str, Tuple[str, str]]] = None,
+) -> Tuple[Optional[str], str]:
+    """Restore ``(namespace, name)`` for a call made by wire name.
+
+    Flat tools are unaffected: they return ``(None, name)``.
+    """
+    if aliases:
+        entry = aliases.get(name)
+        if entry:
+            return entry
+    return None, name
+
+
+def apply_namespace_tool_aliases(
+    messages: List[Dict[str, Any]],
+    aliases: Dict[str, Tuple[str, str]],
+) -> None:
+    """Map preserved history identities to the current request's tool names."""
+    wire_names = {identity: wire for wire, identity in aliases.items()}
+    for message in messages:
+        for call in message.get("tool_calls", []):
+            function = call.get("function", {})
+            namespace = function.pop("namespace", None)
+            if namespace:
+                name = function["name"]
+                function["name"] = wire_names.get(
+                    (namespace, name), _namespace_wire_name(namespace, name, set())
+                )
 
 
 # =============================================================================
@@ -370,6 +535,7 @@ def build_function_call_output_item(
     call_id: str,
     item_id: Optional[str] = None,
     status: str = "completed",
+    namespace: Optional[str] = None,
 ) -> OutputItem:
     """Build a function_call-type OutputItem."""
     return OutputItem(
@@ -379,6 +545,7 @@ def build_function_call_output_item(
         call_id=call_id,
         name=name,
         arguments=arguments,
+        namespace=namespace,
     )
 
 
@@ -665,6 +832,7 @@ def normalize_response_output_to_messages(
             messages.append(msg_dict)
         elif item_type == "function_call":
             call_id = item.get("call_id", f"call_{uuid.uuid4().hex[:8]}")
+            namespace = item.get("namespace")
             pending_tool_calls.append(
                 {
                     "id": call_id,
@@ -672,6 +840,7 @@ def normalize_response_output_to_messages(
                     "function": {
                         "name": item.get("name", ""),
                         "arguments": _try_parse_json(item.get("arguments", "{}")),
+                        **({"namespace": namespace} if namespace else {}),
                     },
                 }
             )
