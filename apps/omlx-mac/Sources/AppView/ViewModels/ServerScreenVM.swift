@@ -18,6 +18,15 @@ final class ServerScreenVM {
     var basePathText: String = AppConfig.defaultBasePath()
     var modelDirTexts: [String] = [""]
     var hfCacheEnabled: Bool = true
+    /// Live switch; commits through `saveUsageHistory()` like the other
+    /// auto-apply rows rather than the Apply button.
+    var usageHistoryEnabled: Bool = true
+    private(set) var hasPendingDefaults = false
+    @ObservationIgnored
+    private var restoreBeforeReset: (() -> Void)?
+    var showResetNotice = false
+    private(set) var isLoading = false
+    private(set) var isResetting = false
     var lastError: String?
     /// Non-fatal notice for the offline endpoint-only Apply path (§G4) —
     /// mirrors `WelcomeViewModel.apiKeyWarning`, the established pattern for
@@ -64,7 +73,91 @@ final class ServerScreenVM {
     @ObservationIgnored
     private var hasLoaded = false
 
+    func resetDefaults(client: OMLXClient) async {
+        guard !isLoading, !isResetting, !showResetNotice else { return }
+        isResetting = true
+        defer { isResetting = false }
+        let previous = (
+            host: host,
+            portText: portText,
+            logLevel: logLevel,
+            autoStartOnLaunch: autoStartOnLaunch,
+            sseKeepaliveMode: sseKeepaliveMode,
+            maxAudioUploadSizeText: maxAudioUploadSizeText,
+            serverAliasesText: serverAliasesText,
+            hfCacheEnabled: hfCacheEnabled,
+            usageHistoryEnabled: usageHistoryEnabled,
+            samplingContextText: samplingContextText,
+            samplingMaxTokensText: samplingMaxTokensText,
+            samplingTemperatureText: samplingTemperatureText,
+            samplingTopPText: samplingTopPText,
+            samplingTopKText: samplingTopKText,
+            samplingRepetitionPenaltyText: samplingRepetitionPenaltyText,
+            hasPendingDefaults: hasPendingDefaults,
+            lastError: lastError
+        )
+        do {
+            let dto = try await client.getGlobalSettingsDefaults()
+            restoreBeforeReset = { [weak self] in
+                guard let self else { return }
+                self.host = previous.host
+                self.portText = previous.portText
+                self.logLevel = previous.logLevel
+                self.autoStartOnLaunch = previous.autoStartOnLaunch
+                self.sseKeepaliveMode = previous.sseKeepaliveMode
+                self.maxAudioUploadSizeText = previous.maxAudioUploadSizeText
+                self.serverAliasesText = previous.serverAliasesText
+                self.hfCacheEnabled = previous.hfCacheEnabled
+                self.usageHistoryEnabled = previous.usageHistoryEnabled
+                self.samplingContextText = previous.samplingContextText
+                self.samplingMaxTokensText = previous.samplingMaxTokensText
+                self.samplingTemperatureText = previous.samplingTemperatureText
+                self.samplingTopPText = previous.samplingTopPText
+                self.samplingTopKText = previous.samplingTopKText
+                self.samplingRepetitionPenaltyText = previous.samplingRepetitionPenaltyText
+                self.hasPendingDefaults = previous.hasPendingDefaults
+                self.lastError = previous.lastError
+            }
+            self.host = dto.server.host
+            self.portText = String(dto.server.port)
+            self.logLevel = canonicalize(level: dto.server.logLevel)
+            self.autoStartOnLaunch = dto.server.autoStartOnLaunch ?? true
+            self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
+            self.maxAudioUploadSizeText = dto.server.maxAudioUploadSize ?? "100MB"
+            self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
+            self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
+            self.usageHistoryEnabled = dto.usage?.usageHistory ?? true
+            if let s = dto.sampling {
+                self.samplingContextText = String(s.maxContextWindow)
+                self.samplingMaxTokensText = String(s.maxTokens)
+                self.samplingTemperatureText = trimDouble(s.temperature)
+                self.samplingTopPText = trimDouble(s.topP)
+                self.samplingTopKText = String(s.topK)
+                self.samplingRepetitionPenaltyText = trimDouble(s.repetitionPenalty)
+            }
+
+            self.hasPendingDefaults = true
+
+            self.lastError = nil
+            self.showResetNotice = true
+        } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
+    func cancelReset() {
+        restoreBeforeReset?()
+        confirmReset()
+    }
+
+    func confirmReset() {
+        restoreBeforeReset = nil
+        showResetNotice = false
+    }
+
     func load(client: OMLXClient) async {
+        isLoading = true
+        defer { isLoading = false }
         self.client = client
         do {
             let dto = try await client.getGlobalSettings()
@@ -85,6 +178,7 @@ final class ServerScreenVM {
                 self.modelDirTexts = modelDirs
             }
             self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
+            self.usageHistoryEnabled = dto.usage?.usageHistory ?? true
             if let s = dto.sampling {
                 self.samplingContextText = String(s.maxContextWindow)
                 self.samplingMaxTokensText = String(s.maxTokens)
@@ -106,6 +200,7 @@ final class ServerScreenVM {
     /// Snapshot current draft values as the new "applied" baseline. Called
     /// at the end of `load()` and after a successful `applyServerSettings()`.
     private func snapshotApplyBaselines() {
+        hasPendingDefaults = false
         let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
         baselinePortText = t(portText)
         baselineSamplingContextText = t(samplingContextText)
@@ -125,6 +220,7 @@ final class ServerScreenVM {
     /// Address / Log Level / SSE Keep-Alive Mode auto-apply via `bind()`
     /// and are intentionally excluded from this check.
     func hasPendingServerChanges(services: AppServices) -> Bool {
+        if hasPendingDefaults { return true }
         let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
         if t(portText) != baselinePortText { return true }
         if t(samplingContextText) != baselineSamplingContextText { return true }
@@ -151,6 +247,14 @@ final class ServerScreenVM {
         var patch = GlobalSettingsPatch()
         var nextPort: Int? = nil
         self.offlineApplyNotice = nil
+        let nextHost = hasPendingDefaults && host != appliedBindAddress ? host : nil
+        if hasPendingDefaults {
+            patch.host = nextHost
+            patch.logLevel = logLevel
+            patch.sseKeepaliveMode = sseKeepaliveMode
+            patch.autoStartOnLaunch = autoStartOnLaunch
+            patch.usageHistory = usageHistoryEnabled
+        }
 
         if t(portText) != baselinePortText {
             guard let p = Int(t(portText)), (1...65535).contains(p) else {
@@ -254,7 +358,7 @@ final class ServerScreenVM {
             patch.modelDirs = diff.normalizedModelDirs
         }
 
-        let patchHasFields = patch.port != nil
+        let patchHasFields = hasPendingDefaults || patch.port != nil
             || patch.samplingMaxContextWindow != nil
             || patch.samplingMaxTokens != nil
             || patch.samplingTemperature != nil
@@ -273,45 +377,29 @@ final class ServerScreenVM {
             return
         }
 
-        // Offline Apply (§G4): everything except the listen Port lives only
-        // in the server's own settings store — the mac app's sole writer is
-        // the live PATCH below, which throws immediately when offline. Fail
-        // fast on those instead of silently no-op'ing (or, worse, snapshotting
-        // baselines as if they'd saved). Port-only changes CAN be persisted
-        // locally for the next manual start.
-        if !services.serverState.isRunningLike {
-            let patchHasNonEndpointFields = patch.samplingMaxContextWindow != nil
-                || patch.samplingMaxTokens != nil
-                || patch.samplingTemperature != nil
-                || patch.samplingTopP != nil
-                || patch.samplingTopK != nil
-                || patch.samplingRepetitionPenalty != nil
-                || patch.serverAliases != nil
-                || patch.hfCacheEnabled != nil
-                || patch.modelDirs != nil
-            if patchHasNonEndpointFields || diff.hasChanges {
+        if services.canSaveSettingsOffline && patchHasFields {
+            guard let nextPort, patch == GlobalSettingsPatch(port: nextPort), !diff.hasChanges else {
                 self.lastError = String(
-                    localized: "server.error.offline_apply_needs_server",
-                    defaultValue: "Start the server to apply sampling, alias, cache, or storage changes. Only Port can be changed while it's offline.",
-                    comment: "Server screen error when Apply is tapped offline with pending changes beyond just the listen port"
+                    localized: "server.error.offline_port_only",
+                    defaultValue: "Apply the port change separately while the server is stopped. Start the server before applying other settings.",
+                    comment: "Offline Apply supports port recovery without a running server"
                 )
                 return
             }
-            if let p = nextPort {
+            Task {
                 do {
-                    // applyServerEndpoint's managed-server branch calls
-                    // start() as a side effect of its online reconfigure
-                    // contract — wrong here, since the server isn't
-                    // supposed to launch just because Apply was clicked.
-                    try services.saveServerEndpointOffline(port: p)
-                    self.effectivePort = p
+                    try await services.applyServerEndpoint(port: nextPort)
+                    self.effectivePort = nextPort
+                    self.baselinePortText = String(nextPort)
+                    // Offline save lives in AppConfig only — tell the user it
+                    // takes effect on the next manual start (§G4).
                     self.offlineApplyNotice = String(
                         localized: "server.notice.offline_apply_saved",
                         defaultValue: "Saved locally — takes effect the next time the server starts.",
                         comment: "Server screen notice after an offline-only Apply of the listen port"
                     )
-                    self.lastError = nil
                     self.snapshotApplyBaselines()
+                    self.lastError = nil
                 } catch {
                     self.lastError = error.omlxDescription
                 }
@@ -331,6 +419,9 @@ final class ServerScreenVM {
                 if patchHasFields, let client {
                     _ = try await client.updateGlobalSettings(patch)
                 }
+                if hasPendingDefaults {
+                    try services.setAutoStartOnLaunch(autoStartOnLaunch, persist: false)
+                }
                 if diff.baseChanged {
                     // Hand the bundled port to the storage flow so its single
                     // restart binds the new port. Without this the restart
@@ -348,15 +439,16 @@ final class ServerScreenVM {
                     try await services.applyStorageChanges(
                         basePath: diff.baseChanged ? diff.normalizedBase : nil,
                         modelDirs: relocatedModelDirs,
-                        port: nextPort
+                        port: nextPort,
+                        host: nextHost
                     )
                     self.basePathText = services.config.basePath
                     self.modelDirTexts = services.config.effectiveModelDirs
                     if let p = nextPort { self.effectivePort = p }
                 } else {
-                    if let p = nextPort {
-                        try await services.applyServerEndpoint(port: p)
-                        self.effectivePort = p
+                    if nextPort != nil || nextHost != nil {
+                        try await services.applyServerEndpoint(host: nextHost, port: nextPort)
+                        if let p = nextPort { self.effectivePort = p }
                     }
                     if diff.modelDirsChanged {
                         var updated = services.config
@@ -364,6 +456,10 @@ final class ServerScreenVM {
                         services.updateConfig(updated)
                         self.modelDirTexts = diff.normalizedModelDirs
                     }
+                }
+                if let nextHost {
+                    self.appliedBindAddress = nextHost
+                    self.effectiveHost = AppConfig.connectableHost(for: nextHost)
                 }
                 self.lastError = nil
                 self.snapshotApplyBaselines()
@@ -511,7 +607,7 @@ final class ServerScreenVM {
     func saveHost(services: AppServices) {
         let next = host
         Task {
-            await commit(GlobalSettingsPatch(host: next))
+            guard await commit(GlobalSettingsPatch(host: next)) else { return }
             do {
                 try await services.applyServerEndpoint(host: next)
                 self.appliedBindAddress = next
@@ -584,10 +680,10 @@ final class ServerScreenVM {
             do {
                 if portChanged || hostChanged {
                     if portChanged {
-                        await commit(GlobalSettingsPatch(port: parsedPort))
+                        guard await commit(GlobalSettingsPatch(port: parsedPort)) else { return }
                     }
                     if hostChanged {
-                        await commit(GlobalSettingsPatch(host: host))
+                        guard await commit(GlobalSettingsPatch(host: host)) else { return }
                     }
                     try await services.applyServerEndpoint(
                         host: hostChanged ? host : nil,
@@ -613,6 +709,10 @@ final class ServerScreenVM {
 
     func saveSseKeepaliveMode() {
         Task { await commit(GlobalSettingsPatch(sseKeepaliveMode: sseKeepaliveMode)) }
+    }
+
+    func saveUsageHistory() {
+        Task { await commit(GlobalSettingsPatch(usageHistory: usageHistoryEnabled)) }
     }
 
     func saveAutoStartOnLaunch(services: AppServices) {
@@ -644,7 +744,7 @@ final class ServerScreenVM {
             set: { newValue in
                 let changed = binding.wrappedValue != newValue
                 binding.wrappedValue = newValue
-                if changed { save() }
+                if changed && !self.hasPendingDefaults { save() }
             }
         )
     }
