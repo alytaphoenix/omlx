@@ -30,10 +30,12 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .deepseek_v41_delta import compact_snapshot as compact_deepseek_v41_snapshot
 from .paged_ssd_cache import (
     HAS_MLX,
     _encode_shape,
     _extract_tensor_bytes,
+    _fsync_parent_dir,
     _has_zero_dim,
     _restore_tensor_from_bytes,
     _write_safetensors_no_mx,
@@ -264,6 +266,7 @@ class BoundarySnapshotSSDStore:
                 return False
             if block_size is not None:
                 compact_pooling_cache_snapshot(extracted, token_count, block_size)
+                compact_deepseek_v41_snapshot(extracted, token_count, block_size)
 
             # 2. Flatten tensors + metadata for safetensors serialization.
             tensors_raw, metadata = self._serialize_extracted(
@@ -424,7 +427,15 @@ class BoundarySnapshotSSDStore:
                 arrays, metadata = data
             else:
                 return None
-            return self._reconstruct_from_safetensors(arrays, metadata)
+            reconstructed = self._reconstruct_from_safetensors(arrays, metadata)
+            if reconstructed is None:
+                return None
+            # mx.load returns file-backed lazy arrays. Materialize them while
+            # this ephemeral snapshot still exists so the reconstructed cache
+            # cannot retain a read primitive past cleanup or promotion.
+            if arrays:
+                mx.eval(*arrays.values())
+            return reconstructed
         except Exception as e:
             logger.debug(
                 "Failed to load boundary snapshot %s/%d: %s",
@@ -455,7 +466,15 @@ class BoundarySnapshotSSDStore:
             if not (isinstance(data, tuple) and len(data) == 2):
                 return None
             arrays, metadata = data
-            return self._reconstruct_from_safetensors(arrays, metadata)
+            reconstructed = self._reconstruct_from_safetensors(arrays, metadata)
+            if reconstructed is None:
+                return None
+            # ``take_staged_file`` transfers this path to a caller that may
+            # move or unlink it immediately after load_file returns. Detach
+            # every lazy input from the file before returning cache state.
+            if arrays:
+                mx.eval(*arrays.values())
+            return reconstructed
         except Exception as e:
             logger.debug("Failed to load committed boundary snapshot %s: %s", file_path, e)
             return None
@@ -519,8 +538,13 @@ class BoundarySnapshotSSDStore:
             if not self._is_safe_snapshot_path(detached_path):
                 return None
             os.replace(file_path, detached_path)
-            with suppress(OSError):
-                file_path.parent.rmdir()
+            # Do not tidy the (possibly empty) request directory here. The
+            # writer thread creates it with ``mkdir(exist_ok=True)`` and only
+            # then writes the staging file for a later boundary; an ``rmdir``
+            # slipping between those two steps made that write fail with
+            # ENOENT, so the later checkpoint could never be promoted and
+            # the split-GDN store stopped one block short. ``cleanup_request``
+            # removes the directory once the request is done.
             return detached_path
         except Exception as e:
             logger.debug(
@@ -977,6 +1001,7 @@ class BoundarySnapshotSSDStore:
                     )
                     return False
                 os.replace(str(temp_path), str(file_path))
+                _fsync_parent_dir(file_path)
                 wrote_file = True
                 if self._is_cancelled(pw_key[0]):
                     with suppress(OSError):
@@ -1131,6 +1156,7 @@ class BoundarySnapshotSSDStore:
                 )
                 return
             os.rename(str(temp_path), str(file_path))
+            _fsync_parent_dir(file_path)
 
             # Cleanup may race with a queued write; remove any late file.
             if self._is_cancelled(pw_key[0]):
@@ -1242,7 +1268,9 @@ class BoundarySnapshotSSDStore:
                             info[f"sub_{j}_missing_{k}"] = "1"
                             continue
                         if _has_zero_dim(elem):
-                            arrays[f"layer_{i}_sub_{j}_state_{k}"] = mx.zeros((1,))
+                            arrays[f"layer_{i}_sub_{j}_state_{k}"] = mx.zeros(
+                                (1,), dtype=elem.dtype
+                            )
                             info[f"sub_{j}_zero_dim_{k}"] = _encode_shape(elem.shape)
                         else:
                             arrays[f"layer_{i}_sub_{j}_state_{k}"] = elem
@@ -1261,7 +1289,9 @@ class BoundarySnapshotSSDStore:
                             info[f"missing_{k}"] = "1"
                             continue
                         if _has_zero_dim(elem):
-                            arrays[f"layer_{i}_state_{k}"] = mx.zeros((1,))
+                            arrays[f"layer_{i}_state_{k}"] = mx.zeros(
+                                (1,), dtype=elem.dtype
+                            )
                             info[f"zero_dim_{k}"] = _encode_shape(elem.shape)
                         else:
                             key = f"layer_{i}_state_{k}"
