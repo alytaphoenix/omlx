@@ -20,6 +20,48 @@ import pytest
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 
+@pytest.fixture(autouse=True)
+def _restore_global_sdpa_bindings():
+    """Undo the process-global sdpa rebinds these tests install.
+
+    ``apply_turboquant_attention_patch`` rebinds ``scaled_dot_product_attention``
+    on every mlx_lm/mlx_vlm module attribute process-wide. Left in place, it
+    decides which dispatcher owns that attribute for every later test file —
+    e.g. test_qwen35_verify_sdpa_split's chain test then wraps whatever is
+    bound when it runs, and a later fake-kernel install (test_qwen35_fa256's
+    ``"steel"`` stub) leaks through it as a non-array output. Snapshot and
+    restore around each test so this file leaves the binding graph exactly
+    as it found it, like test_sdpa256_attention's snapshot/restore helpers.
+    """
+    import sys
+
+    from omlx.patches import turboquant_attention
+
+    def _snapshot():
+        snap = {}
+        for name, mod in list(sys.modules.items()):
+            if mod is None or not (
+                name.startswith("mlx_lm.models.")
+                or name.startswith("mlx_vlm.models.")
+            ):
+                continue
+            fn = getattr(mod, "scaled_dot_product_attention", None)
+            if fn is not None:
+                snap[name] = fn
+        return snap
+
+    was_patched = turboquant_attention._PATCHED
+    snap = _snapshot()
+    try:
+        yield
+    finally:
+        for name, fn in snap.items():
+            mod = sys.modules.get(name)
+            if mod is not None:
+                mod.scaled_dot_product_attention = fn
+        turboquant_attention._PATCHED = was_patched
+
+
 def _classes():
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import (
