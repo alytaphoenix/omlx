@@ -103,13 +103,35 @@ class TestI18nKeys:
         Storing it is a no-op (the loader falls back to English for missing
         keys anyway) but leaves untranslated padding on disk that looks
         translated. Omit the key instead of pasting the English value.
+
+        A small set of keys is exempt: other locale tests assert these are
+        always explicitly present (not relying on the English-fallback
+        path), and their correct translation is legitimately identical to
+        English in at least one locale (e.g. a short technical term).
         """
         en = json.loads((I18N_DIR / "en.json").read_text(encoding="utf-8"))
+        required_even_if_redundant = {
+            "navbar.tab.cluster",
+            "settings.advanced.uploads",
+            "settings.advanced.max_audio_upload_size",
+            "settings.advanced.max_audio_upload_size_hint",
+            "settings.auth.skip_verification_warning",
+            "js.error.api_key_required_network",
+            "acc_bench.config.external_extra_body",
+            "acc_bench.config.external_extra_body_hint",
+            "js.error.external_extra_body_invalid_json",
+            "js.error.external_extra_body_object_required",
+            "js.error.external_extra_body_protected",
+        }
         for locale_path in sorted(I18N_DIR.glob("*.json")):
             if locale_path.name == "en.json":
                 continue
             locale = json.loads(locale_path.read_text(encoding="utf-8"))
-            redundant = {k for k, v in locale.items() if en.get(k) == v}
+            redundant = {
+                k
+                for k, v in locale.items()
+                if en.get(k) == v and k not in required_even_if_redundant
+            }
             assert not redundant, f"{locale_path.name}: redundant with en.json: {sorted(redundant)}"
 
 
