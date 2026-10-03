@@ -22,11 +22,13 @@ from omlx.api.markitdown import (
     MARKITDOWN_MODEL_ID,
     MarkItDownFile,
     MarkItDownRequestError,
+    convert_attachment_to_markdown_async,
     convert_file_to_markdown,
     parse_file_part,
     preprocess_markitdown_file_parts,
     preprocess_markitdown_file_parts_async,
     quiet_pdf_parser_loggers,
+    stream_attachment_to_markdown_async,
 )
 from omlx.api.markitdown_pdf_fallback import (
     convert_pdf_with_ocr_engine,
@@ -285,15 +287,59 @@ def test_markitdown_stream_response_starts_before_conversion(monkeypatch):
     asyncio.run(exercise())
 
 
-def test_markitdown_non_stream_response_starts_before_conversion(monkeypatch):
+def test_markitdown_fast_conversion_returns_plain_response(monkeypatch):
+    """A conversion that resolves within the keepalive grace period skips
+    the StreamingResponse/leading-space dance entirely and returns a plain
+    response with a real status code -- see
+    ``omlx.server._json_response_or_keepalive``.
+    """
+    state = ServerState()
+    state.engine_pool = _EmptyPool()
+    state.global_settings = _settings_with_markitdown_model()
+
+    async def fake_convert_messages(*args, **kwargs):
+        return "Converted markdown"
+
+    monkeypatch.setattr(
+        server_module,
+        "convert_messages_to_markdown_async",
+        fake_convert_messages,
+    )
+    request = ChatCompletionRequest(
+        model=MARKITDOWN_MODEL_ID,
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    async def exercise():
+        with patch("omlx.server._server_state", state):
+            response = await server_module._create_markitdown_chat_completion(
+                request,
+                None,
+            )
+
+        assert not isinstance(response, StreamingResponse)
+        assert response.status_code == 200
+        assert "Converted markdown" in response.body.decode()
+
+    asyncio.run(exercise())
+
+
+def test_markitdown_slow_conversion_streams_keepalive_before_body(monkeypatch):
+    """A conversion that outlives the grace period falls back to
+    keepalive streaming so the client doesn't read-timeout waiting for
+    headers on a long MarkItDown/OCR pass.
+    """
     state = ServerState()
     state.engine_pool = _EmptyPool()
     state.global_settings = _settings_with_markitdown_model()
     started = False
 
+    monkeypatch.setattr(server_module, "_JSON_KEEPALIVE_GRACE_S", 0.01)
+
     async def fake_convert_messages(*args, **kwargs):
         nonlocal started
         started = True
+        await asyncio.sleep(0.05)
         return "Converted markdown"
 
     monkeypatch.setattr(
@@ -314,7 +360,6 @@ def test_markitdown_non_stream_response_starts_before_conversion(monkeypatch):
             )
 
         assert isinstance(response, StreamingResponse)
-        assert started is False
 
         iterator = response.body_iterator.__aiter__()
         first = await iterator.__anext__()
@@ -857,6 +902,94 @@ def test_ocr_pdf_engine_streams_ready_prefix_in_page_order(monkeypatch):
         "### Page 2",
         "### Page 3",
     ]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_missing_ocr_model_falls_back_to_markitdown(monkeypatch, stream, empty):
+    class FakePool:
+        def resolve_model_id(self, model_id, settings_manager):
+            return model_id
+
+        def get_entry(self, model_id):
+            return None
+
+    calls = []
+
+    def fake_convert(file):
+        calls.append(file.filename)
+        return "" if empty else "Extracted PDF text"
+
+    monkeypatch.setattr(
+        "omlx.api.markitdown._convert_file_with_markitdown", fake_convert
+    )
+    settings = GlobalSettings()
+    settings.integrations.markitdown_pdf_processing_engine = "GLM-OCR-bf16"
+    file = MarkItDownFile("paper.pdf", "application/pdf", b"pdf")
+
+    async def convert():
+        kwargs = dict(global_settings=settings, engine_pool=FakePool())
+        if stream:
+            return "".join(
+                [
+                    chunk
+                    async for chunk in stream_attachment_to_markdown_async(
+                        file, **kwargs
+                    )
+                ]
+            )
+        return await convert_attachment_to_markdown_async(file, **kwargs)
+
+    if empty:
+        with pytest.raises(MarkItDownRequestError, match="Select an OCR"):
+            asyncio.run(convert())
+    else:
+        assert "Extracted PDF text" in asyncio.run(convert())
+    assert calls == ["paper.pdf"]
+    assert settings.integrations.markitdown_pdf_processing_engine == "GLM-OCR-bf16"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_ocr_runtime_error_does_not_fall_back(monkeypatch, stream):
+    class FakePool:
+        def resolve_model_id(self, model_id, settings_manager):
+            return model_id
+
+        def get_entry(self, model_id):
+            return types.SimpleNamespace(config_model_type="glm_ocr", engine_type="vlm")
+
+        def acquire(self, model_id):
+            raise RuntimeError("OCR loading failed")
+
+    def unexpected_fallback(file):
+        pytest.fail("An available OCR model must not fall back to MarkItDown")
+
+    monkeypatch.setattr(
+        "omlx.api.markitdown._convert_file_with_markitdown", unexpected_fallback
+    )
+    monkeypatch.setattr(
+        "omlx.api.markitdown_pdf_fallback.render_pdf_pages_to_image_data_uris",
+        lambda file: ["data:image/png;base64,test"],
+    )
+    settings = GlobalSettings()
+    settings.integrations.markitdown_pdf_processing_engine = "GLM-OCR-bf16"
+    file = MarkItDownFile("paper.pdf", "application/pdf", b"pdf")
+
+    async def convert():
+        kwargs = dict(
+            global_settings=settings,
+            engine_pool=FakePool(),
+            get_sampling_params=lambda *_: (0, 1, 0, 1, 0, 0, 0, 128, 0, 0),
+        )
+        if stream:
+            return [
+                chunk
+                async for chunk in stream_attachment_to_markdown_async(file, **kwargs)
+            ]
+        return await convert_attachment_to_markdown_async(file, **kwargs)
+
+    with pytest.raises(RuntimeError, match="OCR loading failed"):
+        asyncio.run(convert())
 
 
 def test_ocr_pdf_engine_rejects_non_ocr_config_model_type():
