@@ -21,6 +21,7 @@ capped at 40 and marked as one they were working on.
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,6 +32,9 @@ from fastapi.testclient import TestClient
 from omlx.cluster import routes
 
 GiB = 1024**3
+
+_REPO = Path(__file__).resolve().parents[1]
+_DASHBOARD_JS = _REPO / "omlx" / "admin" / "static" / "js" / "dashboard.js"
 
 
 # Regression tests for the dashboard's cluster wiring (PR 3140 merge):
