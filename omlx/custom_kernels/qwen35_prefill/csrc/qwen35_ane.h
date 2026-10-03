@@ -38,6 +38,15 @@ public:
   Ticket begin(MTL::CommandBuffer *command_buffer);
   void execute(Ticket ticket);
   void wait(Ticket ticket);
+  // Retire a ticket whose producer command buffer failed before execute()
+  // was ever called: balances the submission counters and wakes waiters
+  // without latching the program (the failure is per-submission, typically
+  // a request abort, not a program fault).
+  void cancel_ticket(Ticket ticket);
+  // True once an evaluation has failed or timed out on this program; the
+  // program is latched and every later begin() will throw. Lets the Python
+  // layer detect a wedged program at graph-construction time and fall back.
+  bool has_error();
   // Run one throwaway evaluation to pay the first-run compilation cost at
   // load time instead of inside the first user request. Input contents are
   // irrelevant; the output is discarded.
@@ -49,6 +58,8 @@ private:
   explicit AneLinearModel(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
 
+  friend std::shared_ptr<AneLinearModel> ane_compile_program(
+      const std::string &, const mlx::core::array &, int, int, int);
   friend class AneLinearBankBuilder;
   friend class AneFusedBankBuilder;
   friend std::shared_ptr<AneLinearModel>
@@ -153,6 +164,12 @@ mlx::core::array qwen35_ane_cpu_fp16_affine_qmm_t(
 
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_fp16_linear(
     const mlx::core::array &weight, int sequence_length);
+
+mlx::core::array ane_planar(const mlx::core::array &x,
+    const std::shared_ptr<AneLinearModel> &model);
+std::shared_ptr<AneLinearModel> ane_compile_program(
+    const std::string &mil, const mlx::core::array &weight_blob,
+    int input_dim, int output_dim, int sequence_length);
 
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
     const mlx::core::array &gate_weight,
