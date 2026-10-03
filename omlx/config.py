@@ -10,6 +10,7 @@ This module provides unified configuration management with:
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,7 +44,10 @@ def parse_size(size_str: str) -> int:
         if size_str.endswith(unit):
             try:
                 value = float(size_str[: -len(unit)])
-                return int(value * multiplier)
+                byte_value = value * multiplier
+                if not math.isfinite(byte_value):
+                    raise ValueError
+                return int(byte_value)
             except ValueError:
                 pass
 
@@ -62,6 +66,8 @@ class ServerConfig:
     port: int = 8000
     log_level: str = "info"
     cors_origins: List[str] = field(default_factory=lambda: ["*"])
+    max_image_upload_size: str = "50MB"
+    max_image_side_length: int = 2048
 
 
 @dataclass
@@ -197,6 +203,16 @@ class OMLXConfig:
         config.server.host = os.getenv("OMLX_HOST", config.server.host)
         config.server.port = int(os.getenv("OMLX_PORT", str(config.server.port)))
         config.server.log_level = os.getenv("OMLX_LOG_LEVEL", config.server.log_level)
+        config.server.max_image_upload_size = (
+            os.getenv("OMLX_MAX_IMAGE_UPLOAD_SIZE")
+            or os.getenv("OMLX_MAX_IMAGE_BYTES")
+            or config.server.max_image_upload_size
+        )
+        if side_len := os.getenv("OMLX_MAX_IMAGE_SIDE_LENGTH"):
+            try:
+                config.server.max_image_side_length = int(side_len)
+            except ValueError:
+                pass
 
         # Model settings
         config.model.model_name = os.getenv("OMLX_MODEL", config.model.model_name)
@@ -273,6 +289,10 @@ class OMLXConfig:
             config.server.port = args.port
         if hasattr(args, "log_level") and args.log_level:
             config.server.log_level = args.log_level
+        if hasattr(args, "max_image_upload_size") and args.max_image_upload_size:
+            config.server.max_image_upload_size = args.max_image_upload_size
+        if hasattr(args, "max_image_side_length") and args.max_image_side_length is not None:
+            config.server.max_image_side_length = args.max_image_side_length
 
         if hasattr(args, "model") and args.model:
             config.model.model_name = args.model
