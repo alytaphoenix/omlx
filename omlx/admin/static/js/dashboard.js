@@ -7,6 +7,9 @@
     // Wrapping the global fetch for cluster paths only means every current
     // and future cluster call site participates without being touched.
     (() => {
+        // A page environment without fetch at all (unit-test vm sandboxes)
+        // has nothing to wrap; the bar never fires there.
+        if (typeof window.fetch !== 'function') return;
         const nativeFetch = window.fetch.bind(window);
         window.fetch = async function (input, init) {
             const response = await nativeFetch(input, init);
