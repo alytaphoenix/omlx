@@ -652,6 +652,69 @@ def test_qwen_decode_mask_follows_in_place_finalize_padding(module_name, cache_n
     assert cache._qwen3_5_decode_left_padding == [2, 3]
 
 
+@pytest.mark.parametrize(
+    "left_padding,lengths,expected",
+    [
+        ([0, 0], [0, 3], [[False, False, False], [True, True, True]]),
+        ([1, 0], [2, 3], [[False, True, False], [True, True, True]]),
+        ([1, 0], [7, 7], [[False, True, True], [True, True, True]]),
+        (None, [1, 3], [[True, False, False], [True, True, True]]),
+        ([0, 0], [3, 7], None),
+        ([0, 0], None, None),
+    ],
+)
+def test_qwen_ssm_mask_preserves_padding_bounds(left_padding, lengths, expected):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language
+
+    from omlx.patches.qwen35_ssm_mask import apply_qwen35_ssm_mask_patch
+
+    apply_qwen35_ssm_mask_patch()
+    cache = ArraysCache(2, left_padding=left_padding)
+    if lengths is not None:
+        cache.prepare(lengths=lengths)
+    mask = language._create_qwen3_5_ssm_mask(mx.zeros((2, 3, 4)), cache)
+    assert (None if mask is None else mask.tolist()) == expected
+
+
+@pytest.mark.parametrize("chunk_size", [3, 7])
+def test_qwen_gdn_padded_prefill_matches_unpadded_state(chunk_size):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language
+    from mlx_vlm.models.qwen3_5.config import TextConfig
+
+    from omlx.patches.qwen35_ssm_mask import apply_qwen35_ssm_mask_patch
+
+    from test_mtp_prompt_priming import TINY_CONFIG
+
+    apply_qwen35_ssm_mask_patch()
+    mx.random.seed(173)
+    config = TextConfig.from_dict(
+        dict(TINY_CONFIG, linear_key_head_dim=128, linear_value_head_dim=128)
+    )
+    layer = language.Qwen3_5GatedDeltaNet(config)
+    layer.eval()
+    inputs = mx.random.normal((2, 7, config.hidden_size))
+    references = []
+    for row, length in enumerate([3, 7]):
+        reference = ArraysCache(2)
+        mx.eval(layer(inputs[row : row + 1, :length], cache=reference))
+        references.append(reference)
+
+    cache = ArraysCache.merge([ArraysCache(2), ArraysCache(2)])
+    cache.prepare(lengths=[3, 7])
+    for start in range(0, 7, chunk_size):
+        chunk = inputs[:, start : start + chunk_size]
+        mask = language._create_qwen3_5_ssm_mask(chunk, cache)
+        mx.eval(layer(chunk, mask=mask, cache=cache))
+
+    for row, reference in enumerate(references):
+        for state in range(2):
+            assert mx.allclose(
+                cache[state][row : row + 1], reference[state], atol=1e-6, rtol=1e-5
+            ).item()
+
+
 def test_dense_vlm_runtime_delegates_foreign_subclasses_unchanged():
     """The dense Qwen3.5 runtime patch must not wire foreign subclasses."""
     from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime

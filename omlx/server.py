@@ -2116,6 +2116,14 @@ def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
     return None
 
 
+def _no_repeat_ngram_kwargs(request) -> dict[str, int]:
+    size = getattr(request, "no_repeat_ngram_size", None)
+    if not size:
+        return {}
+    window = getattr(request, "ngram_window", None) or 0
+    return {"no_repeat_ngram_size": size, "ngram_window": window}
+
+
 def get_model_settings_for_request(model_id: str | None):
     """Return settings for the requested API model name via ModelSettingsManager."""
     sm = _server_state.settings_manager
@@ -4511,6 +4519,7 @@ async def create_completion(
             )
             if repetition_context_size is not None:
                 gen_kwargs["repetition_context_size"] = repetition_context_size
+            gen_kwargs.update(_no_repeat_ngram_kwargs(request))
 
             # First prompt's first-token timestamp only: later prompts start
             # after earlier generations, so their first_token_at would count
@@ -4980,6 +4989,7 @@ async def create_chat_completion(
         )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
+        chat_kwargs.update(_no_repeat_ngram_kwargs(request))
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
@@ -5808,6 +5818,7 @@ async def stream_completion(
     )
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
+    gen_kwargs.update(_no_repeat_ngram_kwargs(request))
     outputs = engine.stream_generate(
         prompt=prompt,
         max_tokens=max_tokens,

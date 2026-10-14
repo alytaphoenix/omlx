@@ -102,6 +102,7 @@ from .utils.metal_sync import (
     unreleased_graphics_bytes,
 )
 from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
+from .utils.sampling import make_no_repeat_ngram_processor
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.sampling import make_shared_sampler as omlx_make_shared_sampler
 from .utils.tokenizer import create_streaming_detokenizer
@@ -1398,6 +1399,30 @@ def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
     return False
 
 
+def _request_count(request: Any, name: str) -> int:
+    """An integer requeue field, or 0 for duck-typed requests."""
+    value = getattr(request, name, 0)
+    return value if isinstance(value, int) else 0
+
+
+def _requeue_row_state(request: Any) -> tuple | None:
+    state = getattr(request, "requeue_row_state", None)
+    return state if isinstance(state, tuple) else None
+
+
+def _insert_max_tokens(request: Any) -> int:
+    folded = _request_count(request, "requeued_output_tokens")
+    return max(1, request.sampling_params.max_tokens - folded)
+
+
+def _mark_generation_resumed(request: Any, now: float) -> None:
+    # A requeued row keeps its first decode start time.
+    folded = _request_count(request, "requeued_output_tokens")
+    if not folded or request.generation_started_at is None:
+        request.generation_started_at = now
+    request.requeue_row_state = None
+
+
 def _batch_generator_all_tokens(request: Any) -> list[int]:
     """Seed tokens for mlx-lm's TokenBuffer before the kickoff token."""
     token_ids = getattr(request, "prompt_token_ids", None)
@@ -1906,6 +1931,20 @@ class SchedulerOutput:
     has_work: bool = False
 
 
+class _ResumedStopSequences:
+    """Hands a requeued row's live stop matcher to its next generation batch.
+
+    GenerationBatch calls ``matcher()`` once per inserted row, so returning the
+    saved matcher keeps a partly matched stop sequence across the requeue.
+    """
+
+    def __init__(self, matcher: Any) -> None:
+        self._matcher = matcher
+
+    def matcher(self) -> Any:
+        return self._matcher
+
+
 class _BoundarySnapshotProvider:
     """Dict-like loader for extracted boundary snapshots.
 
@@ -2210,10 +2249,17 @@ class Scheduler:
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
         self._generation_overflow_recovery_ids: set[str] = set()
+        # Memory-pressure requeue. ProcessMemoryEnforcer sets the flag on the
+        # asyncio thread and step() drains it; requeued ids are re-admitted one
+        # at a time until they leave the scheduler.
+        self._pending_memory_requeue = False
+        self._memory_requeue_ids: set[str] = set()
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: set[str] = set()
+        # Client cancels whose computed prefix is stored before the abort.
+        self._abort_keep_cache_ids: set[str] = set()
 
         # Deferred between-turn Metal reclaim, requested by the (asyncio-thread)
         # ProcessMemoryEnforcer under pinned-model memory pressure. A bare bool
@@ -2889,7 +2935,7 @@ class Scheduler:
                     # Cleanup uid maps now that the slot is reclaimable.
                     _unregister_uid_row(self.model, uid)
                     del self.uid_to_request_id[uid]
-                if self.request_id_to_uid.get(request_id) == uid:
+                if uid is not None and self.request_id_to_uid.get(request_id) == uid:
                     del self.request_id_to_uid[request_id]
                 self._inflight_store_futures.pop(request_id, None)
                 self._inflight_store_info.pop(request_id, None)
@@ -2914,6 +2960,7 @@ class Scheduler:
                 drained = True
         self._pending_async_removes = pending
         if drained:
+            self._note_memory_admission_progress()
             # The completion-time deferred clear may have already fired while
             # the async store worker still owned extracted KV buffers. Anchor
             # another ordinary deferred clear to the point where those final
@@ -4514,6 +4561,15 @@ class Scheduler:
                 if vlm_embeds is not None and _saved_rope_deltas is not None:
                     self.model._language_model._rope_deltas = _saved_rope_deltas
                 request._prefill_saved_rope_deltas = None
+                # A client cancel keeps this progress; the cache is only
+                # reachable here, so extract it before the references drop.
+                if (
+                    request.request_id in self._abort_keep_cache_ids
+                    and self._abort_keeps_cache(request)
+                ):
+                    request._abort_store_prepared = self._prepare_abort_prefill_store(
+                        request, prompt_cache
+                    )
 
                 # Drop partial-prefill references before clearing the Metal pool.
                 # Otherwise the traceback frame can keep large KV/cache arrays
@@ -5599,6 +5655,13 @@ class Scheduler:
         self._clear_memory_admission_blocker(request_id)
         self._clear_store_cache_admission_blocker(request_id)
 
+    def _note_memory_admission_progress(self, now: float | None = None) -> None:
+        """Restart the memory admission timeout after completed work."""
+        if self._memory_admission_blocked_request_id is not None:
+            self._memory_admission_blocked_since = (
+                time.monotonic() if now is None else now
+            )
+
     def _memory_admission_stall_output(self, reason: str) -> RequestOutput | None:
         """Fail one head-of-line request after persistent memory admission stall."""
         if not self.waiting:
@@ -5640,7 +5703,8 @@ class Scheduler:
             tail=["reduce context length", "lower hot_cache_max_size"],
         )
         message = (
-            "Request could not be admitted because memory pressure persisted "
+            "Request could not be admitted because no request or cache cleanup "
+            "progress was observed "
             f"for {stalled_for:.1f}s ({reason}). {advice}."
         )
         logger.warning("Memory admission stalled for %s: %s", request_id, message)
@@ -6767,6 +6831,7 @@ class Scheduler:
         state = plan.state
         self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += plan.tokens
+        self._note_memory_admission_progress()
 
         # Boundary snapshot
         if state.boundary_enabled:
@@ -6859,7 +6924,10 @@ class Scheduler:
 
         Precondition: state.sampler, state.sm, state.per_row_lps are set.
         """
-        if request.sampling_params.seed is not None:
+        # A requeued row keeps the random stream it was already sampling from.
+        if request.sampling_params.seed is not None and not _request_count(
+            request, "requeued_output_tokens"
+        ):
             mx.random.seed(request.sampling_params.seed)
 
         # #2219: both chunked-completion paths (inline first chunk and
@@ -6907,7 +6975,7 @@ class Scheduler:
         with mx.stream(self._stream):
             uids = self.batch_generator.insert(
                 [state.last_token],
-                max_tokens=[request.sampling_params.max_tokens],
+                max_tokens=[_insert_max_tokens(request)],
                 caches=[state.cache] if state.cache else None,
                 all_tokens=[_batch_generator_all_tokens(request)],
                 samplers=[state.sampler],
@@ -6949,7 +7017,7 @@ class Scheduler:
                 raise
             request.batch_uid = uid
             request.status = RequestStatus.RUNNING
-            request.generation_started_at = now
+            _mark_generation_resumed(request, now)
             request.last_activity_at = now
 
             self.total_prompt_tokens += request.num_prompt_tokens
@@ -7376,6 +7444,13 @@ class Scheduler:
             if request.request_id in self._prefill_states
         )
 
+    def _stop_sequences_for_insert(self, request: "Request") -> Any:
+        """Stop sequences for an insert; a requeued row keeps its matcher."""
+        row_state = _requeue_row_state(request)
+        if row_state is not None:
+            return _ResumedStopSequences(row_state[2])
+        return self._build_state_machine(request)
+
     def _build_state_machine(self, request: "Request") -> StopSequences:
         """Build a StopSequences for per-request stop tokens.
 
@@ -7747,6 +7822,13 @@ class Scheduler:
                 else {}
             ),
         )
+        if sampling_params.no_repeat_ngram_size:
+            logits_processors.append(
+                make_no_repeat_ngram_processor(
+                    sampling_params.no_repeat_ngram_size,
+                    sampling_params.ngram_window,
+                )
+            )
 
         suppress_processor = _make_suppress_logits_processor(
             self._model_suppress_tokens
@@ -8826,6 +8908,7 @@ class Scheduler:
         self,
         request_id: str,
         full_token_sequence: list[int],
+        stop_at_generation_prompt: bool = True,
     ) -> (
         tuple[
             list[int],
@@ -8876,8 +8959,10 @@ class Scheduler:
         limit = total_tokens
         request = self.requests.get(request_id)
         marker = getattr(request, "generation_prompt_start", 0) or 0
-        if 0 < marker < limit and not getattr(
-            request, "generation_prompt_persists", False
+        if (
+            stop_at_generation_prompt
+            and 0 < marker < limit
+            and not getattr(request, "generation_prompt_persists", False)
         ):
             limit = marker
         valid_counts = sorted(
@@ -9303,8 +9388,13 @@ class Scheduler:
             return None
 
         prompt_tokens = list(request.prompt_token_ids or [])
+        folded_output_tokens = _request_count(request, "requeued_output_tokens")
         if _output_tokens_cacheable(request):
-            prompt_tokens += list(getattr(request, "output_token_ids", None) or [])
+            prompt_tokens += list(getattr(request, "output_token_ids", None) or [])[
+                folded_output_tokens:
+            ]
+        elif folded_output_tokens:
+            prompt_tokens = prompt_tokens[:-folded_output_tokens]
         boundary_override = self._get_boundary_store_override(request_id, prompt_tokens)
         if boundary_override is not None:
             (
@@ -9325,7 +9415,11 @@ class Scheduler:
             needs_member_refill = any(
                 self._has_blanked_cachelist_members(layer) for layer in boundary_cache
             )
-            if needs_placeholder_fill or needs_member_refill:
+            if (
+                needs_placeholder_fill
+                or needs_member_refill
+                or _request_count(request, "memory_requeues")
+            ):
                 live_payload = self._extract_live_request_cache_for_store(
                     request_id,
                     uid,
@@ -10474,6 +10568,11 @@ class Scheduler:
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
         self._try_specprefill_scoring(request)
+        if _request_count(request, "memory_requeues"):
+            # The requeue store holds the request's own progress, not a cache hit.
+            request.prefill_resumed_tokens = max(
+                0, request.cached_tokens - request.requeue_reported_cached_tokens
+            )
         self._prefix_cache_prepared.add(request.request_id)
 
     def add_request(self, request: Request) -> None:
@@ -11324,7 +11423,7 @@ class Scheduler:
                 aborted.append(uid)
         return aborted
 
-    def abort_request(self, request_id: str) -> bool:
+    def abort_request(self, request_id: str, keep_cache: bool = False) -> bool:
         """
         Enqueue a request for deferred abort.
 
@@ -11334,10 +11433,14 @@ class Scheduler:
 
         Args:
             request_id: The request ID to abort
+            keep_cache: Store the computed prefix first, so a client that
+                cancels and resends the prompt resumes from it.
 
         Returns:
             True (abort is always enqueued)
         """
+        if keep_cache:
+            self._abort_keep_cache_ids.add(request_id)
         self._pending_abort_ids.add(request_id)
         logger.debug(f"Enqueued deferred abort for request {request_id}")
         return True
@@ -11398,6 +11501,28 @@ class Scheduler:
         """
         self._pending_pressure_clear = True
 
+    def request_memory_requeue(self) -> int:
+        """Ask the inference thread to store and requeue every live request.
+
+        Called by ProcessMemoryEnforcer on the asyncio thread in place of an
+        abort-all at hard pressure. Returns how many requests will be
+        requeued, or 0 when they cannot all be kept, in which case the caller
+        aborts as before. Only flags and GIL-atomic reads happen here.
+        """
+        if self._pending_memory_requeue:
+            return len(self.running) + len(self.prefilling)
+        if not self._memory_requeue_storage_ready():
+            return 0
+        try:
+            live = [*self.running.values(), *self.prefilling]
+        except RuntimeError:  # The inference thread changed a queue mid-read.
+            return 0
+        # A lone request is re-admitted at once and needs the same memory.
+        if len(live) < 2 or any(self._memory_requeue_blocker(r) for r in live):
+            return 0
+        self._pending_memory_requeue = True
+        return len(live)
+
     def _consume_pressure_clear(self) -> bool:
         """Retire a pending hard-pressure clear (inference-thread side).
 
@@ -11447,16 +11572,21 @@ class Scheduler:
             after / 1024**3,
         )
 
-    def _do_abort_request(self, request_id: str) -> bool:
+    def _do_abort_request(
+        self, request_id: str, *, allow_cache_store: bool = True
+    ) -> bool:
         """
         Actually abort a request. Must be called from the step() context.
 
         Args:
             request_id: The request ID to abort
+            allow_cache_store: False during reset, after the store-worker barrier.
 
         Returns:
             True if request was found and aborted, False otherwise
         """
+        keep_cache = allow_cache_store and request_id in self._abort_keep_cache_ids
+        self._abort_keep_cache_ids.discard(request_id)
         request = self.requests.get(request_id)
         if request is None:
             return False
@@ -11480,6 +11610,18 @@ class Scheduler:
             if request is None:
                 return False
 
+        keep_cache = keep_cache and self._abort_keeps_cache(request)
+        if (
+            keep_cache
+            and request_id in self.running
+            and self.request_id_to_uid.get(request_id, -1) >= 0
+        ):
+            # Store the prompt as a finished request does; the row leaves the
+            # batch once that store completes.
+            request.set_finished(RequestStatus.FINISHED_ABORTED)
+            self._cleanup_finished({request_id})
+            return True
+
         self._clear_request_admission_bookkeeping(request_id)
 
         # Remove from waiting queue
@@ -11490,11 +11632,20 @@ class Scheduler:
                 pass
 
         # Remove from chunked-prefill queue (if mid-prefill)
+        store_future = None
+        # An external prefill extracts its progress at the abort point, before
+        # it drops the cache; see _do_external_prefill.
+        prepared = getattr(request, "_abort_store_prepared", None)
+        request._abort_store_prepared = None
         if request_id in self._prefill_states:
-            self._prefill_states.pop(request_id, None)
+            state = self._prefill_states.pop(request_id, None)
+            if keep_cache and state is not None:
+                prepared = self._prepare_abort_prefill_store(request, state.cache)
             self.prefilling = deque(
                 r for r in self.prefilling if r.request_id != request_id
             )
+        if keep_cache and prepared is not None:
+            store_future = self._submit_abort_store(request, prepared)
 
         # Remove from running (BatchGenerator)
         if request.request_id in self.request_id_to_uid:
@@ -11527,8 +11678,9 @@ class Scheduler:
         # forever (#766).
         self._cleanup_specprefill(request_id)
 
-        # Release blocks for eviction (same as _cleanup_finished)
-        if self.paged_cache_manager is not None:
+        # Release blocks for eviction (same as _cleanup_finished). A prefill
+        # store in flight releases them itself when it completes.
+        if self.paged_cache_manager is not None and store_future is None:
             block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table is None and hasattr(request, "block_table"):
                 block_table = request.block_table
@@ -11543,7 +11695,7 @@ class Scheduler:
                     )
 
         # Clear request entry from block_aware_cache
-        if self.block_aware_cache is not None:
+        if self.block_aware_cache is not None and store_future is None:
             self.block_aware_cache.clear_request_entry(request_id)
 
         # Clean up streaming detokenizer to prevent state contamination
@@ -11558,9 +11710,10 @@ class Scheduler:
         if hasattr(self.model, "clear_pending_embeddings"):
             self.model.clear_pending_embeddings()
 
-        # Drop any boundary snapshot for this request.
+        # Drop any boundary snapshot for this request. A store in flight may
+        # still read the on-disk snapshots; the async drain removes them.
         self._boundary_cache_snapshots.pop(request_id, None)
-        if self._boundary_snapshot_store is not None:
+        if self._boundary_snapshot_store is not None and store_future is None:
             self._boundary_snapshot_store.cleanup_request(request_id)
 
         # Remove from prefill progress tracker.
@@ -11573,11 +11726,13 @@ class Scheduler:
         # Remove from requests dict and clear cache references to release
         # MLX arrays promptly (mirrors _cleanup_finished behavior).
         # _cleanup_request (engine_core) no longer calls remove_finished_request,
-        # so this is the single cleanup point for aborted requests.
-        req_to_remove = self.requests.pop(request_id, None)
-        if req_to_remove is not None:
-            req_to_remove._extracted_cache = None
-            req_to_remove.prompt_cache = None
+        # so this is the single cleanup point for aborted requests. With a store
+        # in flight the async drain pops it instead.
+        if store_future is None:
+            req_to_remove = self.requests.pop(request_id, None)
+            if req_to_remove is not None:
+                req_to_remove._extracted_cache = None
+                req_to_remove.prompt_cache = None
 
         # Schedule the deferred Metal clear that _cleanup_finished would have
         # scheduled: aborts free KV/activation arrays into MLX's buffer pool
@@ -11590,6 +11745,80 @@ class Scheduler:
 
         logger.debug(f"Aborted request {request_id}")
         return True
+
+    def _abort_keeps_cache(self, request: "Request") -> bool:
+        """Whether a client cancel stores the request's computed prefix."""
+        return (
+            self.block_aware_cache is not None
+            and not self._admission_paused
+            and not getattr(request, "skip_cache_store", False)
+            and request.specprefill_indices is None
+            and not self._model_has_unreconstructible_cache()
+        )
+
+    def _convert_dropped_prefill_cache(self, prompt_cache: list[Any]) -> None:
+        """Give a partial prefill cache the TurboQuant layout of stored blocks.
+
+        Converts in place, the same way a finished prefill is converted, so
+        only use it on a cache that is dropped after the store.
+        """
+        if self._turboquant_kv_bits is not None and self._turboquant_eligible(
+            prompt_cache
+        ):
+            self._apply_turboquant_kv_convert(prompt_cache)
+
+    def _prepare_abort_prefill_store(
+        self, request: "Request", prompt_cache: list[Any]
+    ) -> tuple[list[int], list[Any], Any, Any] | None:
+        """Extract a cancelled prefill's progress for an off-thread store."""
+        if self._store_cache_executor is None:
+            return None
+        request_id = request.request_id
+        tokens = list(request.prompt_token_ids[: _cache_base_sizes(prompt_cache)])
+        try:
+            _safe_sync_stream(self._stream)
+            self._convert_dropped_prefill_cache(prompt_cache)
+            return self._prepare_live_cache_store(request_id, prompt_cache, tokens)
+        except Exception as e:
+            logger.debug("Cancelled prefill store skipped for %s: %s", request_id, e)
+            return None
+
+    def _submit_abort_store(
+        self, request: "Request", prepared: tuple[list[int], list[Any], Any, Any]
+    ) -> Any:
+        """Store a cancelled request's extracted progress off-thread."""
+        request_id = request.request_id
+        tokens, cache_to_store, model_cache_config, snapshots = prepared
+        gate = self._store_cache_gate
+        if gate is not None:
+            gate.note_submitted()
+        try:
+            future = self._store_cache_executor.submit(
+                self._async_store_cache_worker,
+                request_id,
+                tokens,
+                cache_to_store,
+                model_cache_config,
+                snapshots,
+                request.vlm_extra_keys_for_cache,
+                request.vlm_extra_key_token_start_for_cache,
+                request.vlm_extra_key_ranges_for_cache,
+                not self._bypass_hot_cache_under_pressure(),
+            )
+        except BaseException:
+            if gate is not None:
+                gate.note_done()
+            raise
+        self._inflight_store_futures[request_id] = future
+        self._inflight_store_info[request_id] = _InflightStoreInfo(
+            tokens=list(tokens),
+            extra_keys=request.vlm_extra_keys_for_cache,
+            extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+            extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+        )
+        # No batch row: the drain only waits for the store, then cleans up.
+        self._pending_async_removes.append((None, request_id, future))
+        return future
 
     def has_requests(self) -> bool:
         """Check if there are any pending or running requests.
@@ -11645,17 +11874,22 @@ class Scheduler:
 
     def _refresh_generation_overflow_recovery_ids(self) -> None:
         """Drop serial-retry markers once the affected requests leave the scheduler."""
-        if not self._generation_overflow_recovery_ids:
+        if not (self._generation_overflow_recovery_ids or self._memory_requeue_ids):
             return
         active_ids = set(self.running)
         active_ids.update(request.request_id for request in self.waiting)
         active_ids.update(request.request_id for request in self.prefilling)
         self._generation_overflow_recovery_ids.intersection_update(active_ids)
+        self._memory_requeue_ids.intersection_update(active_ids)
 
     def _effective_max_num_seqs(self) -> int:
         """Current admission cap, narrowed for models that require serial decode."""
         self._refresh_generation_overflow_recovery_ids()
-        if self._serialize_llama4_requests or self._generation_overflow_recovery_ids:
+        if (
+            self._serialize_llama4_requests
+            or self._generation_overflow_recovery_ids
+            or self._memory_requeue_ids
+        ):
             return 1
         return max(1, self.config.max_num_seqs)
 
@@ -11836,7 +12070,10 @@ class Scheduler:
         if self.memory_monitor is None:
             return None
 
-        prompt_tokens = request.num_prompt_tokens
+        # A requeued request prefills its folded output as part of the prompt.
+        prompt_tokens = request.num_prompt_tokens + _request_count(
+            request, "requeued_output_tokens"
+        )
         cached_tokens = request.cached_tokens or 0
 
         # A request paused mid-prefill for an eviction attempt resumes its own
@@ -12506,16 +12743,51 @@ class Scheduler:
             if self._is_harmony_model:
                 request.is_harmony_model = True
 
-            # Check if prompt ends with <think> token for reasoning models.
-            # Must happen before _build_sampler_and_processors so the thinking
-            # budget processor can check needs_think_prefix.
-            if self._detect_needs_think_prefix(request):
-                request.needs_think_prefix = True
+            row_state = _requeue_row_state(request)
+            if row_state is not None:
+                # A requeued row continues with its own sampler and processor
+                # state; its prompt now ends inside the generated output.
+                sampler, logits_processors = row_state[0], list(row_state[1])
+            else:
+                # Check if prompt ends with <think> token for reasoning models.
+                # Must happen before _build_sampler_and_processors so the
+                # thinking budget processor can check needs_think_prefix.
+                if self._detect_needs_think_prefix(request):
+                    request.needs_think_prefix = True
 
-            # Per-request sampler/logits processors to avoid BatchGenerator recreation.
-            sampler, logits_processors = self._build_sampler_and_processors(
-                request.sampling_params, request
-            )
+                # Per-request sampler/logits processors to avoid BatchGenerator recreation.
+                sampler, logits_processors = self._build_sampler_and_processors(
+                    request.sampling_params, request
+                )
+
+            if _request_count(request, "requeue_media_end") > request.cached_tokens:
+                # Media embeddings are released at the first decode token, so a
+                # requeued suffix that still holds placeholders cannot run again.
+                message = (
+                    "Request was paused under memory pressure and its cached "
+                    "image context was evicted before it could resume"
+                )
+                logger.warning(
+                    "Requeued request %s lost its media prefix (%d cached < %d)",
+                    request.request_id,
+                    request.cached_tokens,
+                    request.requeue_media_end,
+                )
+                self._release_paged_cache_for_request(request.request_id)
+                self.requests.pop(request.request_id, None)
+                self._clear_request_admission_bookkeeping(request.request_id)
+                self._cleanup_detokenizer(request.request_id)
+                self._cleanup_output_parser_session(request.request_id)
+                rejected_outputs.append(
+                    RequestOutput(
+                        request_id=request.request_id,
+                        finished=True,
+                        finish_reason="error",
+                        error=message,
+                        error_code="memory_requeue_lost",
+                    )
+                )
+                continue
 
             # Pre-flight memory guard: estimate peak memory for this request
             # and reject if it would exceed the hard limit. The check
@@ -12772,7 +13044,7 @@ class Scheduler:
                     and vlm_embeds is None
                     and len(tokens_to_process) > chunk_threshold + 1
                 ):
-                    sm = self._build_state_machine(request)
+                    sm = self._stop_sequences_for_insert(request)
                     per_row_lps = list(logits_processors) if logits_processors else []
                     state = self._begin_prefill(
                         request, tokens_to_process, cache_to_use
@@ -12964,12 +13236,14 @@ class Scheduler:
                     request.rope_deltas = self.model.get_last_rope_deltas()
 
             # Build per-request state machine for stop tokens
-            sm = self._build_state_machine(request)
+            sm = self._stop_sequences_for_insert(request)
 
             # Set random seed for reproducible generation (best-effort).
             # This affects global MLX random state, so concurrent requests
             # may interfere. Matches OpenAI's best-effort seed semantics.
-            if request.sampling_params.seed is not None:
+            if request.sampling_params.seed is not None and not _request_count(
+                request, "requeued_output_tokens"
+            ):
                 mx.random.seed(request.sampling_params.seed)
 
             # TurboQuant KV is quantized at the end of _do_external_prefill
@@ -13018,7 +13292,7 @@ class Scheduler:
             with mx.stream(self._stream):
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
-                    max_tokens=[request.sampling_params.max_tokens],
+                    max_tokens=[_insert_max_tokens(request)],
                     caches=[cache_to_use] if cache_to_use else None,
                     all_tokens=[_batch_generator_all_tokens(request)],
                     samplers=[sampler],
@@ -13037,7 +13311,7 @@ class Scheduler:
                 now = time.monotonic()
                 request.batch_uid = uid
                 request.status = RequestStatus.RUNNING
-                request.generation_started_at = now
+                _mark_generation_resumed(request, now)
                 request.last_activity_at = now
                 self.running[request.request_id] = request
                 scheduled.append(request)
@@ -13105,6 +13379,7 @@ class Scheduler:
                 continue
 
             request.last_activity_at = step_now
+            self._note_memory_admission_progress(step_now)
             completion_tokens_before = request.num_output_tokens
 
             # Release VLM embeddings after first decode token (prefill is done)
@@ -13553,8 +13828,10 @@ class Scheduler:
                         or prompt_boundary_store is not None
                     ):
                         try:
+                            # Requeue folds the first outputs into the prompt.
+                            folded = _request_count(request, "requeued_output_tokens")
                             full_token_sequence = list(request.prompt_token_ids) + list(
-                                request.output_token_ids
+                                request.output_token_ids[folded:]
                             )
 
                             if prompt_boundary_store is not None:
@@ -13571,7 +13848,11 @@ class Scheduler:
                                 else:
                                     # <think> output is stripped before the next
                                     # turn, so it can never prefix-match.
-                                    cacheable_sequence = list(request.prompt_token_ids)
+                                    cacheable_sequence = list(
+                                        request.prompt_token_ids[
+                                            : len(request.prompt_token_ids) - folded
+                                        ]
+                                    )
                                 token_sequence_to_store = cacheable_sequence
                                 cache_to_store = request._extracted_cache
                                 model_cache_config = getattr(
@@ -14359,6 +14640,298 @@ class Scheduler:
         self.requests[request.request_id] = request
         self.waiting.appendleft(request)
 
+    # Requeues per request before a memory-pressure abort.
+    _MAX_MEMORY_REQUEUES = 2
+    # Serialized blocks a requeue store may queue ahead of the SSD writer, so
+    # it never buffers a whole request in host RAM while memory is short.
+    _MEMORY_REQUEUE_PENDING_WRITES = 2
+
+    def _memory_requeue_storage_ready(self) -> bool:
+        return (
+            self.block_aware_cache is not None
+            and self.paged_ssd_cache_manager is not None
+            and not self.config.hot_cache_only
+            and getattr(self, "_unreconstructible_cache_model", None) is False
+        )
+
+    def _memory_requeue_blocker(self, request: "Request") -> str | None:
+        """Why ``request`` cannot be requeued, or None. Safe on any thread."""
+        request_id = request.request_id
+        if request.memory_requeues >= self._MAX_MEMORY_REQUEUES:
+            return "requeue budget spent"
+        if (
+            self._specprefill_active_request_id == request_id
+            or request.specprefill_indices is not None
+        ):
+            return "specprefill"
+        if _block_drafter_for(self.model) is not None:
+            return "block drafter"
+        if request_id in self._prefill_states:
+            return None
+        uid = self.request_id_to_uid.get(request_id)
+        if uid is None or uid < 0:
+            return "no generation row"
+        return None
+
+    def _memory_requeue_row(self, uid: int) -> tuple[Any, int] | None:
+        """The generation batch and row index that hold ``uid``."""
+        batch_generator = self.batch_generator
+        if batch_generator is None:
+            return None
+        found = batch_generator._find_uids([uid]).get(uid)
+        generation = getattr(batch_generator, "_generation_batch", None)
+        if found is None or found[0] != 2 or generation is None:
+            return None
+        return generation, found[1]
+
+    def _media_token_end(self, token_ids: list[int]) -> int:
+        """Index after the last image, video or audio placeholder, or 0."""
+        config = getattr(getattr(self.model, "_vlm_model", None), "config", None)
+        media_ids = {
+            int(value)
+            for name in ("image_token_id", "video_token_id", "audio_token_id")
+            if isinstance(value := getattr(config, name, None), int)
+        }
+        if not media_ids:
+            return 0
+        for index in range(len(token_ids) - 1, -1, -1):
+            if token_ids[index] in media_ids:
+                return index + 1
+        return 0
+
+    def _process_pending_memory_requeue(self) -> None:
+        """Store every live request to the paged SSD cache and requeue it.
+
+        Runs at the start of step() on the inference thread. The batch is
+        dropped as a whole: removing rows one at a time copies the remaining
+        rows, which needs the memory that is short.
+        """
+        if not self._pending_memory_requeue:
+            return
+        self._pending_memory_requeue = False
+        live = sorted(
+            [*self.running.values(), *self.prefilling], key=lambda r: r.arrival_time
+        )
+        if len(live) < 2 or not self._memory_requeue_storage_ready():
+            return
+        rows: dict[str, tuple[Any, int]] = {}
+        for request in live:
+            if self._memory_requeue_blocker(request) is not None:
+                return
+            if request.request_id in self._prefill_states:
+                continue
+            row = self._memory_requeue_row(self.request_id_to_uid[request.request_id])
+            if row is None:
+                return
+            rows[request.request_id] = row
+
+        started = time.perf_counter()
+        _safe_sync_stream(self._stream)
+        kept: list[str] = []
+        ssd = self.paged_ssd_cache_manager
+        with ssd.bounded_pending_writes(self._MEMORY_REQUEUE_PENDING_WRITES):
+            for request in live:
+                # An emergency abort ends these requests anyway.
+                if self._pending_abort_ids:
+                    break
+                state = self._prefill_states.get(request.request_id)
+                live_tokens = (
+                    _cache_base_sizes(state.cache)
+                    if state is not None
+                    else len(request.prompt_token_ids)
+                    + len(request.output_token_ids)
+                    - request.requeued_output_tokens
+                )
+                try:
+                    stored = self._store_for_memory_requeue(request)
+                    kept.append(f"{request.request_id[:8]} {stored}/{live_tokens}")
+                except Exception as e:
+                    logger.warning(
+                        "Memory requeue store failed for %s: %s",
+                        request.request_id,
+                        e,
+                    )
+        for request in live:
+            row = rows.get(request.request_id)
+            if row is not None:
+                self._save_requeue_row_state(request, *row)
+
+        self.batch_generator = None
+        self._current_sampler_params = None
+        self.prefilling = deque()
+        for request in live:
+            self._detach_for_memory_requeue(request)
+        for request in reversed(live):
+            self.waiting.appendleft(request)
+        self._memory_requeue_ids.update(r.request_id for r in live)
+        Scheduler._clear_cache(self)
+        logger.warning(
+            "Memory pressure: requeued %d request(s) in %.1fs; tokens kept in the "
+            "SSD cache: %s",
+            len(live),
+            time.perf_counter() - started,
+            ", ".join(kept),
+        )
+
+    def _prepare_live_cache_store(
+        self, request_id: str, raw_cache: list[Any], tokens: list[int]
+    ) -> tuple[list[int], list[Any], Any, Any] | None:
+        """Extract and evaluate a live cache for store_cache.
+
+        Returns ``(tokens, cache, model_cache_config, snapshots)``; a stateful
+        model stores up to its latest boundary snapshot within ``tokens``.
+        """
+        if not tokens:
+            return None
+        extracted, model_cache_config = self._extract_cache_states(raw_cache)
+        if not extracted:
+            return None
+        cache_to_store = extracted
+        snapshots = None
+        if self._detect_boundary_snapshot_need():
+            override = self._get_boundary_store_override(
+                request_id, tokens, stop_at_generation_prompt=False
+            )
+            if override is None:
+                return None
+            tokens, boundary_cache, boundary_config, snapshots = override
+            cache_to_store = self._merge_boundary_with_full_cache(
+                boundary_cache, extracted
+            )
+            if boundary_config is not None:
+                model_cache_config = boundary_config
+        arrays = self._collect_arrays_from_extracted_cache(cache_to_store)
+        if snapshots is not None:
+            for snapshot in snapshots.iter_in_memory_extracted():
+                arrays.extend(self._collect_arrays_from_extracted_cache(snapshot))
+        if arrays:
+            mx.eval(*arrays)
+        return tokens, cache_to_store, model_cache_config, snapshots
+
+    def _store_for_memory_requeue(self, request: "Request") -> int:
+        """Write a live request's KV to the paged SSD cache; returns tokens kept."""
+        request_id = request.request_id
+        state = self._prefill_states.get(request_id)
+        if state is not None:
+            raw_cache = state.cache
+            tokens = list(request.prompt_token_ids[: _cache_base_sizes(raw_cache)])
+            # The requeue drops this prefill state after the store.
+            self._convert_dropped_prefill_cache(raw_cache)
+        else:
+            uid = self.request_id_to_uid[request_id]
+            result = self.batch_generator.extract_cache([uid])
+            if uid not in result:
+                return 0
+            raw_cache, live_tokens = result[uid]
+            tokens = list(live_tokens or ())
+            expected = list(request.prompt_token_ids) + list(
+                request.output_token_ids[request.requeued_output_tokens :]
+            )
+            if tokens != expected[: len(tokens)]:
+                return 0
+            # The row's KV covers its whole resumed prompt. Leave the last token
+            # to the resumed prefill: an exact hit on a stateful cache cannot
+            # step back one token and prefills everything.
+            tokens = tokens[:-1]
+        prepared = self._prepare_live_cache_store(request_id, raw_cache, tokens)
+        if prepared is None:
+            return 0
+        tokens, cache_to_store, model_cache_config, snapshots = prepared
+
+        store_id = f"{request_id}#requeue{request.memory_requeues}"
+        tail_terminal = getattr(snapshots, "tail_terminal_token_count", None)
+        with _mx_buffer_access_lock:
+            table = self.block_aware_cache.store_cache(
+                store_id,
+                tokens,
+                cache_to_store,
+                model_cache_config=model_cache_config,
+                boundary_snapshots=snapshots,
+                extra_keys=request.vlm_extra_keys_for_cache,
+                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                hot_cache_write_back=False,
+                _store_tail_terminal=tail_terminal == len(tokens),
+            )
+        if table is None and self.paged_cache_manager is not None:
+            table = self.paged_cache_manager.get_block_table(store_id)
+        if table and self.paged_cache_manager is not None:
+            self.paged_cache_manager.release_for_eviction(table.block_ids)
+        self.block_aware_cache.clear_request_entry(store_id)
+        return len(tokens)
+
+    @staticmethod
+    def _save_requeue_row_state(request: "Request", generation: Any, idx: int) -> None:
+        """Keep a decoding row's sampler, processors and stop matcher."""
+        generation._omlx_realign_rows()
+        sampler = generation.samplers[idx] if generation.samplers else None
+        processors = (
+            list(generation.logits_processors[idx] or ())
+            if generation.logits_processors
+            else []
+        )
+        for processor in processors:
+            # The token sampled for the dropped step is never sent.
+            discard = getattr(processor, "discard_pending", None)
+            if callable(discard):
+                discard()
+        request.requeue_row_state = (sampler, processors, generation._matchers[idx])
+
+    def _detach_for_memory_requeue(self, request: "Request") -> None:
+        """Release a request's live state but keep its stream and output."""
+        request_id = request.request_id
+        self._clear_request_admission_bookkeeping(request_id)
+        self._prefill_states.pop(request_id, None)
+        uid = self.request_id_to_uid.pop(request_id, None)
+        if uid is not None:
+            self.uid_to_request_id.pop(uid, None)
+            if hasattr(self.model, "unregister_rope_delta"):
+                self.model.unregister_rope_delta(uid)
+            _unregister_uid_row(self.model, uid)
+        self.running.pop(request_id, None)
+        # Keep the blocks findable for the resume lookup, as an abort does, but
+        # drop the table so the next admission starts a fresh one.
+        if self.paged_cache_manager is not None:
+            table = (
+                self.paged_cache_manager.detach_block_table(request_id)
+                or request.block_table
+            )
+            if table:
+                self.paged_cache_manager.release_for_eviction(table.block_ids)
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.clear_request_entry(request_id)
+        self._boundary_cache_snapshots.pop(request_id, None)
+        if self._boundary_snapshot_store is not None:
+            self._boundary_snapshot_store.cleanup_request(request_id)
+        get_prefill_tracker().remove(request_id)
+
+        if not request.memory_requeues:
+            request.requeue_reported_cached_tokens = max(
+                0, request.cached_tokens - request.prefill_resumed_tokens
+            )
+        request.memory_requeues += 1
+        new_outputs = request.output_token_ids[request.requeued_output_tokens :]
+        if new_outputs:
+            request.prompt_token_ids = list(request.prompt_token_ids) + list(
+                new_outputs
+            )
+            request.requeued_output_tokens = len(request.output_token_ids)
+        if request.vlm_inputs_embeds is None and (
+            request.vlm_image_hash or request.vlm_cache_key_ranges
+        ):
+            request.requeue_media_end = self._media_token_end(request.prompt_token_ids)
+        request.status = RequestStatus.WAITING
+        request.batch_uid = None
+        request.prompt_cache = None
+        request.cached_tokens = 0
+        request.prefill_resumed_tokens = 0
+        request.remaining_tokens = None
+        request.block_table = None
+        request.shared_prefix_blocks = 0
+        request._extracted_cache = None
+        request._model_cache_config = None
+        request.specprefill_indices = None
+
     def _pause_for_prefill_eviction(
         self,
         request: "Request",
@@ -14408,6 +14981,7 @@ class Scheduler:
 
         # Process pending aborts FIRST (thread-safe with hybrid executor)
         self._process_pending_aborts()
+        self._process_pending_memory_requeue()
 
         # Drain a deferred between-turn reclaim requested by the memory
         # enforcer (only acts when the scheduler is idle).
@@ -14766,10 +15340,12 @@ class Scheduler:
 
         # Drain any pending deferred aborts
         self._pending_abort_ids.clear()
+        # Reset clears the cache and must not start stores after the barrier.
+        self._abort_keep_cache_ids.clear()
 
         # Abort all requests directly (reset is synchronous)
         for request_id in list(self.requests.keys()):
-            self._do_abort_request(request_id)
+            self._do_abort_request(request_id, allow_cache_store=False)
 
         self.waiting.clear()
         self.prefilling.clear()
@@ -14781,6 +15357,8 @@ class Scheduler:
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
         self._generation_overflow_recovery_ids.clear()
+        self._memory_requeue_ids.clear()
+        self._pending_memory_requeue = False
         # Async store_cache bookkeeping. shutdown() drains these before us,
         # but clear here too so reset() is safe to call standalone (e.g. tests
         # or recovery paths) without leaking Request refs through stale futures.

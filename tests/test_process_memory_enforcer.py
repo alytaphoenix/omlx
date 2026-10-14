@@ -1596,6 +1596,43 @@ class TestSingleModelMemoryPressure:
         assert entry.abort_requested is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "usage_gb,requeued,requeue_calls,aborts",
+        [(11, 2, 1, 0), (11, 0, 1, 1), (13, 2, 0, 1)],
+    )
+    async def test_single_busy_model_requeues_before_aborting(
+        self, enforcer, usage_gb, requeued, requeue_calls, aborts
+    ):
+        """Hard pressure keeps the requests when the scheduler can requeue them;
+        a declined requeue or the emergency tier aborts as before."""
+
+        calls = []
+
+        class RequeueScheduler(MagicMock):
+            def request_memory_requeue(self):
+                calls.append(1)
+                return requeued
+
+        engine = MagicMock()
+        engine.scheduler = RequeueScheduler()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [usage_gb * 1024**3, usage_gb * 1024**3]
+            )
+            await enforcer._check_and_enforce()
+
+        assert len(calls) == requeue_calls
+        assert engine.abort_all_requests.await_count == aborts
+        enforcer._engine_pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_single_busy_model_pending_unload_at_emergency_pressure(
         self, enforcer
     ):
