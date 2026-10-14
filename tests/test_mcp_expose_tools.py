@@ -1,23 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the "Expose backend MCP tools to clients" dashboard toggle.
 
-Covers the server-side helper (``omlx.server.mcp_tools_exposed``), the admin
-dashboard toggle markup, and i18n key presence across all locales. The
-end-to-end merge behaviour is covered in
-``tests/integration/test_server_endpoints.py`` (TestMCPExposeToolsToggle).
+Covers the server-side helper (``omlx.server.mcp_tools_exposed``) and the
+admin API round trip. The dashboard markup and i18n checks live in
+apps/omlx-web/tests/test_mcp_expose_tools_ui.py, and the end-to-end merge
+behaviour is covered in ``tests/integration/test_server_endpoints.py``
+(TestMCPExposeToolsToggle).
 """
 
-import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import omlx.server as server
 from omlx.settings import GlobalSettings, MCPSettings
 
 ROOT = Path(__file__).resolve().parents[1]
-I18N_DIR = ROOT / "omlx/admin/i18n"
-SETTINGS_TEMPLATE = ROOT / "omlx/admin/templates/dashboard/_settings.html"
-DASHBOARD_JS = ROOT / "omlx/admin/static/js/dashboard.js"
+I18N_DIR = ROOT / "apps/omlx-web/omlx_web/i18n"
+SETTINGS_TEMPLATE = ROOT / "apps/omlx-web/omlx_web/templates/dashboard/_settings.html"
+DASHBOARD_JS = ROOT / "apps/omlx-web/omlx_web/static/js/dashboard.js"
 
 REQUIRED_I18N_KEYS = {
     "settings.mcp.expose_tools",
@@ -119,7 +118,6 @@ _REQUIRED_RAW_I18N_KEYS = frozenset({
     "status.layout.save",
     "status.layout.width_full",
 })
-
 
 class TestMcpToolsExposedHelper:
     """Unit tests for ``omlx.server.mcp_tools_exposed``."""
