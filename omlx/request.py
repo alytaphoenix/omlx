@@ -84,6 +84,13 @@ class SamplingParams:
     # Seed for reproducible generation (best-effort, per OpenAI spec)
     seed: Optional[int] = None
 
+    # Stop strings skip the leading think block. Set by the APIs that return
+    # reasoning separately; /v1/completions returns it inline.
+    stop_skips_reasoning: bool = False
+
+    # Read-only logits processor, applied after every other processor.
+    logits_observer: Any = None
+
     def __post_init__(self):
         if self.stop is None:
             self.stop = []
@@ -127,6 +134,7 @@ class Request:
     output_token_ids: List[int] = field(default_factory=list)
     output_text: str = ""
     generation_started_at: Optional[float] = None
+    prefill_started_at: Optional[float] = None
     last_activity_at: Optional[float] = None
 
     # For BatchGenerator integration
@@ -134,7 +142,8 @@ class Request:
 
     # Prefix cache fields
     prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
-    cached_tokens: int = 0  # Number of tokens retrieved from cache
+    cached_tokens: int = 0  # Prefix tokens in KV, including resumed prefill
+    prefill_resumed_tokens: int = 0  # Locally computed tokens retained after a pause
     remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
 
     # Paged cache fields (for BlockAwarePrefixCache)
@@ -157,6 +166,8 @@ class Request:
     benchmark_requested_steps: List[int] = field(default_factory=list)
     benchmark_boundary_enabled: bool = False
     benchmark_cache_block_size: int = 0
+    # MoE expert offload counters when the request was added.
+    moe_offload_start: Optional[Dict[str, Any]] = None
 
     # Multimodal content (images, video)
     images: Optional[List[Any]] = None
@@ -234,6 +245,7 @@ class Request:
     prefill_eviction_retries: int = (
         0  # Per-request prefill-headroom eviction phase counter
     )
+    packed_prefill_excluded: bool = False  # Retries alone after a failed pack
 
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None

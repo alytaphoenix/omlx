@@ -35,6 +35,7 @@ from .paged_ssd_cache import (
     _extract_tensor_bytes,
     _fsync_parent_dir,
     _TMP_STAGING_MIN_AGE_SECONDS,
+    _unique_tmp_path,
     _write_safetensors_no_mx,
 )
 
@@ -165,8 +166,8 @@ class VisionFeatureSSDCache:
                     entry = self._ssd_index.get(key)
                     grid = entry.grid if entry is not None else None
                 with self._memory_lock:
-                    self._memory_put(key, features)
-                    if grid is not None:
+                    resident = self._memory_put(key, features)
+                    if grid is not None and resident:
                         self._memory_grid[key] = grid
                 self._stats["hits"] += 1
                 self._stats["ssd_loads"] += 1
@@ -196,8 +197,8 @@ class VisionFeatureSSDCache:
 
         # Store in memory LRU
         with self._memory_lock:
-            self._memory_put(key, features)
-            if grid is not None:
+            resident = self._memory_put(key, features)
+            if grid is not None and resident:
                 self._memory_grid[key] = list(grid)
 
         # Enqueue SSD write
@@ -245,24 +246,23 @@ class VisionFeatureSSDCache:
 
     # ── Memory LRU helpers ──────────────────────────────────────────
 
-    def _memory_put(self, key: str, features: Any) -> None:
+    def _memory_put(self, key: str, features: Any) -> bool:
         """Insert into memory LRU, evicting oldest if over limits.
+
+        Returns False when an entry larger than the budget evicts itself.
 
         Caller must hold _memory_lock.
         """
         nbytes = self._features_bytes(features)
         if key in self._memory_cache:
             self._memory_cache.move_to_end(key)
-            self._memory_cache[key] = features
             self._memory_bytes += nbytes - self._memory_entry_bytes.get(key, 0)
-            self._memory_entry_bytes[key] = nbytes
-            return
-
+        else:
+            self._memory_bytes += nbytes
         self._memory_cache[key] = features
         self._memory_entry_bytes[key] = nbytes
-        self._memory_bytes += nbytes
 
-        # Evict oldest if over either limit
+        # Evict oldest if over either limit, including after a replace.
         while self._memory_cache and (
             self._memory_bytes > self._max_memory_bytes
             or len(self._memory_cache) > self._max_memory_entries
@@ -270,6 +270,7 @@ class VisionFeatureSSDCache:
             evicted_key, _ = self._memory_cache.popitem(last=False)
             self._memory_bytes -= self._memory_entry_bytes.pop(evicted_key, 0)
             self._memory_grid.pop(evicted_key, None)
+        return key in self._memory_cache
 
     @staticmethod
     def _features_bytes(features: Any) -> int:
@@ -636,9 +637,7 @@ class VisionFeatureSSDCache:
 
             try:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path = file_path.with_name(
-                    file_path.stem + "_tmp.safetensors"
-                )
+                temp_path = _unique_tmp_path(file_path)
                 actual_size = _write_safetensors_no_mx(
                     str(temp_path), tensors_raw, metadata
                 )
