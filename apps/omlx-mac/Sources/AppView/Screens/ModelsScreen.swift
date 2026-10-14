@@ -308,7 +308,7 @@ private struct LibrarySection: View {
 
     private func gradient(for m: ModelDTO) -> [Color] {
         switch m.modelType {
-        case "embedding", "reranker": return SquircleGradient.downloads
+        case "embedding", "reranker", "decision": return SquircleGradient.downloads
         case "audio_stt", "audio_tts", "audio_sts": return SquircleGradient.integrations
         case "vlm":             return SquircleGradient.update
         default:                return SquircleGradient.models
@@ -319,6 +319,7 @@ private struct LibrarySection: View {
         switch m.modelType {
         case "embedding": return "cube.transparent"
         case "reranker":  return "arrow.up.arrow.down"
+        case "decision":  return "checklist"
         case "audio_stt", "audio_tts", "audio_sts": return "waveform"
         case "vlm":     return "eye"
         default:        return "cpu"
