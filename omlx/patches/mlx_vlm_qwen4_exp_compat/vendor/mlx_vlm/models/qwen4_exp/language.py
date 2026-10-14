@@ -42,7 +42,6 @@ from ..qwen3_5.language import (
     Qwen3_5Attention,
     Qwen3_5GatedDeltaNet,
     _create_qwen3_5_attention_mask,
-    _create_qwen3_5_ssm_mask,
 )
 from ..qwen3_5 import language as q35_language
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
@@ -4424,7 +4423,9 @@ class Qwen4ExpModel(nn.Module):
             cache = [None] * len(self.layers)
 
         fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
+        ssm_mask = q35_language._create_qwen3_5_ssm_mask(
+            hidden_states, cache[self.ssm_idx]
+        )
         if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
             ssm_mask = mask
 
