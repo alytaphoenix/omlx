@@ -1341,6 +1341,19 @@ class ProcessMemoryEnforcer:
             self._propagate_memory_limit()
         logger.info(f"Prefill memory guard: {'enabled' if value else 'disabled'}")
 
+    def _request_memory_requeue(self, entry: Any) -> int:
+        """Ask the entry's scheduler to keep its requests; 0 means abort them."""
+        scheduler = self._resolve_scheduler(entry)
+        # Look the method up on the class so a mock's auto-attribute is ignored.
+        requeue = getattr(type(scheduler), "request_memory_requeue", None)
+        if not callable(requeue):
+            return 0
+        try:
+            return int(requeue(scheduler) or 0)
+        except Exception as e:
+            logger.warning("Memory requeue request failed: %s", e)
+            return 0
+
     @staticmethod
     def _resolve_scheduler(entry: Any) -> Any | None:
         """Resolve the watermark target Scheduler from an EnginePool entry.
@@ -1826,6 +1839,16 @@ class ProcessMemoryEnforcer:
                     busy_victim = self._find_lru_busy_non_pinned_victim_locked()
                     if busy_victim is not None:
                         entry = self._engine_pool._entries.get(busy_victim)
+                        if not emergency and entry is not None:
+                            requeued = self._request_memory_requeue(entry)
+                            if requeued > 0:
+                                logger.warning(
+                                    "Hard memory pressure: storing and requeueing "
+                                    "%d request(s) on '%s' instead of aborting",
+                                    requeued,
+                                    busy_victim,
+                                )
+                                break
                         aborted = 0
                         if (
                             entry
