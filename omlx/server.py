@@ -127,6 +127,7 @@ from .api.openai_models import (
     CompletionChoice,
     CompletionRequest,
     CompletionResponse,
+    CompletionTokensDetails,
     DetokenizeRequest,
     DetokenizeResponse,
     ModelInfo,
@@ -171,7 +172,9 @@ from .api.decisions import (
     READOUT_TEMPLATE_KWARGS,
     DecisionsRequestError,
     decide,
+    decisions_request,
     from_systemone,
+    systemone_answers,
     to_systemone,
 )
 from .api.decisions_models import DecisionRequest
@@ -4185,7 +4188,7 @@ async def create_systemone(
     _: bool = Depends(verify_inference_api_key),
 ):
     """
-    Answer typed questions about a state with a decision model.
+    Answer typed questions about a state with a decision or chat model.
 
     TypeSafe System One compatible endpoint. Every answer carries a
     probability for each option of a ``noul`` (yes/no), ``choice`` or
@@ -4215,45 +4218,77 @@ async def create_systemone(
     # The lease keeps the model loaded from encode() to the response.
     lease = _LLMEngineLease()
     try:
-        engine = await get_decision_engine(request.model, lease)
-        try:
-            plan = await engine.encode(request.model_dump(), truncate=request.truncate)
-        except DecisionContextLengthError as e:
-            raise HTTPException(status_code=413, detail=str(e)) from e
-        except DecisionRequestError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
+        if _is_decision_model(request.model):
+            engine = await get_decision_engine(request.model, lease)
+            try:
+                plan = await engine.encode(
+                    request.model_dump(), truncate=request.truncate
+                )
+            except DecisionContextLengthError as e:
+                raise HTTPException(status_code=413, detail=str(e)) from e
+            except DecisionRequestError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
 
-        async def _decide():
-            start_time = time.perf_counter()
-            result = await engine.systemone(plan)
-            elapsed = time.perf_counter() - start_time
-            resolved_model = resolve_model_id(request.model) or request.model
-            input_tokens = result["input_tokens"]
-            logger.info(
-                f"SystemOne: model={resolved_model}, {len(request.questions)} "
-                f"questions, {input_tokens} tokens in {elapsed:.3f}s"
-            )
-            get_server_metrics().record_request_complete(
-                prompt_tokens=input_tokens,
-                completion_tokens=0,
-                cached_tokens=0,
-                prefill_duration=elapsed,
-                model_id=resolved_model,
-                request_duration=elapsed,
-            )
-            return json.dumps(
-                {
-                    "model": request.model,
-                    "answers": result["answers"],
-                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-                },
-                ensure_ascii=False,
+            async def _decide():
+                start_time = time.perf_counter()
+                result = await engine.systemone(plan)
+                return (
+                    result["answers"],
+                    result["input_tokens"],
+                    0,
+                    time.perf_counter() - start_time,
+                )
+
+        else:
+            try:
+                decision_request = decisions_request(request)
+            except DecisionsRequestError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            # System One has no refusal answer.
+            readouts = await _chat_model_decisions(
+                decision_request, lease, require_answer=False
             )
 
-        return await _json_response_or_keepalive(http_request, _decide(), lease=lease)
+            async def _decide():
+                answers, *usage = await readouts()
+                try:
+                    return systemone_answers(request, answers), *usage
+                except DecisionsRequestError as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
+
+        return await _json_response_or_keepalive(
+            http_request, _systemone_body(request, _decide(), lease), lease=lease
+        )
     except BaseException:
         await lease.release()
         raise
+
+
+async def _systemone_body(
+    request: SystemOneRequest, run, lease: _LLMEngineLease
+) -> str:
+    answers, input_tokens, cached_tokens, elapsed = await run
+    resolved_model = _serving_model_id(lease, request.model)
+    logger.info(
+        f"SystemOne: model={resolved_model}, {len(request.questions)} "
+        f"questions, {input_tokens} tokens in {elapsed:.3f}s"
+    )
+    get_server_metrics().record_request_complete(
+        prompt_tokens=input_tokens,
+        completion_tokens=0,
+        cached_tokens=cached_tokens,
+        prefill_duration=elapsed,
+        model_id=resolved_model,
+        request_duration=elapsed,
+    )
+    return json.dumps(
+        {
+            "model": request.model,
+            "answers": answers,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+        },
+        ensure_ascii=False,
+    )
 
 
 def _is_decision_model(model: str) -> bool:
@@ -4317,43 +4352,7 @@ async def create_decisions(
                 )
 
         else:
-            engine = await get_engine_for_model(request.model, lease=lease)
-            multimodal = isinstance(engine, VLMBatchedEngine) or getattr(
-                engine, "supports_multimodal_fallback", False
-            )
-
-            def _prepare_readout(messages):
-                try:
-                    num_prompt_tokens, prepared = _prepare_chat_prompt_for_request(
-                        engine,
-                        messages,
-                        chat_template_kwargs=READOUT_TEMPLATE_KWARGS,
-                        is_partial=True,
-                    )
-                except Exception as e:
-                    if _is_chat_template_error(e):
-                        raise HTTPException(
-                            status_code=400, detail=f"Chat template error: {e}"
-                        ) from e
-                    raise
-                validate_context_window(num_prompt_tokens, request.model)
-                return {} if prepared is None else {"_prepared_prompt": prepared}
-
-            async def _decide():
-                await _raise_if_llm_lease_abort_requested(lease)
-                start_time = time.perf_counter()
-                try:
-                    result = await decide(
-                        engine, request, multimodal, prepare=_prepare_readout
-                    )
-                except DecisionsRequestError as e:
-                    raise HTTPException(status_code=400, detail=str(e)) from e
-                return (
-                    result["answers"],
-                    result["input_tokens"],
-                    result["cached_tokens"],
-                    time.perf_counter() - start_time,
-                )
+            _decide = await _chat_model_decisions(request, lease)
 
         return await _json_response_or_keepalive(
             http_request, _decisions_body(request, _decide(), lease), lease=lease
@@ -4361,6 +4360,55 @@ async def create_decisions(
     except BaseException:
         await lease.release()
         raise
+
+
+async def _chat_model_decisions(
+    request: DecisionRequest, lease: _LLMEngineLease, require_answer: bool = True
+):
+    """Lease the chat model and return the readout runner for ``request``."""
+    engine = await get_engine_for_model(request.model, lease=lease)
+    multimodal = isinstance(engine, VLMBatchedEngine) or getattr(
+        engine, "supports_multimodal_fallback", False
+    )
+
+    def _prepare_readout(messages):
+        try:
+            num_prompt_tokens, prepared = _prepare_chat_prompt_for_request(
+                engine,
+                messages,
+                chat_template_kwargs=READOUT_TEMPLATE_KWARGS,
+                is_partial=True,
+            )
+        except Exception as e:
+            if _is_chat_template_error(e):
+                raise HTTPException(
+                    status_code=400, detail=f"Chat template error: {e}"
+                ) from e
+            raise
+        validate_context_window(num_prompt_tokens, request.model)
+        return {} if prepared is None else {"_prepared_prompt": prepared}
+
+    async def _decide():
+        await _raise_if_llm_lease_abort_requested(lease)
+        start_time = time.perf_counter()
+        try:
+            result = await decide(
+                engine,
+                request,
+                multimodal,
+                prepare=_prepare_readout,
+                require_answer=require_answer,
+            )
+        except DecisionsRequestError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return (
+            result["answers"],
+            result["input_tokens"],
+            result["cached_tokens"],
+            time.perf_counter() - start_time,
+        )
+
+    return _decide
 
 
 async def _decisions_body(
@@ -4678,7 +4726,7 @@ def _extract_chat_messages(
             else None
         ),
     )
-    is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_vlm = _engine_accepts_images(engine)
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
         extractor_kwargs = {}
@@ -4719,6 +4767,17 @@ def _extract_chat_messages(
         messages=messages,
         is_partial=is_partial,
         native_reasoning=native_reasoning,
+    )
+
+
+def _engine_accepts_images(engine: BaseEngine) -> bool:
+    """Whether image content parts should reach ``engine``.
+
+    In-process VLMs read them, and an external engine can declare it (Splash
+    serving a checkpoint with a vision tower). Other engines get text only.
+    """
+    return isinstance(engine, VLMBatchedEngine) or bool(
+        getattr(engine, "accepts_image_input", False)
     )
 
 
@@ -5156,7 +5215,12 @@ async def create_chat_completion(
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                start_in_thinking=(
+                    output.finish_reason == "length"
+                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                ),
             )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
@@ -5209,6 +5273,11 @@ async def create_chat_completion(
                             pass
 
             finish_reason = "tool_calls" if tool_calls else output.finish_reason
+            reasoning_token_count = (
+                len(engine.tokenizer.encode(cleaned_thinking))
+                if cleaned_thinking
+                else 0
+            )
 
             return ChatCompletionResponse(
                 model=request.model,
@@ -5230,6 +5299,9 @@ async def create_chat_completion(
                     total_tokens=output.prompt_tokens + output.completion_tokens,
                     prompt_tokens_details=PromptTokensDetails(
                         cached_tokens=output.cached_tokens,
+                    ),
+                    completion_tokens_details=CompletionTokensDetails(
+                        reasoning_tokens=reasoning_token_count,
                     ),
                     model_load_duration=(
                         round(model_load_duration, 2)
@@ -6032,6 +6104,27 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+def _chat_prompt_opens_thinking(
+    engine: BaseEngine,
+    messages: list,
+    kwargs: dict,
+) -> bool:
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        return False
+    try:
+        prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+            engine, messages, kwargs
+        )
+        opened, _ = prompt_opens_thinking(
+            tokenizer, prompt, prompt_token_ids=prompt_token_ids
+        )
+    except Exception as exc:
+        logger.debug("Could not detect chat prompt thinking state: %s", exc)
+        return False
+    return opened
+
+
 class _ToolCallGenerationError(HTTPException):
     """Keep generation failure codes through JSON keepalive responses."""
 
@@ -6219,6 +6312,7 @@ async def stream_chat_completion(
     first_visible_time = None
     last_output = None
     accumulated_text = ""
+    accumulated_reasoning = ""
     has_tools = bool(kwargs.get("tools"))
     start_in_thinking = False
     try:
@@ -6358,6 +6452,7 @@ async def stream_chat_completion(
                         ],
                     )
                     if thinking_delta:
+                        accumulated_reasoning += thinking_delta
                         event = (
                             f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                         )
@@ -6485,12 +6580,14 @@ async def stream_chat_completion(
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish(
-            truncated=last_output is not None and last_output.finish_reason == "length"
+            truncated=last_output is not None and last_output.finish_reason == "length",
+            has_tool_calls=bool(last_output and last_output.tool_calls),
         )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
             if thinking_delta:
+                accumulated_reasoning += thinking_delta
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=request.model,
@@ -6509,6 +6606,7 @@ async def stream_chat_completion(
         if thinking_filter:
             remaining_thinking = thinking_filter.finish()
             if remaining_thinking:
+                accumulated_reasoning += remaining_thinking
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=request.model,
@@ -6640,6 +6738,7 @@ async def stream_chat_completion(
         tool_failure = None
     if not tool_calls and not tool_failure:
         if recovered_thinking:
+            accumulated_reasoning += recovered_thinking
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
@@ -6840,6 +6939,11 @@ async def stream_chat_completion(
             total_time = end_time - start_time
             pt = last_output.prompt_tokens
             ct = last_output.completion_tokens
+            reasoning_token_count = (
+                len(engine.tokenizer.encode(accumulated_reasoning))
+                if accumulated_reasoning
+                else 0
+            )
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
@@ -6850,6 +6954,9 @@ async def stream_chat_completion(
                     total_tokens=pt + ct,
                     prompt_tokens_details=PromptTokensDetails(
                         cached_tokens=last_output.cached_tokens,
+                    ),
+                    completion_tokens_details=CompletionTokensDetails(
+                        reasoning_tokens=reasoning_token_count,
                     ),
                     model_load_duration=(
                         round(model_load_duration, 2)
@@ -7087,7 +7194,8 @@ async def stream_anthropic_messages(
 
     # Flush remaining buffered content from thinking parser
     thinking_delta, content_delta = thinking_parser.finish(
-        truncated=last_output is not None and last_output.finish_reason == "length"
+        truncated=last_output is not None and last_output.finish_reason == "length",
+        has_tool_calls=bool(last_output and last_output.tool_calls),
     )
     if thinking_delta:
         if thinking_filter:
@@ -7414,7 +7522,7 @@ async def create_anthropic_message(
 
         # Convert Anthropic format to internal format
         # Harmony models need special handling to preserve tool format
-        is_vlm = isinstance(engine, VLMBatchedEngine)
+        is_vlm = _engine_accepts_images(engine)
         native_reasoning = uses_native_reasoning_content(
             resolved_model,
             config_model_type=(
@@ -7693,7 +7801,12 @@ async def create_anthropic_message(
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                start_in_thinking=(
+                    output.finish_reason == "length"
+                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                ),
             )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
@@ -8102,7 +8215,7 @@ async def create_response(
         # Images in function_call_output lists survive only for engines that
         # can extract them; text engines get a placeholder instead so base64
         # payloads never reach the prompt (#2989).
-        preserve_tool_images = isinstance(engine, VLMBatchedEngine)
+        preserve_tool_images = _engine_accepts_images(engine)
 
         current_input_messages = convert_responses_input_to_messages(
             request.input,
@@ -8459,7 +8572,12 @@ async def create_response(
             # Process output text
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                start_in_thinking=(
+                    output.finish_reason == "length"
+                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                ),
             )
 
             # Parse tool calls
@@ -8957,7 +9075,8 @@ async def stream_responses_api(
     # Flush remaining content from parsers
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish(
-            truncated=last_output is not None and last_output.finish_reason == "length"
+            truncated=last_output is not None and last_output.finish_reason == "length",
+            has_tool_calls=bool(last_output and last_output.tool_calls),
         )
         if thinking_delta:
             if thinking_filter:
