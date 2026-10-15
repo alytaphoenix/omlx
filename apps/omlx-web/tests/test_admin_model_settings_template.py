@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from omlx.admin.routes import _load_locale
+from omlx_web.routes import _load_locale
 
 
 def _model_settings_template() -> str:

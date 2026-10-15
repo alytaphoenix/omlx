@@ -8,6 +8,8 @@ behaviour is covered in ``tests/integration/test_server_endpoints.py``
 (TestMCPExposeToolsToggle).
 """
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import omlx.server as server

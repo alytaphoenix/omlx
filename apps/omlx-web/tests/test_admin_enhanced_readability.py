@@ -22,7 +22,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
 
-from omlx.admin.routes import _load_locale
+from omlx_web.routes import _load_locale
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = ROOT / "omlx_web/templates"

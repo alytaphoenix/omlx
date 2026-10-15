@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from omlx.admin.routes import _load_locale
+from omlx_web.routes import _load_locale
 
 ROOT = Path(__file__).resolve().parents[1]
 I18N_DIR = ROOT / "omlx_web" / "i18n"

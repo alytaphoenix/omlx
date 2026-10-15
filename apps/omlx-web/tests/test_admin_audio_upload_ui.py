@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from omlx.admin import routes as admin_routes
+from omlx_web import routes as admin_routes
 
 ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_TEMPLATE = ROOT / "omlx_web/templates/dashboard/_settings.html"

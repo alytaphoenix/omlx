@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from omlx.admin.routes import _load_locale
+from omlx_web.routes import _load_locale
 
 ROOT = Path(__file__).resolve().parents[1]
 
