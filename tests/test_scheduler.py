@@ -2383,6 +2383,49 @@ class TestSchedulerReset:
         assert len(scheduler._pending_async_removes) == 0
         assert len(scheduler._inflight_store_futures) == 0
 
+    @pytest.mark.parametrize("phase", ["decode", "prefill", "external_prefill"])
+    def test_reset_does_not_start_cancel_cache_store(
+        self, mock_model, mock_tokenizer, phase
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="cancel-before-reset",
+            prompt=[3, 4, 5],
+            sampling_params=SamplingParams(),
+        )
+        scheduler.add_request(request)
+        scheduler._abort_keeps_cache = MagicMock(return_value=True)
+        scheduler._cleanup_finished = MagicMock()
+        scheduler._submit_abort_store = MagicMock()
+        scheduler._prepare_abort_prefill_store = MagicMock(return_value=object())
+        if phase == "decode":
+            scheduler.running[request.request_id] = request
+            scheduler.request_id_to_uid[request.request_id] = 0
+            scheduler.uid_to_request_id[0] = request.request_id
+        elif phase == "prefill":
+            scheduler._prefill_states[request.request_id] = SimpleNamespace(cache=[])
+            scheduler.prefilling.append(request)
+        else:
+            request._abort_store_prepared = object()
+        scheduler.abort_request(request.request_id, keep_cache=True)
+
+        abort = scheduler._do_abort_request
+
+        def abort_with_late_cancel(request_id, **kwargs):
+            # A client can cancel after reset clears the pending flags.
+            scheduler.abort_request(request_id, keep_cache=True)
+            return abort(request_id, **kwargs)
+
+        with patch.object(
+            scheduler, "_do_abort_request", side_effect=abort_with_late_cancel
+        ):
+            scheduler.reset()
+
+        scheduler._cleanup_finished.assert_not_called()
+        scheduler._submit_abort_store.assert_not_called()
+        assert not scheduler._abort_keep_cache_ids
+        assert not scheduler.requests
+
     def test_reset_waits_for_store_worker_before_snapshot_and_cache_cleanup(
         self, mock_model, mock_tokenizer
     ):
@@ -2755,6 +2798,62 @@ class TestSchedulerSuppressTokens:
         round_token = captured["sampler"](round_logits)
         mx.eval(round_token)
         assert int(round_token.item()) == 2
+
+
+class TestSchedulerNoRepeatNgram:
+    @staticmethod
+    def _decode(model, tokenizer, rows):
+        scheduler = Scheduler(model=model, tokenizer=tokenizer)
+        requests = [
+            Request(request_id=f"r{i}", prompt=list(prompt), sampling_params=params)
+            for i, (prompt, params) in enumerate(rows)
+        ]
+        for request in requests:
+            scheduler.add_request(request)
+        for _ in range(200):
+            scheduler.step()
+            if not any(r.request_id in scheduler.requests for r in requests):
+                break
+        scheduler.shutdown()
+        return [list(r.output_token_ids) for r in requests]
+
+    def test_batched_greedy_decode_bans_only_its_own_row(self, mock_tokenizer):
+        from mlx_lm.models.llama import Model, ModelArgs
+
+        mx.random.seed(0)
+        model = Model(
+            ModelArgs(
+                model_type="llama",
+                hidden_size=32,
+                num_hidden_layers=2,
+                intermediate_size=64,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                rms_norm_eps=1e-5,
+                vocab_size=64,
+                tie_word_embeddings=True,
+            )
+        )
+        greedy = SamplingParams(max_tokens=40, temperature=0)
+        banned = SamplingParams(max_tokens=40, temperature=0, no_repeat_ngram_size=3)
+        short, long = [5, 9, 12], [7, 3, 30, 22, 14, 9, 41, 8, 17]
+
+        def repeated_trigrams(tokens):
+            trigrams = [tuple(tokens[i : i + 3]) for i in range(len(tokens) - 2)]
+            return len(trigrams) - len(set(trigrams))
+
+        loop, neighbour = self._decode(
+            model, mock_tokenizer, [(short, greedy), (long, greedy)]
+        )
+        fixed, same_neighbour = self._decode(
+            model, mock_tokenizer, [(short, banned), (long, greedy)]
+        )
+
+        # The tiny greedy model loops; with the ban, prompt plus output never
+        # repeats a trigram, and the other row of the batch is untouched.
+        assert repeated_trigrams(short + loop) > 10
+        assert len(fixed) > 10 and repeated_trigrams(short + fixed) == 0
+        assert same_neighbour == neighbour
 
 
 class TestSchedulerXtcSpecialTokens:
@@ -6091,23 +6190,36 @@ class TestStoreCacheAdmissionBackpressure:
         assert scheduler.running == {}
         scheduler._ensure_batch_generator.assert_not_called()
 
-    def test_memory_guard_fails_persistent_admission_stall(
-        self, mock_model, mock_tokenizer
+    @pytest.mark.parametrize("admission_paused", [False, True])
+    def test_memory_guard_times_out_only_after_decode_stalls(
+        self, mock_model, mock_tokenizer, admission_paused
     ):
-        """A persistent memory-gated head-of-line wait should fail cleanly."""
+        """Decode progress keeps a queued request alive until progress stops."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         request = self._make_request("req-stalled")
         self._queue_request(scheduler, request)
         running = self._make_request("req-running")
         scheduler.running[running.request_id] = running
         scheduler.requests[running.request_id] = running
+        scheduler.uid_to_request_id[1] = running.request_id
+        scheduler._admission_paused = admission_paused
         scheduler._prefill_memory_guard = True
         scheduler._memory_limit_bytes = 100
         scheduler._current_usage_bytes = MagicMock(return_value=101)
         scheduler._memory_admission_blocked_request_id = request.request_id
         scheduler._memory_admission_blocked_since = 0.0
 
+        with patch("omlx.scheduler.time.monotonic", return_value=30.0):
+            scheduler._process_batch_responses(
+                [SimpleNamespace(uid=1, token=42, finish_reason=None)]
+            )
         with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+
+        with patch("omlx.scheduler.time.monotonic", return_value=91.0):
             scheduled, rejected = scheduler._schedule_waiting()
 
         assert scheduled == []
@@ -6327,10 +6439,24 @@ class TestStoreCacheAdmissionBackpressure:
         scheduler._pending_async_removes.append(
             (2, done_request.request_id, done_future)
         )
+        self._queue_request(scheduler, self._make_request("req-waiting"))
+        with patch("omlx.scheduler.time.monotonic", return_value=0.0):
+            assert (
+                scheduler._memory_admission_stall_output("store_cache_backpressure")
+                is None
+            )
 
-        with patch("omlx.scheduler._safe_sync_stream"):
+        with (
+            patch("omlx.scheduler._safe_sync_stream"),
+            patch("omlx.scheduler.time.monotonic", return_value=30.0),
+        ):
             drained = scheduler._drain_pending_async_removes()
 
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            assert (
+                scheduler._memory_admission_stall_output("store_cache_backpressure")
+                is None
+            )
         assert drained is True
         assert list(scheduler._pending_async_removes) == [
             (1, slow_request.request_id, slow_future)

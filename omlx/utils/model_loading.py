@@ -652,6 +652,11 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
+    if for_vlm and model_type in {"qwen3_5", "qwen3_5_moe", "qwen4_exp"}:
+        from ..patches.qwen35_ssm_mask import apply_qwen35_ssm_mask_patch
+
+        apply_qwen35_ssm_mask_patch()
+
     if for_vlm and model_type == "qwen3_5":
         from ..patches.mlx_vlm_qwen35_base_compat import (
             apply_mlx_vlm_qwen35_base_compat_patch,

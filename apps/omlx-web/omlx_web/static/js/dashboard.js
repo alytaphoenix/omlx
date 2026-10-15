@@ -4821,6 +4821,11 @@
                 }
             },
 
+            // Name clients send for a model: its alias when set, as /v1/models lists it.
+            apiModelName(id) {
+                return this.managerModelInfo(id)?.settings?.model_alias || id;
+            },
+
             _copyFallback(text) {
                 const textarea = document.createElement('textarea');
                 textarea.value = text;

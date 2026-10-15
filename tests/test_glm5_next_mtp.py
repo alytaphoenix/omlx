@@ -725,12 +725,13 @@ def assert_row_states(actual, expected, size):
                         assert ac._processed == bc._processed
 
 
-def make_host(dtype=mx.float32, *, mtp_layers=0):
+def make_host(dtype=mx.float32, *, mtp_layers=0, **overrides):
     assert glm5_next_vlm_runtime.apply()
     from mlx_vlm.models.glm5_next import language
     from mlx_vlm.models.glm5_next.config import TextConfig
 
     values = copy.deepcopy(TINY_TEXT_CONFIG)
+    values.update(overrides)
     values["num_hidden_layers"] = 8
     values["num_nextn_predict_layers"] = mtp_layers
     values["layer_types"] = values["layer_types"][:8]
@@ -786,6 +787,50 @@ def test_vector_restore_and_continuation_match_scalar(size, depth, dtype):
             mx.eval(x, y)
             assert mx.array_equal(x, y).item(), (cycle, step, accepted)
         assert_row_states(cache, expected, size)
+
+
+@pytest.mark.skipif(
+    not language.nax_sparse_mla_available(), reason="split-K decode needs NAX"
+)
+@pytest.mark.parametrize("lengths", [[2051, 2057], [2057]])
+def test_split_k_batched_decode_matches_rows_alone(monkeypatch, lengths):
+    mx.random.seed(4242)
+    # Selection past index_topk, with shapes the split-K kernels accept.
+    host = make_host(
+        mx.bfloat16,
+        index_topk=2048,
+        index_n_heads=32,
+        index_head_dim=128,
+        num_attention_heads=16,
+        num_key_value_heads=16,
+        kv_lora_rank=128,
+    )
+    rows = []
+    for n in lengths:
+        cache = host.make_cache()
+        tokens = mx.random.randint(0, 512, (1, n)).astype(mx.uint32)
+        mx.eval(host(tokens, cache=cache).logits)
+        rows.append(cache)
+    cache = bg._merge_row_caches([copy.deepcopy(r) for r in rows])
+    calls = []
+    kernel = language.sparse_mla_decode_batched
+    monkeypatch.setattr(
+        language,
+        "sparse_mla_decode_batched",
+        lambda *a, **k: calls.append(1) or kernel(*a, **k),
+    )
+    widths = [1, 1, 3, 1, 4, 1]
+    for step, width in enumerate(widths):
+        tokens = mx.random.randint(0, 512, (len(lengths), width)).astype(mx.uint32)
+        batched = host(tokens, cache=cache).logits
+        singles = [host(tokens[r : r + 1], cache=c).logits for r, c in enumerate(rows)]
+        mx.eval(batched, singles)
+        for r, single in enumerate(singles):
+            assert mx.allclose(
+                batched[r : r + 1], single, atol=3e-4, rtol=3e-4
+            ).item(), (step, r)
+    # Both sparse layers of every step ran the batched kernel.
+    assert len(calls) == 2 * len(widths)
 
 
 @pytest.mark.parametrize("size", [2, 3, 4])
@@ -1428,14 +1473,32 @@ def test_fused_verify_cycles_are_bitwise_reference(seed, kda):
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
-def test_fused_verify_cycles_with_sparse_selection_are_bitwise_reference():
-    """Past index_topk the sparse layers select (indexer + pooling undo)."""
+@pytest.mark.parametrize("split_k", [False, True])
+def test_fused_verify_cycles_with_sparse_selection_are_bitwise_reference(
+    monkeypatch, split_k
+):
+    """Past index_topk the sparse layers select (indexer + pooling undo).
+
+    With split_k both models run the split-K decode attention, so the fused
+    and reference forwards still match bit for bit."""
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
+    if split_k and not language.nax_sparse_mla_available():
+        pytest.skip("split-K decode needs NAX")
+    monkeypatch.setattr(language, "_SMALL_QUERY_INDEXER", split_k)
+    calls = []
+    kernel = language.sparse_mla_decode
+    monkeypatch.setattr(
+        language,
+        "sparse_mla_decode",
+        lambda *a, **k: calls.append(1) or kernel(*a, **k),
+    )
     used = check_verify_matches_reference(
         29, 2101, _CYCLES[:10], KDA_BITS["8-bit/5-bit"]
     )
-    assert {"kda", "hc_mix", "dsa_topk"} <= used, used
+    assert {"kda", "hc_mix"} <= used, used
+    assert bool(calls) == split_k
+    assert ("dsa_topk" in used) != split_k, used
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
