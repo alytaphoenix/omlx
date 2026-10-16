@@ -465,8 +465,15 @@ class ModelSettings:
     is_favorite: bool = False  # Listed first in /v1/models and admin lists
 
     # External engine serving this model instead of oMLX's MLX engines
-    # (omlx/engine/splash.py). None runs the model in-process.
+    # (omlx/engine/splash.py, omlx/engine/rocm.py). None runs the model
+    # in-process.
     external_engine: Optional[str] = None
+
+    # Engine-specific options for the external engine named above. Splash
+    # ignores it; the ROCm engine reads base_url/model/api_key/tokenizer from
+    # it (see RocmEngineConfig.from_dict). Kept as a free-form mapping so a
+    # new external engine can ship without a schema change to ModelSettings.
+    external_engine_config: Optional[dict] = None
 
     # Security: opt-in per model. When True, mlx-lm/mlx-vlm/mlx-embeddings/reranker
     # loaders are allowed to execute custom Python from the model repository

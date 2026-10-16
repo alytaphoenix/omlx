@@ -47,7 +47,8 @@ from .base import BaseEngine, GenerationOutput
 logger = logging.getLogger(__name__)
 
 # External engines a model can be served by, as model settings name them.
-EXTERNAL_ENGINES = {"splash": "Splash"}
+# The value is the human-facing label used by the admin UI.
+EXTERNAL_ENGINES = {"splash": "Splash", "rocm": "ROCm (AMD)"}
 
 # Homebrew prefixes: the menu bar app starts with a minimal PATH.
 _BREW_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")

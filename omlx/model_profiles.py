@@ -110,6 +110,8 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "qwen4_gdn_decode_wide_proj",
         # Which engine serves the model depends on what this Mac has installed.
         "external_engine",
+        # Endpoint/credentials for the external engine; host-specific.
+        "external_engine_config",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
         # Memory residency of an embedding model's audio tower; explicit per model.

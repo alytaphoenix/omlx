@@ -1111,6 +1111,26 @@ class TestAdminAPI:
         saved = await _put_model(pool, saved, external_engine="splash", temperature=0.5)
         assert (saved.external_engine, saved.temperature) == ("splash", 0.5)
 
+    async def test_rocm_engine_requires_and_reports_endpoint(self, tmp_path):
+        pool, _ = _pool(tmp_path)
+
+        # Selecting ROCm without an endpoint is rejected with a clear reason.
+        with pytest.raises(HTTPException, match="base_url"):
+            await _put_model(pool, ModelSettings(), external_engine="rocm")
+
+        # With an endpoint it is accepted and persisted.
+        saved = await _put_model(
+            pool,
+            ModelSettings(),
+            external_engine="rocm",
+            external_engine_config={
+                "base_url": "http://10.99.0.2:8731",
+                "model": "gufo-flash-next",
+            },
+        )
+        assert saved.external_engine == "rocm"
+        assert saved.external_engine_config["base_url"] == "http://10.99.0.2:8731"
+
     def test_model_list_reports_engine_compatibility(
         self, tmp_path, launchers, global_settings
     ):
@@ -1123,7 +1143,13 @@ class TestAdminAPI:
         }
 
         assert rows[entry.model_id] == [
-            {"id": "splash", "label": "Splash", "compatible": True, "reason": ""}
+            {"id": "splash", "label": "Splash", "compatible": True, "reason": ""},
+            {
+                "id": "rocm",
+                "label": "ROCm (AMD)",
+                "compatible": False,
+                "reason": "Set external_engine_config.base_url to the ROCm endpoint",
+            },
         ]
         assert rows["Qwen3.8-27B-DFlash2"] == []
 

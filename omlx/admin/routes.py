@@ -43,6 +43,7 @@ from .._version import __version__ as _omlx_version
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
+from ..engine.rocm import RocmEngine
 from ..engine.splash import (
     EXTERNAL_ENGINES,
     SPLASH_INSTALL_HINT,
@@ -63,15 +64,15 @@ from ..model_profiles import (
 )
 from ..model_settings import (
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
+    MOE_OFFLOAD_MTP_MODEL_TYPES,
     ModelSettings,
     ane_prefill_backend,
     ane_prefill_fraction,
+    merge_chat_template_kwargs,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
     validate_ane_prefill,
     validate_moe_expert_offload,
-    MOE_OFFLOAD_MTP_MODEL_TYPES,
-    merge_chat_template_kwargs,
 )
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
@@ -408,8 +409,12 @@ class ModelSettingsRequest(BaseModel):
     specprefill_draft_model: str | None = None
     specprefill_keep_pct: float | None = None
     specprefill_threshold: int | None = None
-    # External engine (omlx/engine/splash.py); null runs the model in-process
+    # External engine (omlx/engine/splash.py, omlx/engine/rocm.py); null runs
+    # the model in-process
     external_engine: str | None = None
+    # Engine-specific options for the external engine above. For ROCm:
+    # {"base_url", "model", "api_key", "tokenizer", ...}.
+    external_engine_config: dict | None = None
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool | None = None
     dflash_draft_model: str | None = None
@@ -936,22 +941,45 @@ def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     )
 
 
+def _rocm_config_compatible(config: dict | None) -> tuple[bool, str]:
+    """Whether an ``external_engine_config`` names a usable ROCm endpoint."""
+    config = dict(config or {})
+    base_url = config.get("base_url") or config.get("url") or config.get("endpoint")
+    model = (
+        config.get("model") or config.get("model_name")
+        or config.get("upstream_model")
+    )
+    if not base_url:
+        return False, "Set external_engine_config.base_url to the ROCm endpoint"
+    if not model:
+        return False, "Set external_engine_config.model to the upstream model id"
+    return True, ""
+
+
 def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list[dict]:
     """Each external engine and whether it can serve this model."""
     if model_info.get("engine_type") not in ("batched", "vlm"):
         return []
     if model_info.get("is_helper"):
         return []
-    target, reason = engine_pool.splash_target(model_info["id"], settings)
-    return [
-        {
-            "id": engine_id,
-            "label": label,
-            "compatible": target is not None,
-            "reason": reason,
-        }
-        for engine_id, label in EXTERNAL_ENGINES.items()
-    ]
+    result = []
+    for engine_id, label in EXTERNAL_ENGINES.items():
+        if engine_id == "rocm":
+            compatible, reason = _rocm_config_compatible(
+                getattr(settings, "external_engine_config", None)
+            )
+        else:
+            target, reason = engine_pool.splash_target(model_info["id"], settings)
+            compatible = target is not None
+        result.append(
+            {
+                "id": engine_id,
+                "label": label,
+                "compatible": compatible,
+                "reason": reason,
+            }
+        )
+    return result
 
 
 def _entry_is_diffusion_model(entry) -> bool:
@@ -1004,6 +1032,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["moe_expert_offload_resident_fraction"] = 0.25
     settings["specprefill_enabled"] = False
     settings["external_engine"] = None
+    settings["external_engine_config"] = None
     settings["dflash_enabled"] = False
     settings["mtp_enabled"] = False
     settings["vlm_mtp_enabled"] = False
@@ -3066,12 +3095,26 @@ async def update_model_settings(
                 raise HTTPException(
                     status_code=400, detail=f"Unknown external engine: {engine_id}"
                 )
-            target, reason = await asyncio.to_thread(
-                engine_pool.splash_target, model_id, current_settings
-            )
-            if target is None:
-                raise HTTPException(status_code=400, detail=reason)
+            if engine_id == "rocm":
+                # The endpoint may arrive in this same request or already be
+                # stored; validate whichever is effective.
+                effective = request.external_engine_config or getattr(
+                    current_settings, "external_engine_config", None
+                )
+                ok, reason = _rocm_config_compatible(effective)
+                if not ok:
+                    raise HTTPException(status_code=400, detail=reason)
+            else:
+                target, reason = await asyncio.to_thread(
+                    engine_pool.splash_target, model_id, current_settings
+                )
+                if target is None:
+                    raise HTTPException(status_code=400, detail=reason)
         current_settings.external_engine = engine_id
+    if "external_engine_config" in sent:
+        current_settings.external_engine_config = (
+            None if is_diffusion_model else request.external_engine_config or None
+        )
     # DFlash settings
     if "dflash_enabled" in sent:
         new_dflash_enabled = (
@@ -4493,6 +4536,34 @@ def _splash_status(global_settings) -> dict:
     }
 
 
+def _rocm_status(global_settings) -> dict:
+    """ROCm endpoints currently serving models through the external engine."""
+    models = []
+    try:
+        engine_pool = _get_engine_pool() if _get_engine_pool is not None else None
+    except HTTPException:  # the server has not created the pool yet
+        engine_pool = None
+    entries = getattr(engine_pool, "_entries", None) or {}
+    for model_id, entry in list(entries.items()):
+        engine = getattr(entry, "engine", None)
+        if not isinstance(engine, RocmEngine):
+            continue
+        stats = engine.get_stats()
+        models.append(
+            {
+                "id": model_id,
+                "base_url": stats.get("base_url"),
+                "upstream_model": stats.get("upstream_model"),
+                "requests": stats.get("requests", 0),
+            }
+        )
+    return {
+        "available": True,
+        "label": EXTERNAL_ENGINES["rocm"],
+        "models": models,
+    }
+
+
 def _global_settings_response(global_settings):
     from ..settings import get_auto_ssd_cache_size
 
@@ -4658,7 +4729,10 @@ def _global_settings_response(global_settings):
             "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
             "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
         },
-        "external_engines": {"splash": _splash_status(global_settings)},
+        "external_engines": {
+            "splash": _splash_status(global_settings),
+            "rocm": _rocm_status(global_settings),
+        },
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
             "total_memory": memory_info["total_formatted"],

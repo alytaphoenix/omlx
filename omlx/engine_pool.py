@@ -36,6 +36,7 @@ from .engine import BaseEngine, BatchedEngine
 from .engine.decision import DecisionEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
+from .engine.rocm import RocmEngine, RocmEngineConfig
 from .engine.splash import (
     EXTERNAL_ENGINES,
     SplashEngine,
@@ -88,6 +89,12 @@ from .utils.model_loading import (
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
+
+# Engines that run the model outside the oMLX process — in another process
+# (Splash) or on another host (ROCm). Their memory is not charged to MLX
+# active memory, and a failure to start them must surface instead of silently
+# falling back to an MLX engine.
+EXTERNAL_ENGINE_CLASSES = (SplashEngine, RocmEngine)
 
 
 def _touch_gpu() -> None:
@@ -391,9 +398,9 @@ class EnginePool:
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
         self._current_model_memory = 0
-        # Splash engines between launch and load completion, which the memory
-        # guard must count before entry.engine is set.
-        self._starting_external: dict[str, SplashEngine] = {}
+        # External engines between launch and load completion, which the
+        # memory guard must count before entry.engine is set.
+        self._starting_external: dict[str, SplashEngine | RocmEngine] = {}
         # Scanned model roots, kept for org-qualified display/upload names.
         self._model_dirs: list[Path] = []
         self._scheduler_config = scheduler_config or SchedulerConfig()
@@ -540,6 +547,10 @@ class EnginePool:
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
+        if getattr(runtime_settings, "external_engine", None) == "rocm":
+            # The weights run on the AMD node; the local footprint of an HTTP
+            # client is negligible and the MLX reservations do not apply.
+            return 0
         if getattr(runtime_settings, "external_engine", None):
             # Splash plans its own budget; none of the MLX reservations apply.
             target, _ = self.splash_target(entry.model_id, runtime_settings)
@@ -1098,6 +1109,10 @@ class EnginePool:
         # Security/load gates.
         add("trust_remote_code", bool(data.get("trust_remote_code", False)))
         add("external_engine", data.get("external_engine") or None)
+        # A ROCm model's endpoint is part of its identity: repointing it must
+        # reload the model so the new node is used.
+        if (data.get("external_engine") or None) == "rocm":
+            add("external_engine_config", data.get("external_engine_config") or None)
         add("index_cache_freq", normalized_index_cache_freq())
         # Embedding audio tower residency is decided at load. The audio length
         # only matters while the tower is loaded.
@@ -1914,6 +1929,10 @@ class EnginePool:
 
     @staticmethod
     def _engine_has_usable_tokenizer(engine: object) -> bool:
+        # External engines whose weights live on another host may not carry a
+        # local tokenizer; they say so explicitly and count tokens by estimate.
+        if getattr(engine, "local_tokenizer_optional", False):
+            return True
         tokenizer = getattr(engine, "tokenizer", None)
         return tokenizer is not None and callable(getattr(tokenizer, "encode", None))
 
@@ -2015,7 +2034,10 @@ class EnginePool:
             get_settings = getattr(self._settings_manager, "get_settings", None)
             if callable(get_settings):
                 settings = get_settings(model_id)
-        if getattr(settings, "external_engine", None):
+        # Only Splash needs its launcher resolved ahead of the load. Other
+        # external engines (ROCm) point at a remote endpoint and have nothing
+        # to install locally.
+        if getattr(settings, "external_engine", None) == "splash":
             await asyncio.to_thread(
                 find_splash_binary, get_global_settings().integrations.splash_path
             )
@@ -2025,7 +2047,7 @@ class EnginePool:
         entry: EngineEntry,
         model_settings: object | None,
         effective_type: str,
-    ) -> SplashEngine | None:
+    ) -> BaseEngine | None:
         """The external engine the model's settings select, else None.
 
         A model that cannot run on its selected engine fails to load with the
@@ -2038,6 +2060,53 @@ class EnginePool:
             raise ModelLoadingError(
                 entry.model_id, f"Unknown external engine '{engine_id}'"
             )
+        if engine_id == "rocm":
+            return self._rocm_engine_for(entry, model_settings, effective_type)
+        return self._splash_engine_for(entry, model_settings, effective_type)
+
+    def _rocm_engine_for(
+        self,
+        entry: EngineEntry,
+        model_settings: object | None,
+        effective_type: str,
+    ) -> RocmEngine:
+        """Serve ``entry`` from a remote ROCm (AMD) OpenAI-compatible node.
+
+        Unlike Splash, nothing is spawned or installed locally: the AMD box
+        runs its own engine (gufo/llama-server) and publishes an OpenAI API.
+        oMLX only needs the endpoint, which the model carries in
+        ``external_engine_config``.
+        """
+        if effective_type not in ("batched", "vlm"):
+            raise ModelLoadingError(
+                entry.model_id, "The ROCm engine serves language models only"
+            )
+        try:
+            config = RocmEngineConfig.from_dict(
+                getattr(model_settings, "external_engine_config", None),
+                default_model=entry.model_id,
+            )
+        except (ValueError, TypeError) as exc:
+            raise ModelLoadingError(
+                entry.model_id,
+                "ROCm models need external_engine_config with 'base_url' and "
+                f"'model': {exc}",
+            ) from exc
+        config = replace(config, model_name=config.model_name or entry.model_id)
+        logger.info(
+            "Serving %s through the ROCm engine at %s (upstream model %s)",
+            entry.model_id,
+            config.base_url,
+            config.upstream_model,
+        )
+        return RocmEngine(config)
+
+    def _splash_engine_for(
+        self,
+        entry: EngineEntry,
+        model_settings: object | None,
+        effective_type: str,
+    ) -> SplashEngine:
         if effective_type not in ("batched", "vlm"):
             raise ModelLoadingError(
                 entry.model_id, "Splash serves language models only"
@@ -3424,7 +3493,7 @@ class EnginePool:
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         distributed = self._distributed_deployment_for_entry(entry) is not None
         # Splash, like cluster ranks, holds its memory in its own process.
-        external = distributed or isinstance(entry.engine, SplashEngine)
+        external = distributed or isinstance(entry.engine, EXTERNAL_ENGINE_CLASSES)
         resident_size = self._entry_resident_size(entry)
         settle_size = (
             entry.runtime_settle_size
@@ -3930,7 +3999,7 @@ class EnginePool:
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
 
-            if isinstance(engine, SplashEngine):
+            if isinstance(engine, EXTERNAL_ENGINE_CLASSES):
                 self._starting_external[model_id] = engine
             try:
                 await engine.start()
@@ -3938,6 +4007,11 @@ class EnginePool:
                 if isinstance(engine, SplashEngine):
                     # start() already stopped Splash; its error carries the
                     # tail of the Splash log. There is no MLX fallback.
+                    raise
+                if isinstance(engine, RocmEngine):
+                    # The ROCm node owns its lifecycle; a failed probe means a
+                    # misconfigured endpoint, and an MLX fallback would run the
+                    # wrong engine entirely.
                     raise
                 if force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
@@ -4167,6 +4241,9 @@ class EnginePool:
             if isinstance(engine, SplashEngine):
                 # The weights live in the Splash process, not this one.
                 observed_delta = 0
+            elif isinstance(engine, RocmEngine):
+                # The weights live on the ROCm node, not this Mac.
+                observed_delta = 0
             entry.actual_size = observed_delta or resident_size
 
             # Registry consistency check: a lockless mutator (a
@@ -4340,6 +4417,9 @@ class EnginePool:
                 # Report the live footprint of the Splash process group.
                 external_engine = "splash"
                 actual_size = e.engine.process_memory_bytes() or actual_size
+            elif isinstance(e.engine, RocmEngine):
+                # The footprint is the HTTP client; the weights are remote.
+                external_engine = "rocm"
             models.append(
                 {
                     "id": mid,
