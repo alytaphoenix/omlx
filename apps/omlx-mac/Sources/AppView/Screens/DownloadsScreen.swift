@@ -585,7 +585,7 @@ private struct SearchDropdown: View {
             // free for the info button (rendered as a sibling outside
             // this row Button so its tap doesn't fall through to onPick).
             if !isHovered, let downloads = m.downloads, downloads > 0 {
-                Text(formatNumber(downloads))
+                Text(CountFormat.compact(downloads))
                     .font(.omlxMono(10.5))
                     .foregroundStyle(theme.textTertiary)
                     .padding(.trailing, 12)
@@ -652,6 +652,13 @@ private struct ActiveDownloadsSection: View {
                                             comment: "Per-row progress line during downloads. Placeholders: percent, bytes downloaded, total bytes"))
                                     .font(.omlxMono(11))
                                     .foregroundStyle(theme.textSecondary)
+                                if let eta = task.etaText {
+                                    Text(String(localized: "downloads.progress.eta",
+                                                defaultValue: "\(eta) left",
+                                                comment: "Remaining download time after the progress line. Placeholder: duration such as 2h 30m"))
+                                        .font(.omlxMono(11))
+                                        .foregroundStyle(theme.textSecondary)
+                                }
                                 Button {
                                     if task.statusEnum == .pending || task.statusEnum == .downloading {
                                         onCancel(task.taskId)
@@ -904,7 +911,7 @@ private struct SuggestedSection: View {
         var bits: [String] = []
         if let p = m.paramsFormatted { bits.append(p) }
         if let s = m.sizeFormatted { bits.append(s) }
-        if let dl = m.downloads { bits.append("\(formatNumber(dl)) ↓") }
+        if let dl = m.downloads { bits.append("\(CountFormat.compact(dl)) ↓") }
         return bits.isEmpty ? "—" : bits.joined(separator: " · ")
     }
 }
@@ -927,14 +934,4 @@ enum SuggestedSort: String, Hashable, CaseIterable {
                                        comment: "Sort option: rank suggested models by on-disk size, descending")
         }
     }
-}
-
-// MARK: - Helpers
-
-func formatNumber(_ n: Int) -> String {
-    let v = Double(n)
-    if v >= 1e9 { return String(format: "%.1fB", v / 1e9) }
-    if v >= 1e6 { return String(format: "%.1fM", v / 1e6) }
-    if v >= 1e3 { return String(format: "%.1fK", v / 1e3) }
-    return String(n)
 }

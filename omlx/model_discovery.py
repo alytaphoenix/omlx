@@ -69,12 +69,14 @@ VLM_MODEL_TYPES = {
     "glm_ocr",
     "minimax_m3_vl",
     "minicpmv",
+    "minicpmv4_7",
     "phi4_siglip",
     "phi4mm",
     "youtu_vl",
     "inkling",
     "inkling_mm_model",  # config model_type of Inkling Small checkpoints
     "muse_glimmer",
+    "muse_spark",
     "glm5_next",
 }
 
@@ -194,6 +196,7 @@ VLM_ARCHITECTURES = {
     "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
     "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
     "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
+    "MuseSparkForConditionalGeneration",  # meta-models/Muse-Spark-Open-816B-A42B
     "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
     "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
     "Moondream",  # vikhyatk/moondream2 (2024 revisions)
@@ -386,18 +389,9 @@ AUDIO_STS_ARCHITECTURES = {
     "LFM2AudioModel",
 }
 
-# STT families whose mlx-audio implementations accept incremental audio
-# input (push-based realtime decoding): whisper via the AlignAtt
-# StreamingDecoder, voxtral_realtime via VoxtralStreamingSession. Gates
-# the realtime transcription WebSocket and the admin chat mic button.
-REALTIME_STT_MODEL_TYPES = {"whisper", "voxtral_realtime"}
-
-
 def is_realtime_stt_model(model_type: str, config_model_type: str) -> bool:
-    """True when an audio_stt model supports push-based realtime decoding."""
-    if model_type != "audio_stt":
-        return False
-    return (config_model_type or "").lower() in REALTIME_STT_MODEL_TYPES
+    """True when an audio_stt model can serve the realtime WebSocket."""
+    return model_type == "audio_stt"
 
 
 @dataclass
@@ -1064,6 +1058,9 @@ _EFFORT_CHECK = re.compile(
     r"([\[(][^\])]*[\])]|'[^']*'|\"[^\"]*\")"
 )
 _QUOTED = re.compile(r"['\"]([^'\"]+)['\"]")
+# `reasoning_effort in levels` where the template sets `levels` to a literal.
+_EFFORT_NAME_CHECK = re.compile(r"reasoning_effort\s+(?:not\s+)?in\s+([A-Za-z_]\w*)")
+_DICT_KEY = re.compile(r"['\"]([^'\"]+)['\"]\s*:")
 
 
 def detect_reasoning_effort(
@@ -1081,6 +1078,16 @@ def detect_reasoning_effort(
     named = set()
     for match in _EFFORT_CHECK.finditer(template_text):
         named.update(_QUOTED.findall(match.group(1)))
+    for match in _EFFORT_NAME_CHECK.finditer(template_text):
+        literal = re.search(
+            rf"set\s+{match.group(1)}\s*=\s*(\{{[^}}]*\}}|\[[^\]]*\]|\([^)]*\))",
+            template_text,
+        )
+        if literal is not None:
+            text = literal.group(1)
+            # A dict literal names the accepted levels as its keys.
+            pattern = _DICT_KEY if text.startswith("{") else _QUOTED
+            named.update(pattern.findall(text))
     return [level for level in REASONING_EFFORT_LEVELS if level in named]
 
 

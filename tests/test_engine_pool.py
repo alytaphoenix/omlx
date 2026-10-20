@@ -16,6 +16,7 @@ from omlx.engine_pool import (
     EngineEntry,
     EnginePool,
     VLMBatchedEngine,
+    _is_metal_out_of_memory,
     _qwen35_cpu_share_estimated_bytes,
 )
 from omlx.exceptions import (
@@ -31,6 +32,7 @@ from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
     Qwen4ExpResidencyEstimate,
 )
 from omlx.scheduler import PrefillEvictionRequest, SchedulerConfig
+from tests.test_cluster_engine_pool import _deployment
 
 
 def _make_pool(ceiling: int | None = None, **kwargs) -> EnginePool:
@@ -1175,6 +1177,33 @@ class TestVLMFallback:
         assert entry.model_type == "llm"
         assert entry.engine_type == "batched"
         assert entry.engine is mock_batched_engine
+
+    @pytest.mark.asyncio
+    async def test_cluster_deployment_runs_a_vlm_checkpoint_distributed(
+        self, small_mock_model_dir
+    ):
+        """A coordinator holding a VLM checkpoint serves it through its ranks."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = entry.engine_type = "vlm"
+        deployment = _deployment(entry.model_path)
+        pool._cluster_registry = SimpleNamespace(get_for_model=lambda _: deployment)
+        distributed = MagicMock()
+        distributed.start = AsyncMock()
+
+        with (
+            patch(
+                "omlx.engine.distributed.DistributedBatchedEngine",
+                return_value=distributed,
+            ) as cls,
+            patch("omlx.engine_pool.VLMBatchedEngine") as local,
+        ):
+            await pool._load_engine("model-a")
+
+        assert entry.engine is distributed
+        assert cls.call_args.kwargs["vision_checkpoint"] is True
+        local.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_vlm_failure_still_raises(self, small_mock_model_dir):
@@ -3819,6 +3848,30 @@ class TestResolveModelId:
         result = pool.resolve_model_id("omlx/MODEL-B", settings_manager=None)
         assert result == "model-b"
 
+    def test_claude_tier_alias_never_shadows_models_or_aliases(
+        self, small_mock_model_dir
+    ):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        settings_manager = MagicMock()
+        settings_manager.get_exposed_profile_source_model_id.return_value = None
+        settings_manager.get_all_settings.return_value = {
+            "model-a": ModelSettings(model_alias="claude-haiku"),
+        }
+        tiers = {
+            "claude-sonnet": "model-b",
+            "claude-haiku": "model-b",
+            "model-a": "model-b",
+        }
+
+        def resolve(name):
+            return pool.resolve_model_id(name, settings_manager, tiers)
+
+        assert resolve("claude-sonnet") == "model-b"
+        assert resolve("omlx/claude-sonnet") == "model-b"
+        assert resolve("claude-haiku") == "model-a"
+        assert resolve("model-a") == "model-a"
+
 class TestMemorySettleBarrier:
     """Tests for memory settle barrier in _unload_engine()."""
 
@@ -5522,3 +5575,23 @@ async def test_local_cluster_removal_preserves_busy_guard_and_scope(busy):
     else:
         await pool.prepare_cluster_reload("test-model", local_only=True)
         pool._unload_engine.assert_awaited_once_with("test-model", local_only=True)
+
+
+class TestIsMetalOutOfMemory:
+    """``_is_metal_out_of_memory`` walks the cause chain of a failed load."""
+
+    def test_cause_cycles_terminate(self):
+        exc = ImportError("VoxtralProcessor requires the PyTorch library")
+        exc.__cause__ = exc
+        a, b = RuntimeError("a"), RuntimeError("b")
+        a.__cause__, b.__cause__ = b, a
+
+        assert _is_metal_out_of_memory(exc) is False
+        assert _is_metal_out_of_memory(a) is False
+
+    def test_out_of_memory_found_down_the_chain(self):
+        oom = RuntimeError("[METAL] Command buffer execution failed: Insufficient Memory")
+        outer = RuntimeError("load failed")
+        outer.__cause__ = oom
+
+        assert _is_metal_out_of_memory(outer) is True

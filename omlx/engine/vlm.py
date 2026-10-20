@@ -49,6 +49,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
+from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
@@ -826,17 +827,29 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
         _nn.Module.load_weights = original_load_weights
 
 
+def _index_declares_sidecar_shard(model_dir: Path, sidecar: Path) -> bool:
+    """True when ``model.safetensors.index.json`` lists the resolved sidecar."""
+    index = model_dir / "model.safetensors.index.json"
+    try:
+        shards = set(json.loads(index.read_text())["weight_map"].values())
+    except Exception:
+        return False
+    return sidecar.relative_to(model_dir.resolve()).as_posix() in shards
+
+
 @contextlib.contextmanager
 def _load_optiq_vision_sidecar_on_load(model_dir: Path):
     """Include a config-declared OptiQ sidecar in mlx-vlm strict loading.
 
-    Pinned mlx-vlm only globs ``*.safetensors`` in the model root, while
-    current OptiQ VLM checkpoints keep their unquantized multimodal weights
-    under ``optiq/``. Root-level legacy sidecars remain a no-op because the
-    native glob already loads them.
+    mlx-vlm loads index-listed shards, or globs the model root without an index.
+    Inject only a subdirectory sidecar that the index does not list.
     """
     sidecar = _resolve_optiq_vision_sidecar(model_dir)
-    if sidecar is None or sidecar.parent == model_dir.resolve():
+    if (
+        sidecar is None
+        or sidecar.parent == model_dir.resolve()
+        or _index_declares_sidecar_shard(model_dir, sidecar)
+    ):
         yield
         return
 
@@ -968,6 +981,26 @@ def _gemma4_global_kv_from_per_layer_config(config: dict) -> dict[str, int]:
         if len(values) == 1:
             derived[legacy_key] = values.pop()
     return derived
+
+
+@contextlib.contextmanager
+def _preserve_gemma4_unified_image_processor_on_load(model_dir: Path):
+    """Keep the gemma4_unified image processor built from processor_config.json.
+
+    mlx-vlm's load() replaces it with a default one, dropping max_soft_tokens.
+    """
+    if _read_config_model_type(str(model_dir)) != "gemma4_unified":
+        yield
+        return
+
+    import mlx_vlm.utils as _vu
+
+    original = _vu.load_image_processor
+    _vu.load_image_processor = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        _vu.load_image_processor = original
 
 
 @contextlib.contextmanager
@@ -2085,6 +2118,9 @@ class VLMBatchedEngine(BaseEngine):
                 _strip_vision_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _derive_gemma4_global_kv_on_load(Path(self._model_name)),
+                _preserve_gemma4_unified_image_processor_on_load(
+                    Path(self._model_name)
+                ),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
@@ -2438,6 +2474,9 @@ class VLMBatchedEngine(BaseEngine):
                             True,
                         ),
                         install_dispatch=False,
+                        packed_projections=qwen35_packed_linear.enabled(
+                            self._vlm_model
+                        ),
                     )
 
                 ane_count = await loop.run_in_executor(
@@ -2451,8 +2490,6 @@ class VLMBatchedEngine(BaseEngine):
         # the M5 tensor units. Replaces the layers in place, so resident
         # memory does not grow; runs on the MLX executor before any forward.
         try:
-            from ..patches import qwen35_packed_linear
-
             if qwen35_packed_linear.enabled(self._vlm_model):
                 packed = await loop.run_in_executor(
                     get_mlx_executor(),
@@ -2580,11 +2617,18 @@ class VLMBatchedEngine(BaseEngine):
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_kv_scheme = getattr(
+                    self._model_settings, "turboquant_kv_scheme", "turboquant"
+                )
                 scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
                 scheduler._set_model_info_for_monitor()
-                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+                logger.info(
+                    "KV cache compression enabled for VLM: %s, %s bits",
+                    scheduler._turboquant_kv_scheme,
+                    tq_bits,
+                )
 
         # head_dim=256 long-context prefill -> O(L) tiled SDPA kernel. See
         # batched.py for rationale. Passthrough-safe; strictly gated route.
@@ -2738,8 +2782,8 @@ class VLMBatchedEngine(BaseEngine):
                         scheduler,
                         requested_ane_sequence_length,
                     )
-                    # Price the compiled I/O surfaces off the full model so
-                    # admission charges them while the banks are resident.
+                    # Price the compiled program weights off the full model
+                    # so admission charges them while the banks are resident.
                     monitor = getattr(scheduler, "memory_monitor", None)
                     if monitor is not None:
                         monitor.set_ane_prefill_transient_bytes(
@@ -4851,12 +4895,14 @@ class VLMBatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
+            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )

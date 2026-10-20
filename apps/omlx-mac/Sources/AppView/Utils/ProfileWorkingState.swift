@@ -68,6 +68,7 @@ struct ModelSettingsSnapshot: Equatable {
     var chatTemplateEntries: [ChatTemplateKwargEntry]
 
     var turboquantKvEnabled: Bool
+    var turboquantKvScheme: String
     var turboquantKvBits: String
     var qwen35AnePrefillEnabled: Bool
     var qwen35AnePrefillSequenceLength: String
@@ -128,6 +129,8 @@ enum ProfileSettingsKey {
     static let isPinned = "is_pinned"
     static let chatTemplateKwargs = "chat_template_kwargs"
     static let forcedCtKwargs = "forced_ct_kwargs"
+    static let guidedGrammarEnabled = "guided_grammar_enabled"
+    static let guidedGrammar = "guided_grammar"
 
     /// Keys a global template keeps (`UNIVERSAL_PROFILE_FIELDS`). The server
     /// drops every other key from template settings.
@@ -136,16 +139,20 @@ enum ProfileSettingsKey {
         repetitionPenalty, presencePenalty, enableThinking,
         thinkingBudgetEnabled, thinkingBudgetTokens, reasoningParser,
         maxToolResultTokens, forceSampling, chatTemplateKwargs, forcedCtKwargs,
+        guidedGrammarEnabled, guidedGrammar,
     ]
 
     // Model-specific
     static let modelTypeOverride = "model_type_override"
     static let trustRemoteCode = "trust_remote_code"
     static let turboquantKvEnabled = "turboquant_kv_enabled"
+    static let turboquantKvScheme = "turboquant_kv_scheme"
     static let turboquantKvBits = "turboquant_kv_bits"
     static let qwen35AnePrefillSharedFraction = "qwen35_ane_prefill_shared_fraction"
     static let qwen35OqA8Enabled = "qwen35_oq_a8_enabled"
     static let qwen35OqA8MinTokens = "qwen35_oq_a8_min_tokens"
+    static let moeExpertOffloadEnabled = "moe_expert_offload_enabled"
+    static let moeExpertOffloadResidentFraction = "moe_expert_offload_resident_fraction"
     static let qwen35AnePrefillEnabled = "qwen35_ane_prefill_enabled"
     static let qwen35AnePrefillSequenceLength = "qwen35_ane_prefill_sequence_length"
     static let qwen35AnePrefillTailPaddingMinTokens = "qwen35_ane_prefill_tail_padding_min_tokens"

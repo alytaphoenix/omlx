@@ -15,6 +15,8 @@ struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
     let downloadedSize: Int64
     /// Transfer rate in bytes/second; nil for servers without the field.
     let speedBps: Double?
+    /// Seconds left at the server's one-minute average rate; nil when unknown.
+    let etaSeconds: Int?
     let error: String
     let createdAt: Double
     let startedAt: Double
@@ -37,6 +39,15 @@ struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
             return String(format: "%.0f %@", value, units[unit])
         }
         return String(format: value >= 100 ? "%.0f %@" : "%.1f %@", value, units[unit])
+    }
+
+    /// Formatted remaining time, e.g. "2h 30m".
+    var etaText: String? {
+        guard let seconds = etaSeconds else { return nil }
+        let h = seconds / 3600, m = seconds % 3600 / 60, s = seconds % 60
+        if h > 0 { return "\(h)h \(m)m" }
+        if m > 0 { return "\(m)m \(s)s" }
+        return "\(s)s"
     }
 
     enum Status: String {
